@@ -1,0 +1,1251 @@
+use std::{
+    collections::BTreeMap,
+    fs, io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use serde::Deserialize;
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub server: ServerConfig,
+    pub auth: AuthConfig,
+    pub audit: AuditConfig,
+    pub limits: Limits,
+    pub targets: Vec<Target>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    pub bind: SocketAddr,
+    pub mode: ServerMode,
+    pub public_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerMode {
+    Dev,
+    Production,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    pub provider: AuthProvider,
+    pub user: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthProvider {
+    Dev,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditConfig {
+    pub format: AuditFormat,
+    pub path: PathBuf,
+    pub recording: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuditFormat {
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    pub max_sessions: usize,
+    pub max_sessions_per_user: usize,
+    pub idle_timeout: Duration,
+    pub absolute_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Pty(PtyTarget),
+    Ssh(SshTarget),
+}
+
+impl Target {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Pty(target) => &target.name,
+            Self::Ssh(target) => &target.name,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetAllowlist {
+    targets: BTreeMap<String, Target>,
+}
+
+impl TargetAllowlist {
+    pub fn new(targets: Vec<Target>) -> Result<Self, ConfigError> {
+        let mut by_name = BTreeMap::new();
+        for (index, target) in targets.into_iter().enumerate() {
+            validate_typed_target(index, &target)?;
+            let name = target.name().to_owned();
+            if by_name.insert(name.clone(), target).is_some() {
+                return Err(validation(
+                    format!("targets[{index}].name"),
+                    "duplicates an earlier target name",
+                ));
+            }
+        }
+        Ok(Self { targets: by_name })
+    }
+
+    pub fn resolve(&self, name: &str) -> Result<&Target, UnknownTarget> {
+        self.targets
+            .get(name)
+            .ok_or_else(|| UnknownTarget(name.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unknown configured target `{0}`")]
+pub struct UnknownTarget(String);
+
+impl UnknownTarget {
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyTarget {
+    pub name: String,
+    pub executable: PathBuf,
+    pub argv: Vec<String>,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub known_hosts: PathBuf,
+    pub user_policy: SshUserPolicy,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshUserPolicy {
+    Fixed(String),
+    SameAsAuthenticatedUser,
+    Mapping(BTreeMap<String, String>),
+}
+
+impl SshUserPolicy {
+    pub fn resolve<'a>(&'a self, authenticated_user: &'a str) -> Result<&'a str, UserPolicyError> {
+        let user = match self {
+            Self::Fixed(user) => user,
+            Self::SameAsAuthenticatedUser => authenticated_user,
+            Self::Mapping(mapping) => mapping
+                .get(authenticated_user)
+                .ok_or_else(|| UserPolicyError::NotMapped(authenticated_user.to_owned()))?,
+        };
+        validate_username_value(user).map_err(|_| UserPolicyError::InvalidResolvedUser)?;
+        Ok(user)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum UserPolicyError {
+    #[error("authenticated user is not present in the configured SSH user mapping")]
+    NotMapped(String),
+    #[error("resolved SSH user is not a valid configured username")]
+    InvalidResolvedUser,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("could not read configuration file `{path}`: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("configuration syntax or schema error: {message}")]
+    Parse { message: String },
+    #[error("invalid configuration field `{field}`: {message}")]
+    Validation {
+        field: String,
+        message: &'static str,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    server: RawServer,
+    auth: RawAuth,
+    audit: RawAudit,
+    limits: RawLimits,
+    targets: Vec<RawTarget>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServer {
+    bind: SocketAddr,
+    mode: ServerMode,
+    public_url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuth {
+    provider: AuthProvider,
+    user: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAudit {
+    format: AuditFormat,
+    path: PathBuf,
+    recording: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLimits {
+    max_sessions: usize,
+    max_sessions_per_user: usize,
+    idle_timeout_seconds: u64,
+    absolute_timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum RawTarget {
+    Pty {
+        name: String,
+        command: Vec<String>,
+        #[serde(default)]
+        read_only: bool,
+    },
+    Ssh {
+        name: String,
+        host: String,
+        port: u16,
+        known_hosts: PathBuf,
+        user_policy: RawUserPolicy,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        user_mapping: Option<BTreeMap<String, String>>,
+        #[serde(default)]
+        read_only: bool,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawUserPolicy {
+    Fixed,
+    SameAsAuthUser,
+    Mapping,
+}
+
+pub fn parse(source: &str) -> Result<Config, ConfigError> {
+    let raw: RawConfig =
+        toml::from_str(source).map_err(|error: toml::de::Error| ConfigError::Parse {
+            message: error.message().to_owned(),
+        })?;
+    let targets = raw
+        .targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| convert_target(index, target))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    validate_literal_path(&raw.audit.path, "audit.path")?;
+    validate_nonempty(&raw.auth.user, "auth.user", "must not be empty")?;
+    validate_nonempty(
+        &raw.server.public_url,
+        "server.public_url",
+        "must not be empty",
+    )?;
+    validate_limits(&raw.limits)?;
+    TargetAllowlist::new(targets.clone())?;
+
+    Ok(Config {
+        server: ServerConfig {
+            bind: raw.server.bind,
+            mode: raw.server.mode,
+            public_url: raw.server.public_url,
+        },
+        auth: AuthConfig {
+            provider: raw.auth.provider,
+            user: raw.auth.user,
+        },
+        audit: AuditConfig {
+            format: raw.audit.format,
+            path: raw.audit.path,
+            recording: raw.audit.recording,
+        },
+        limits: Limits {
+            max_sessions: raw.limits.max_sessions,
+            max_sessions_per_user: raw.limits.max_sessions_per_user,
+            idle_timeout: Duration::from_secs(raw.limits.idle_timeout_seconds),
+            absolute_timeout: Duration::from_secs(raw.limits.absolute_timeout_seconds),
+        },
+        targets,
+    })
+}
+
+pub fn load(path: &Path) -> Result<Config, ConfigError> {
+    let source = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parse(&source)
+}
+
+fn convert_target(index: usize, raw: RawTarget) -> Result<Target, ConfigError> {
+    match raw {
+        RawTarget::Pty {
+            name,
+            mut command,
+            read_only,
+        } => {
+            if command.is_empty() {
+                return Err(ConfigError::Validation {
+                    field: format!("targets[{index}].command"),
+                    message: "must contain an executable",
+                });
+            }
+            let executable = PathBuf::from(command.remove(0));
+            validate_literal_path(&executable, &format!("targets[{index}].command[0]"))?;
+            validate_target_name(&name, &format!("targets[{index}].name"))?;
+            Ok(Target::Pty(PtyTarget {
+                name,
+                executable,
+                argv: command,
+                read_only,
+            }))
+        }
+        RawTarget::Ssh {
+            name,
+            host,
+            port,
+            known_hosts,
+            user_policy,
+            user,
+            user_mapping,
+            read_only,
+        } => {
+            validate_target_name(&name, &format!("targets[{index}].name"))?;
+            validate_nonempty(
+                &host,
+                &format!("targets[{index}].host"),
+                "must not be empty",
+            )?;
+            if port == 0 {
+                return Err(validation(
+                    format!("targets[{index}].port"),
+                    "must be between 1 and 65535",
+                ));
+            }
+            validate_literal_path(&known_hosts, &format!("targets[{index}].known_hosts"))?;
+            let policy = match user_policy {
+                RawUserPolicy::SameAsAuthUser => {
+                    reject_stray_policy_fields(index, &user, &user_mapping)?;
+                    SshUserPolicy::SameAsAuthenticatedUser
+                }
+                RawUserPolicy::Fixed => {
+                    if user_mapping.is_some() {
+                        return Err(validation(
+                            format!("targets[{index}].user_mapping"),
+                            "is only valid for mapping user policy",
+                        ));
+                    }
+                    let user = user.ok_or_else(|| {
+                        validation(
+                            format!("targets[{index}].user"),
+                            "is required for fixed user policy",
+                        )
+                    })?;
+                    validate_username(&user, &format!("targets[{index}].user"))?;
+                    SshUserPolicy::Fixed(user)
+                }
+                RawUserPolicy::Mapping => {
+                    if user.is_some() {
+                        return Err(validation(
+                            format!("targets[{index}].user"),
+                            "is only valid for fixed user policy",
+                        ));
+                    }
+                    let mapping = user_mapping.ok_or_else(|| {
+                        validation(
+                            format!("targets[{index}].user_mapping"),
+                            "is required for mapping user policy",
+                        )
+                    })?;
+                    if mapping.is_empty() {
+                        return Err(validation(
+                            format!("targets[{index}].user_mapping"),
+                            "must contain at least one mapping",
+                        ));
+                    }
+                    for (identity, username) in &mapping {
+                        validate_identity(identity, &format!("targets[{index}].user_mapping"))?;
+                        validate_username(username, &format!("targets[{index}].user_mapping"))?;
+                    }
+                    SshUserPolicy::Mapping(mapping)
+                }
+            };
+            Ok(Target::Ssh(SshTarget {
+                name,
+                host,
+                port,
+                known_hosts,
+                user_policy: policy,
+                read_only,
+            }))
+        }
+    }
+}
+
+fn validation(field: String, message: &'static str) -> ConfigError {
+    ConfigError::Validation { field, message }
+}
+
+fn validate_nonempty(value: &str, field: &str, message: &'static str) -> Result<(), ConfigError> {
+    if value.is_empty() {
+        return Err(validation(field.to_owned(), message));
+    }
+    Ok(())
+}
+
+fn validate_target_name(name: &str, field: &str) -> Result<(), ConfigError> {
+    if name.is_empty()
+        || name.len() > 128
+        || name.starts_with('-')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(validation(
+            field.to_owned(),
+            "must be 1-128 ASCII letters, digits, dots, underscores, or hyphens and not start with a hyphen",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_literal_path(path: &Path, field: &str) -> Result<(), ConfigError> {
+    let Some(value) = path.to_str() else {
+        return Err(validation(field.to_owned(), "must be valid UTF-8"));
+    };
+    let has_expansion_syntax = value.starts_with('~')
+        || value
+            .chars()
+            .any(|character| matches!(character, '$' | '*' | '?' | '[' | ']' | '`' | '{' | '}'));
+    if value.is_empty() || value.contains('\0') || has_expansion_syntax {
+        return Err(validation(
+            field.to_owned(),
+            "must be a non-empty literal path without expansion syntax",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_limits(raw: &RawLimits) -> Result<(), ConfigError> {
+    const MAX_SESSIONS: usize = 1_000_000;
+    const MAX_TIMEOUT_SECONDS: u64 = 366 * 24 * 60 * 60;
+    for (field, value) in [
+        ("limits.max_sessions", raw.max_sessions),
+        ("limits.max_sessions_per_user", raw.max_sessions_per_user),
+    ] {
+        if value == 0 || value > MAX_SESSIONS {
+            return Err(validation(
+                field.to_owned(),
+                "must be between 1 and 1000000",
+            ));
+        }
+    }
+    for (field, value) in [
+        ("limits.idle_timeout_seconds", raw.idle_timeout_seconds),
+        (
+            "limits.absolute_timeout_seconds",
+            raw.absolute_timeout_seconds,
+        ),
+    ] {
+        if value == 0 || value > MAX_TIMEOUT_SECONDS {
+            return Err(validation(
+                field.to_owned(),
+                "must be between 1 and 31622400 seconds",
+            ));
+        }
+    }
+    if raw.max_sessions_per_user > raw.max_sessions {
+        return Err(validation(
+            "limits.max_sessions_per_user".into(),
+            "must not exceed limits.max_sessions",
+        ));
+    }
+    if raw.idle_timeout_seconds > raw.absolute_timeout_seconds {
+        return Err(validation(
+            "limits.idle_timeout_seconds".into(),
+            "must not exceed limits.absolute_timeout_seconds",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_stray_policy_fields(
+    index: usize,
+    user: &Option<String>,
+    mapping: &Option<BTreeMap<String, String>>,
+) -> Result<(), ConfigError> {
+    if user.is_some() {
+        return Err(validation(
+            format!("targets[{index}].user"),
+            "is only valid for fixed user policy",
+        ));
+    }
+    if mapping.is_some() {
+        return Err(validation(
+            format!("targets[{index}].user_mapping"),
+            "is only valid for mapping user policy",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_identity(value: &str, field: &str) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+    {
+        return Err(validation(
+            field.to_owned(),
+            "contains an invalid authenticated identity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_username(value: &str, field: &str) -> Result<(), ConfigError> {
+    validate_username_value(value).map_err(|()| {
+        validation(
+            field.to_owned(),
+            "contains an invalid or option-like SSH username",
+        )
+    })
+}
+
+fn validate_username_value(value: &str) -> Result<(), ()> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.starts_with('-')
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_typed_target(index: usize, target: &Target) -> Result<(), ConfigError> {
+    validate_target_name(target.name(), &format!("targets[{index}].name"))?;
+    match target {
+        Target::Pty(target) => {
+            validate_literal_path(&target.executable, &format!("targets[{index}].command[0]"))?
+        }
+        Target::Ssh(target) => {
+            validate_nonempty(
+                &target.host,
+                &format!("targets[{index}].host"),
+                "must not be empty",
+            )?;
+            if target.port == 0 {
+                return Err(validation(
+                    format!("targets[{index}].port"),
+                    "must be between 1 and 65535",
+                ));
+            }
+            validate_literal_path(
+                &target.known_hosts,
+                &format!("targets[{index}].known_hosts"),
+            )?;
+            match &target.user_policy {
+                SshUserPolicy::Fixed(user) => {
+                    validate_username(user, &format!("targets[{index}].user"))?;
+                }
+                SshUserPolicy::SameAsAuthenticatedUser => {}
+                SshUserPolicy::Mapping(mapping) => {
+                    if mapping.is_empty() {
+                        return Err(validation(
+                            format!("targets[{index}].user_mapping"),
+                            "must contain at least one mapping",
+                        ));
+                    }
+                    for (identity, user) in mapping {
+                        validate_identity(identity, &format!("targets[{index}].user_mapping"))?;
+                        validate_username(user, &format!("targets[{index}].user_mapping"))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+
+    use tempfile::tempdir;
+
+    use super::{
+        AuditFormat, AuthProvider, ConfigError, PtyTarget, ServerMode, SshTarget, SshUserPolicy,
+        Target, TargetAllowlist, load, parse,
+    };
+
+    const COMPLETE_CONFIG: &str = r#"
+[server]
+bind = "127.0.0.1:7681"
+mode = "dev"
+public_url = "http://127.0.0.1:7681"
+
+[auth]
+provider = "dev"
+user = "local"
+
+[audit]
+format = "json"
+path = "./ttygate-audit.jsonl"
+recording = false
+
+[limits]
+max_sessions = 8
+max_sessions_per_user = 2
+idle_timeout_seconds = 900
+absolute_timeout_seconds = 14400
+
+[[targets]]
+name = "local-shell"
+type = "pty"
+command = ["/bin/bash", "-l"]
+read_only = false
+
+[[targets]]
+name = "lab-host"
+type = "ssh"
+host = "lab.example.internal"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "same-as-auth-user"
+"#;
+
+    #[test]
+    fn parses_complete_rewrite_plan_example() {
+        let config = parse(COMPLETE_CONFIG).expect("complete example should parse");
+
+        assert_eq!(config.server.mode, ServerMode::Dev);
+        assert_eq!(config.server.bind.to_string(), "127.0.0.1:7681");
+        assert_eq!(config.auth.provider, AuthProvider::Dev);
+        assert_eq!(config.audit.format, AuditFormat::Json);
+        assert_eq!(config.limits.max_sessions, 8);
+        assert_eq!(config.targets.len(), 2);
+        assert!(matches!(
+            &config.targets[0],
+            Target::Pty(target)
+                if target.executable.to_string_lossy() == "/bin/bash"
+                    && target.argv == ["-l"]
+        ));
+        assert!(matches!(
+            &config.targets[1],
+            Target::Ssh(target)
+                if target.user_policy == SshUserPolicy::SameAsAuthenticatedUser
+        ));
+    }
+
+    fn config_with_target(target: &str) -> String {
+        format!(
+            r#"
+[server]
+bind = "127.0.0.1:7681"
+mode = "dev"
+public_url = "http://127.0.0.1:7681"
+[auth]
+provider = "dev"
+user = "local"
+[audit]
+format = "json"
+path = "./audit.jsonl"
+recording = false
+[limits]
+max_sessions = 8
+max_sessions_per_user = 2
+idle_timeout_seconds = 900
+absolute_timeout_seconds = 14400
+{target}
+"#
+        )
+    }
+
+    fn minimal_pty(name: &str) -> Target {
+        Target::Pty(PtyTarget {
+            name: name.into(),
+            executable: PathBuf::from("/bin/sh"),
+            argv: vec![],
+            read_only: false,
+        })
+    }
+
+    #[test]
+    fn parses_minimal_pty_and_ssh_targets() {
+        let pty = parse(&config_with_target(
+            r#"[[targets]]
+name = "shell"
+type = "pty"
+command = ["/bin/sh"]"#,
+        ))
+        .unwrap();
+        assert!(matches!(&pty.targets[0], Target::Pty(target) if target.argv.is_empty()));
+
+        let ssh = parse(&config_with_target(
+            r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "/etc/ttygate/known_hosts"
+user_policy = "same-as-auth-user""#,
+        ))
+        .unwrap();
+        assert!(matches!(&ssh.targets[0], Target::Ssh(_)));
+    }
+
+    #[test]
+    fn parses_and_resolves_all_ssh_user_policies() {
+        let cases = [
+            (
+                r#"user_policy = "fixed"
+user = "operator""#,
+                "alice",
+                Some("operator"),
+            ),
+            (
+                r#"user_policy = "same-as-auth-user""#,
+                "alice",
+                Some("alice"),
+            ),
+            (
+                r#"user_policy = "mapping"
+user_mapping = { alice = "remote-alice" }"#,
+                "alice",
+                Some("remote-alice"),
+            ),
+            (
+                r#"user_policy = "mapping"
+user_mapping = { alice = "remote-alice" }"#,
+                "bob",
+                None,
+            ),
+        ];
+
+        for (policy, identity, expected) in cases {
+            let source = config_with_target(&format!(
+                r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+{policy}"#
+            ));
+            let config = parse(&source).unwrap();
+            let Target::Ssh(target) = &config.targets[0] else {
+                panic!("expected ssh target");
+            };
+            assert_eq!(target.user_policy.resolve(identity).ok(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_target_shapes_and_policy_fields() {
+        let cases = [
+            (
+                r#"name = "shell"
+type = "pty"
+command = []"#,
+                "targets[0].command",
+            ),
+            (
+                r#"name = "shell"
+type = "pty"
+command = [""]"#,
+                "targets[0].command[0]",
+            ),
+            (
+                r#"name = "host"
+type = "ssh"
+host = ""
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "same-as-auth-user""#,
+                "targets[0].host",
+            ),
+            (
+                r#"name = "host"
+type = "ssh"
+host = "example.test"
+port = 0
+known_hosts = "./known_hosts"
+user_policy = "same-as-auth-user""#,
+                "targets[0].port",
+            ),
+            (
+                r#"name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "fixed""#,
+                "targets[0].user",
+            ),
+            (
+                r#"name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "mapping""#,
+                "targets[0].user_mapping",
+            ),
+            (
+                r#"name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "mapping"
+user_mapping = {}"#,
+                "targets[0].user_mapping",
+            ),
+            (
+                r#"name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "same-as-auth-user"
+user = "stray""#,
+                "targets[0].user",
+            ),
+        ];
+
+        for (target, field) in cases {
+            let source = config_with_target(&format!("[[targets]]\n{target}"));
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains(field), "{error:?} did not contain {field:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_schema_values_and_fields() {
+        let cases = [
+            config_with_target(
+                r#"[[targets]]
+name = "bad"
+type = "container"
+image = "nope""#,
+            ),
+            config_with_target(
+                r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "browser-chooses""#,
+            ),
+            config_with_target(
+                r#"[[targets]]
+name = "shell"
+type = "pty"
+command = ["/bin/sh"]
+commnad = ["/bin/bash"]"#,
+            ),
+        ];
+        for source in cases {
+            assert!(matches!(parse(&source), Err(ConfigError::Parse { .. })));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_and_duplicate_target_names() {
+        for name in [
+            "",
+            "two words",
+            "../shell",
+            "-option",
+            "café",
+            "a/b",
+            "line\nbreak",
+        ] {
+            let source = config_with_target(&format!(
+                "[[targets]]\nname = {name:?}\ntype = \"pty\"\ncommand = [\"/bin/sh\"]"
+            ));
+            assert!(
+                parse(&source)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("targets[0].name")
+            );
+        }
+        let long_name = "a".repeat(129);
+        let source = config_with_target(&format!(
+            "[[targets]]\nname = \"{long_name}\"\ntype = \"pty\"\ncommand = [\"/bin/sh\"]"
+        ));
+        assert!(parse(&source).is_err());
+
+        let duplicate = config_with_target(
+            r#"[[targets]]
+name = "shell"
+type = "pty"
+command = ["/bin/sh"]
+[[targets]]
+name = "shell"
+type = "pty"
+command = ["/bin/bash"]"#,
+        );
+        assert!(
+            parse(&duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("targets[1].name")
+        );
+    }
+
+    #[test]
+    fn preserves_literal_paths_and_rejects_expansion_syntax() {
+        for path in ["./known_hosts", "/etc/ttygate/known hosts"] {
+            let source = config_with_target(&format!(
+                r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = {path:?}
+user_policy = "same-as-auth-user""#
+            ));
+            let config = parse(&source).unwrap();
+            let Target::Ssh(target) = &config.targets[0] else {
+                unreachable!()
+            };
+            assert_eq!(target.known_hosts, PathBuf::from(path));
+        }
+
+        for path in [
+            "",
+            "~/known_hosts",
+            "$HOME/known_hosts",
+            "./known_*",
+            "./known?hosts",
+            "./known[12]",
+            "`pwd`/hosts",
+            "${HOME}/hosts",
+            "./{a,b}",
+        ] {
+            let source = config_with_target(&format!(
+                r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = {path:?}
+user_policy = "same-as-auth-user""#
+            ));
+            assert!(
+                parse(&source)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("targets[0].known_hosts")
+            );
+        }
+    }
+
+    #[test]
+    fn validates_limits() {
+        let replacements = [
+            (
+                "max_sessions = 8",
+                "max_sessions = 0",
+                "limits.max_sessions",
+            ),
+            (
+                "max_sessions_per_user = 2",
+                "max_sessions_per_user = 0",
+                "limits.max_sessions_per_user",
+            ),
+            (
+                "idle_timeout_seconds = 900",
+                "idle_timeout_seconds = 0",
+                "limits.idle_timeout_seconds",
+            ),
+            (
+                "absolute_timeout_seconds = 14400",
+                "absolute_timeout_seconds = 0",
+                "limits.absolute_timeout_seconds",
+            ),
+            (
+                "max_sessions_per_user = 2",
+                "max_sessions_per_user = 9",
+                "limits.max_sessions_per_user",
+            ),
+            (
+                "idle_timeout_seconds = 900",
+                "idle_timeout_seconds = 14401",
+                "limits.idle_timeout_seconds",
+            ),
+        ];
+        for (from, to, field) in replacements {
+            let source = COMPLETE_CONFIG.replace(from, to);
+            assert!(parse(&source).unwrap_err().to_string().contains(field));
+        }
+        let config = parse(COMPLETE_CONFIG).unwrap();
+        assert_eq!(config.limits.idle_timeout, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn required_sections_fields_and_duplicate_mapping_keys_fail_with_context() {
+        for required in ["server", "auth", "audit", "limits", "targets"] {
+            let source = match required {
+                "server" => COMPLETE_CONFIG.replace("[server]", "[missing_server]"),
+                "auth" => COMPLETE_CONFIG.replace("[auth]", "[missing_auth]"),
+                "audit" => COMPLETE_CONFIG.replace("[audit]", "[missing_audit]"),
+                "limits" => COMPLETE_CONFIG.replace("[limits]", "[missing_limits]"),
+                "targets" => COMPLETE_CONFIG.replace("[[targets]]", "[[not_targets]]"),
+                _ => unreachable!(),
+            };
+            assert!(parse(&source).unwrap_err().to_string().contains(required));
+        }
+        let duplicate = config_with_target(
+            r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "mapping"
+user_mapping = { alice = "one", alice = "two" }"#,
+        );
+        assert!(matches!(parse(&duplicate), Err(ConfigError::Parse { .. })));
+    }
+
+    #[test]
+    fn every_required_field_is_rejected_individually() {
+        let required_fields = [
+            ("bind = \"127.0.0.1:7681\"", "bind"),
+            ("mode = \"dev\"", "mode"),
+            ("public_url = \"http://127.0.0.1:7681\"", "public_url"),
+            ("provider = \"dev\"", "provider"),
+            ("user = \"local\"", "user"),
+            ("format = \"json\"", "format"),
+            ("path = \"./ttygate-audit.jsonl\"", "path"),
+            ("recording = false", "recording"),
+            ("max_sessions = 8", "max_sessions"),
+            ("max_sessions_per_user = 2", "max_sessions_per_user"),
+            ("idle_timeout_seconds = 900", "idle_timeout_seconds"),
+            (
+                "absolute_timeout_seconds = 14400",
+                "absolute_timeout_seconds",
+            ),
+            ("name = \"local-shell\"", "name"),
+            ("command = [\"/bin/bash\", \"-l\"]", "command"),
+            ("host = \"lab.example.internal\"", "host"),
+            ("port = 22", "port"),
+            ("known_hosts = \"./known_hosts\"", "known_hosts"),
+            ("user_policy = \"same-as-auth-user\"", "user_policy"),
+        ];
+
+        for (line, field) in required_fields {
+            let source = COMPLETE_CONFIG.replacen(line, "", 1);
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains(field), "{error:?} did not contain {field:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_fields_fail_closed_in_every_section() {
+        for anchor in ["[server]", "[auth]", "[audit]", "[limits]"] {
+            let source = COMPLETE_CONFIG.replacen(anchor, &format!("{anchor}\ntypo = true"), 1);
+            assert!(matches!(parse(&source), Err(ConfigError::Parse { .. })));
+        }
+        let source = format!("top_level_typo = true\n{COMPLETE_CONFIG}");
+        assert!(matches!(parse(&source), Err(ConfigError::Parse { .. })));
+    }
+
+    #[test]
+    fn audit_path_uses_the_literal_path_policy() {
+        for path in [
+            "",
+            "~/audit",
+            "$HOME/audit",
+            "./audit*.jsonl",
+            "`pwd`/audit",
+        ] {
+            let source = COMPLETE_CONFIG.replace(
+                "path = \"./ttygate-audit.jsonl\"",
+                &format!("path = {path:?}"),
+            );
+            assert!(
+                parse(&source)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("audit.path")
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_lookup_is_independent_of_toml_parsing() {
+        let allowlist = TargetAllowlist::new(vec![minimal_pty("shell")]).unwrap();
+        assert_eq!(allowlist.resolve("shell").unwrap().name(), "shell");
+        let error = allowlist.resolve("browser-command").unwrap_err();
+        assert_eq!(error.name(), "browser-command");
+    }
+
+    #[test]
+    fn allowlist_rejects_duplicate_typed_targets() {
+        assert!(TargetAllowlist::new(vec![minimal_pty("shell"), minimal_pty("shell")]).is_err());
+    }
+
+    #[test]
+    fn allowlist_rejects_invalid_typed_targets() {
+        let invalid_pty = Target::Pty(PtyTarget {
+            name: "shell".into(),
+            executable: PathBuf::new(),
+            argv: vec![],
+            read_only: false,
+        });
+        assert!(
+            TargetAllowlist::new(vec![invalid_pty])
+                .unwrap_err()
+                .to_string()
+                .contains("targets[0].command[0]")
+        );
+
+        let invalid_ssh = Target::Ssh(SshTarget {
+            name: "host".into(),
+            host: "example.test".into(),
+            port: 0,
+            known_hosts: "./known_hosts".into(),
+            user_policy: SshUserPolicy::SameAsAuthenticatedUser,
+            read_only: false,
+        });
+        assert!(
+            TargetAllowlist::new(vec![invalid_ssh])
+                .unwrap_err()
+                .to_string()
+                .contains("targets[0].port")
+        );
+    }
+
+    #[test]
+    fn file_loading_has_typed_safe_errors_and_never_executes_targets() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("literal-$HOME-config.toml");
+        let marker = directory.path().join("must-not-exist");
+        let source = config_with_target(&format!(
+            "[[targets]]\nname = \"shell\"\ntype = \"pty\"\ncommand = [\"/usr/bin/touch\", {:?}]",
+            marker.to_string_lossy()
+        ));
+        fs::write(&config_path, source).unwrap();
+
+        let config = load(&config_path).unwrap();
+        assert_eq!(config.targets[0].name(), "shell");
+        assert!(!marker.exists());
+
+        let missing = directory.path().join("missing.toml");
+        assert!(matches!(load(&missing), Err(ConfigError::Read { .. })));
+        fs::write(&config_path, "secret_token = 'do-not-display'\nnot toml =").unwrap();
+        let message = load(&config_path).unwrap_err().to_string();
+        assert!(!message.contains("do-not-display"));
+    }
+
+    #[test]
+    fn production_mode_parses_without_chunk_2_1_gating() {
+        let source = COMPLETE_CONFIG.replace("mode = \"dev\"", "mode = \"production\"");
+        assert_eq!(parse(&source).unwrap().server.mode, ServerMode::Production);
+    }
+
+    #[test]
+    fn mapping_policy_rejects_invalid_identity_and_username_entries() {
+        let invalid_maps = [
+            r#"user_mapping = { "" = "remote" }"#,
+            r#"user_mapping = { alice = "" }"#,
+            r#"user_mapping = { "bad identity" = "remote" }"#,
+            r#"user_mapping = { alice = "-oProxyCommand=bad" }"#,
+        ];
+        for mapping in invalid_maps {
+            let source = config_with_target(&format!(
+                r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "mapping"
+{mapping}"#
+            ));
+            assert!(
+                parse(&source)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("user_mapping")
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_policy_rejects_option_like_username() {
+        let target = SshTarget {
+            name: "host".into(),
+            host: "example.test".into(),
+            port: 22,
+            known_hosts: "./known_hosts".into(),
+            user_policy: SshUserPolicy::Fixed("operator".into()),
+            read_only: false,
+        };
+        assert_eq!(target.user_policy.resolve("ignored").unwrap(), "operator");
+
+        let source = config_with_target(
+            r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+known_hosts = "./known_hosts"
+user_policy = "fixed"
+user = "-oProxyCommand=bad""#,
+        );
+        assert!(
+            parse(&source)
+                .unwrap_err()
+                .to_string()
+                .contains("targets[0].user")
+        );
+    }
+
+    #[test]
+    fn mapping_policy_is_typed() {
+        let policy = SshUserPolicy::Mapping(BTreeMap::from([("alice".into(), "remote".into())]));
+        assert_eq!(policy.resolve("alice").unwrap(), "remote");
+    }
+}
