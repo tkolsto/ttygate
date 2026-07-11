@@ -169,6 +169,9 @@ pub fn decode_client_control(bytes: &[u8]) -> Result<ClientControl, ProtocolErro
             Ok(ClientControl::Resize(Resize { cols, rows }))
         }
         "close" => {
+            if object.contains_key("reason") {
+                return Err(ProtocolError::InvalidDirection);
+            }
             exact_keys(&object, &["version", "type"])?;
             Ok(ClientControl::Close)
         }
@@ -196,6 +199,9 @@ pub fn decode_server_control(bytes: &[u8]) -> Result<ServerControl, ProtocolErro
             )?))
         }
         "close" => {
+            if object.len() == 2 && object.contains_key("version") && object.contains_key("type") {
+                return Err(ProtocolError::InvalidDirection);
+            }
             exact_keys(&object, &["version", "type", "reason"])?;
             Ok(ServerControl::Close(parse_close_reason(string_field(
                 &object, "reason",
@@ -262,7 +268,7 @@ fn parse_control(bytes: &[u8]) -> Result<Map<String, Value>, ProtocolError> {
     }
     let text = std::str::from_utf8(bytes).map_err(|_| ProtocolError::MalformedText)?;
     detect_duplicate_fields(text)?;
-    let value: Value = serde_json::from_str(text).map_err(|_| ProtocolError::MalformedControl)?;
+    let value: Value = serde_json::from_str(text).map_err(classify_json_error)?;
     value
         .as_object()
         .cloned()
@@ -384,12 +390,25 @@ fn detect_duplicate_fields(text: &str) -> Result<(), ProtocolError> {
     DuplicateDetector::deserialize(&mut deserializer)
         .map(|_| ())
         .map_err(|error| {
-            if error.to_string().starts_with("duplicate field") {
+            let error = error.to_string();
+            if error.starts_with("duplicate field") {
                 ProtocolError::DuplicateField
+            } else if error.contains("surrogate") || error.contains("unexpected end of hex escape")
+            {
+                ProtocolError::InvalidField
             } else {
                 ProtocolError::MalformedControl
             }
         })
+}
+
+fn classify_json_error(error: serde_json::Error) -> ProtocolError {
+    let error = error.to_string();
+    if error.contains("surrogate") || error.contains("unexpected end of hex escape") {
+        ProtocolError::InvalidField
+    } else {
+        ProtocolError::MalformedControl
+    }
 }
 
 struct DuplicateDetector;
@@ -640,6 +659,17 @@ mod tests {
             decode_client_control(&oversized).unwrap_err().code(),
             "control-too-large"
         );
+
+        let prefix = b"{\"version\":1,\"type\":\"close\",\"padding\":\"";
+        let suffix = b"\"}";
+        let mut maximum = Vec::from(prefix.as_slice());
+        maximum.resize(MAX_CONTROL_BYTES - suffix.len(), b'a');
+        maximum.extend_from_slice(suffix);
+        assert_eq!(maximum.len(), MAX_CONTROL_BYTES);
+        assert_eq!(
+            decode_client_control(&maximum).unwrap_err().code(),
+            "unknown-field"
+        );
     }
 
     #[test]
@@ -649,5 +679,7 @@ mod tests {
         assert!(ExitStatus::signal(0).is_err());
         assert!(ProtocolErrorMessage::new("Bad_Code", "safe").is_err());
         assert!(ProtocolErrorMessage::new("safe-code", "bad\nmessage").is_err());
+        assert!(ProtocolErrorMessage::new("a".repeat(65), "safe").is_err());
+        assert!(ProtocolErrorMessage::new("safe-code", "a".repeat(257)).is_err());
     }
 }

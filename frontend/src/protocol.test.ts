@@ -83,6 +83,12 @@ test("binary frames accept empty and maximum but reject oversize", () => {
 test("text bound is measured in UTF-8 bytes before JSON parsing", () => {
   const multibyte = `{"version":1,"type":"close","padding":"${"💥".repeat(MAX_CONTROL_BYTES)}"}`;
   expectCodecError(() => decodeClientControl(multibyte), "control-too-large");
+
+  const prefix = '{"version":1,"type":"close","padding":"';
+  const suffix = '"}';
+  const maximum = prefix + "a".repeat(MAX_CONTROL_BYTES - prefix.length - suffix.length) + suffix;
+  assert.equal(maximum.length, MAX_CONTROL_BYTES);
+  expectCodecError(() => decodeClientControl(maximum), "unknown-field");
 });
 
 test("encoders reject invalid caller-constructed values", () => {
@@ -96,6 +102,18 @@ test("encoders reject invalid caller-constructed values", () => {
       code: "Bad_Code",
       message: "safe",
     }),
+    "invalid-field",
+  );
+  expectCodecError(
+    () => encodeServerControl({ type: "error", code: "a".repeat(65), message: "safe" }),
+    "invalid-field",
+  );
+  expectCodecError(
+    () => encodeServerControl({ type: "error", code: "safe-code", message: "a".repeat(257) }),
+    "invalid-field",
+  );
+  expectCodecError(
+    () => encodeServerControl({ type: "error", code: "safe-code", message: "\ud800" }),
     "invalid-field",
   );
 });

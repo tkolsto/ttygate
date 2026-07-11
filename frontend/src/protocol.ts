@@ -81,6 +81,7 @@ export function decodeClientControl(text: string): ClientControl {
         rows: dimension(value, "rows"),
       };
     case "close":
+      if (Object.hasOwn(value, "reason")) throw new ProtocolCodecError("invalid-direction");
       exactKeys(value, ["version", "type"]);
       return { type: "close" };
     case "exit-status":
@@ -106,6 +107,7 @@ export function decodeServerControl(text: string): ServerControl {
       return { type: "error", code, message };
     }
     case "close": {
+      if (Object.keys(value).length === 2) throw new ProtocolCodecError("invalid-direction");
       exactKeys(value, ["version", "type", "reason"]);
       const reason = stringField(value, "reason");
       if (!isCloseReason(reason)) throw new ProtocolCodecError("invalid-field");
@@ -154,7 +156,7 @@ function checkBinaryLength(data: Uint8Array): void {
 }
 
 function parseControl(text: string): Record<string, unknown> {
-  if (new TextEncoder().encode(text).byteLength > MAX_CONTROL_BYTES) {
+  if (boundedUtf8Length(text, MAX_CONTROL_BYTES, "malformed-control") > MAX_CONTROL_BYTES) {
     throw new ProtocolCodecError("control-too-large");
   }
   detectDuplicateKeys(text);
@@ -239,11 +241,21 @@ function validateExitStatus(status: ExitStatus): void {
 }
 
 function validateError(code: string, message: string): void {
-  if (!/^[a-z](?:[a-z0-9]|-(?!-))*$/.test(code) || code.length > 64) {
+  if (
+    !/^[a-z][a-z0-9-]*$/.test(code)
+    || code.endsWith("-")
+    || code.includes("--")
+    || code.length > 64
+  ) {
     throw new ProtocolCodecError("invalid-field");
   }
   const characters = [...message];
-  if (characters.length < 1 || characters.length > 256 || characters.some(isAsciiControl)) {
+  if (
+    characters.length < 1
+    || characters.length > 256
+    || characters.some(isAsciiControl)
+    || characters.some(isSurrogate)
+  ) {
     throw new ProtocolCodecError("invalid-field");
   }
 }
@@ -251,6 +263,11 @@ function validateError(code: string, message: string): void {
 function isAsciiControl(character: string): boolean {
   const code = character.codePointAt(0) ?? 0;
   return code <= 0x1f || code === 0x7f;
+}
+
+function isSurrogate(character: string): boolean {
+  const code = character.charCodeAt(0);
+  return code >= 0xd800 && code <= 0xdfff;
 }
 
 function isCloseReason(reason: string): reason is CloseReason {
@@ -271,10 +288,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function checkedStringify(value: unknown): string {
   const result = JSON.stringify(value);
-  if (new TextEncoder().encode(result).byteLength > MAX_CONTROL_BYTES) {
+  if (boundedUtf8Length(result, MAX_CONTROL_BYTES, "invalid-field") > MAX_CONTROL_BYTES) {
     throw new ProtocolCodecError("control-too-large");
   }
   return result;
+}
+
+function boundedUtf8Length(
+  text: string,
+  limit: number,
+  invalidUnicodeCode: ProtocolErrorCode,
+): number {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const low = text.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) throw new ProtocolCodecError(invalidUnicodeCode);
+      bytes += 4;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new ProtocolCodecError(invalidUnicodeCode);
+    } else bytes += 3;
+    if (bytes > limit) return bytes;
+  }
+  return bytes;
 }
 
 function detectDuplicateKeys(text: string): void {
