@@ -1,0 +1,14 @@
+[package]
+name = "ttygate-pty-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2.186"
+nix = { version = "0.30.1", features = ["fs", "process", "signal", "term"] }
+portable-pty = "0.9.0"
+pty-process = { version = "0.5.3", features = ["async"] }
+tokio = { version = "1.52.3", features = ["full"] }
+
+[workspace]
