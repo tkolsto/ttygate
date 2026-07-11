@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible ttygate defect that is safe to discuss publicly.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve ttygate.
+
+        **Do not use this form for a suspected vulnerability.** Report security vulnerabilities through [GitHub private vulnerability reporting](https://github.com/tkolsto/ttygate/security/advisories/new). Remove or redact secrets, terminal contents, cookies, tickets, keys, personal data, and private endpoints from public reports.
+  - type: input
+    id: revision
+    attributes:
+      label: Version or commit
+      description: Provide the release version or full commit SHA where you observed the problem.
+      placeholder: 0123456789abcdef0123456789abcdef01234567
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the operating system, architecture, browser, Rust and Node versions, and relevant non-sensitive configuration.
+      placeholder: macOS 15, arm64, Firefox 140, Rust 1.x, Node 22
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Explain what happened and how it affected you.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe, repeatable sequence. Do not include exploit details or sensitive data.
+      placeholder: |
+        1. Build revision …
+        2. Run command …
+        3. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Explain what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Optional. Remove or redact every secret, terminal content, identity, ticket, cookie, key, personal detail, and private endpoint before posting.
+  - type: checkboxes
+    id: public-safety
+    attributes:
+      label: Public-report safety
+      options:
+        - label: I confirm this is not a vulnerability report and contains no secret, personal data, terminal content, credential, session cookie, ticket, private key, or private endpoint.
+          required: true
