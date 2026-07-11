@@ -1,7 +1,7 @@
 .worktrees/
 /target
 node_modules/
-/frontend/dist/
+/frontend/dist/index.html
 /spikes/**/target/
 /spikes/**/.tmp/
 /spikes/**/.tmp*/

@@ -4,7 +4,7 @@
 
 This document describes the intended security boundaries for ttygate v0.1, a browser gateway to allowlisted local PTY commands and SSH targets. It covers the browser frontend, HTTP and WebSocket service, authentication boundary, session manager, child processes, reverse-proxy integration, configuration, audit logs, and optional recordings.
 
-ttygate is currently pre-release. Only the repository and frontend scaffolds exist; the terminal service and the mitigations labeled **planned** below are not yet implemented. This model is a design contract for later chunks, not a claim that the current binary is safe to deploy. The [roadmap](roadmap.md) identifies when each control is expected to land.
+ttygate is currently pre-release. Chunk 1.3 implements the localhost HTTP foundation, explicit browser Origin policy, development identity cookie, and bounded single-use session tickets. PTY execution, the WebSocket bridge, production authentication/transport gating, and the remaining mitigations below are still planned. This model is a design contract for later chunks, not a claim that the current binary is safe to deploy. The [roadmap](roadmap.md) identifies when each control is expected to land.
 
 The model assumes the host operating system, browser, configured identity provider, and administrators are not already fully compromised. Protecting a compromised endpoint, making untrusted commands safe to run, defending third-party infrastructure, and providing per-user OS isolation for local PTY targets are out of scope. Those limitations are non-goals, not security properties.
 
