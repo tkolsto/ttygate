@@ -5,13 +5,16 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "test": "node --import tsx --test src/protocol.test.ts"
   },
   "dependencies": {
     "@xterm/xterm": "^5.5.0"
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "esbuild": "^0.25.0",
+    "tsx": "^4.23.0",
     "typescript": "^5.5.0"
   },
   "allowScripts": {
