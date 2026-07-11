@@ -21,6 +21,7 @@ require_text() {
 README=README.md
 SECURITY=SECURITY.md
 THREAT_MODEL=docs/threat-model.md
+PROTOCOL=docs/protocol.md
 ISSUE_CONFIG=.github/ISSUE_TEMPLATE/config.yml
 BUG_FORM=.github/ISSUE_TEMPLATE/bug-report.yml
 SECURITY_FORM=.github/ISSUE_TEMPLATE/security-sensitive-change.yml
@@ -62,6 +63,11 @@ require_text "$THREAT_MODEL" 'malicious (websites|sites)|cross-site WebSocket' '
 require_text "$THREAT_MODEL" 'DNS rebinding' 'DNS-rebinding threat'
 require_text "$THREAT_MODEL" 'out of scope|non-goals' 'out-of-scope assumptions'
 require_text "$THREAT_MODEL" 'pre-release|not yet implemented|planned' 'implementation-status distinction'
+
+require_file "$PROTOCOL"
+for heading in 'Scope' 'Versioning and compatibility' 'WebSocket framing' 'Control messages' 'Validation and limits' 'Protocol errors and close semantics' 'Backpressure'; do
+  require_text "$PROTOCOL" "^#+[[:space:]]+$heading" "$heading section"
+done
 
 require_file "$ISSUE_CONFIG"
 require_text "$ISSUE_CONFIG" 'blank_issues_enabled:[[:space:]]*false' 'disabled blank issues'
