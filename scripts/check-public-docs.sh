@@ -26,19 +26,13 @@ BUG_FORM=.github/ISSUE_TEMPLATE/bug-report.yml
 SECURITY_FORM=.github/ISSUE_TEMPLATE/security-sensitive-change.yml
 
 require_file "$README"
-require_file "$SECURITY"
-require_file "$THREAT_MODEL"
-require_file "$ISSUE_CONFIG"
-require_file "$BUG_FORM"
-require_file "$SECURITY_FORM"
-
 require_text "$README" 'security-first browser terminal gateway' 'security-first positioning'
 require_text "$README" 'browser terminals.*security-sensitive|shell-equivalent' 'browser-terminal warning'
 require_text "$README" 'localhost.*(not|does not).*security boundary|malicious.*website|DNS rebinding' 'localhost browser-risk warning'
 require_text "$README" 'pre-release' 'pre-release status'
 require_text "$README" 'no terminal (server|gateway).*yet|not yet.*terminal' 'current scaffold limitation'
 require_text "$README" 'cargo test --workspace' 'Rust scaffold command'
-require_text "$README" 'npm (ci|run)' 'frontend scaffold commands'
+require_text "$README" 'npm.*(ci|run)' 'frontend scaffold commands'
 require_text "$README" '127\.0\.0\.1|localhost-only' 'planned localhost-only default'
 require_text "$README" 'inspired by Shell In A Box' 'Shell In A Box inspiration statement'
 require_text "$README" 'not a fork' 'not-a-fork statement'
@@ -49,6 +43,7 @@ require_text "$README" '\(CONTRIBUTING\.md\)' 'contribution link'
 require_text "$README" '\(LICENSE-MIT\)' 'MIT license link'
 require_text "$README" '\(LICENSE-APACHE\)' 'Apache license link'
 
+require_file "$SECURITY"
 require_text "$SECURITY" 'github\.com/tkolsto/ttygate/security/advisories/new' 'private advisory URL'
 require_text "$SECURITY" 'do not.*public (issue|discussion|pull request)|not.*public (issue|discussion|pull request)' 'public-disclosure warning'
 require_text "$SECURITY" 'acknowledge|assessment|coordinate' 'maintainer response process'
@@ -57,6 +52,7 @@ require_text "$SECURITY" 'supported versions' 'supported-version policy'
 require_text "$SECURITY" 'latest.*main' 'pre-release main-branch support'
 require_text "$SECURITY" 'no released versions|no releases' 'absence of releases'
 
+require_file "$THREAT_MODEL"
 for heading in 'Scope and status' 'Security objectives' 'Assets' 'Trust boundaries' 'Attacker capabilities' 'Threats and planned mitigations' 'Dangerous anti-features' 'Residual risks' 'Maintaining this model'; do
   require_text "$THREAT_MODEL" "^#+[[:space:]]+$heading" "$heading section"
 done
@@ -67,11 +63,14 @@ require_text "$THREAT_MODEL" 'DNS rebinding' 'DNS-rebinding threat'
 require_text "$THREAT_MODEL" 'out of scope|non-goals' 'out-of-scope assumptions'
 require_text "$THREAT_MODEL" 'pre-release|not yet implemented|planned' 'implementation-status distinction'
 
+require_file "$ISSUE_CONFIG"
 require_text "$ISSUE_CONFIG" 'blank_issues_enabled:[[:space:]]*false' 'disabled blank issues'
 require_text "$ISSUE_CONFIG" 'security/advisories/new' 'private-reporting contact'
+require_file "$BUG_FORM"
 require_text "$BUG_FORM" 'security/advisories/new' 'private vulnerability routing'
 require_text "$BUG_FORM" 'remove.*(secret|sensitive)|redact' 'secret-redaction warning'
 require_text "$BUG_FORM" 'not.*(vulnerability|security vulnerability)' 'public-disclosure confirmation'
+require_file "$SECURITY_FORM"
 require_text "$SECURITY_FORM" 'not.*(vulnerability|security vulnerability)' 'public-change vulnerability warning'
 require_text "$SECURITY_FORM" 'threat.model' 'threat-model impact field'
 require_text "$SECURITY_FORM" 'trust boundar' 'trust-boundary field'
