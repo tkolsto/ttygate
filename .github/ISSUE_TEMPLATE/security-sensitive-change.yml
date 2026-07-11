@@ -1,0 +1,91 @@
+name: Security-sensitive change
+description: Propose public hardening or planned security behavior without disclosing a vulnerability.
+title: "security: "
+labels:
+  - security
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for security-sensitive design and implementation work that is safe to discuss publicly.
+
+        **Do not disclose a suspected or unpatched vulnerability here.** Use [GitHub private vulnerability reporting](https://github.com/tkolsto/ttygate/security/advisories/new) instead. Keep exploit details, secrets, terminal contents, credentials, tickets, cookies, keys, personal data, and private endpoints out of public issues.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Select the primary component or boundary.
+      options:
+        - Authentication and session identity
+        - Origin, CSRF, and browser boundary
+        - Session tickets and WebSocket binding
+        - Protocol and terminal data
+        - Target policy and process execution
+        - SSH and host verification
+        - Reverse proxy, TLS, and deployment
+        - Audit logs and recordings
+        - Resource limits and availability
+        - Build, dependencies, and release
+        - Documentation and security model
+    validations:
+      required: true
+  - type: textarea
+    id: security-goal
+    attributes:
+      label: Security goal
+      description: State the property this change should establish or preserve.
+    validations:
+      required: true
+  - type: textarea
+    id: threat-model-impact
+    attributes:
+      label: Threat-model and trust-boundary impact
+      description: Identify affected assets, attacker capabilities, trust boundaries, mitigations, or residual risks in docs/threat-model.md.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the externally observable behavior and fail-closed outcome. Do not include vulnerability details.
+    validations:
+      required: true
+  - type: textarea
+    id: abuse-cases
+    attributes:
+      label: Abuse cases and negative paths
+      description: List malformed, unauthorized, cross-user, cross-origin, replay, spoofing, or resource-exhaustion cases the design must reject.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: Provide concrete, reviewable outcomes as a checklist.
+      placeholder: |
+        - [ ] Unauthorized path is rejected
+        - [ ] Authorized path succeeds
+        - [ ] Threat model is updated
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and out-of-scope work
+      description: Link prerequisite issues and identify deliberate non-goals.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan
+      description: Include unit, integration, adversarial, and manual checks, especially rejection paths.
+    validations:
+      required: true
+  - type: checkboxes
+    id: public-safety
+    attributes:
+      label: Public-report safety
+      options:
+        - label: I confirm this is not a vulnerability report and contains no secret, exploit detail, terminal content, credential, session cookie, ticket, private key, personal data, or private endpoint.
+          required: true
