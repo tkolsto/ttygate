@@ -2,3 +2,9 @@
 /target
 node_modules/
 /frontend/dist/
+/spikes/**/target/
+/spikes/**/.tmp/
+/spikes/**/.tmp*/
+/spikes/**/*.key
+/spikes/**/*.log
+/spikes/**/known_hosts*

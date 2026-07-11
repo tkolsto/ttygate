@@ -1,0 +1,13 @@
+[package]
+name = "ttygate-web-stack-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = "0.3.31"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-tungstenite = "0.29.0"
+
+[workspace]
