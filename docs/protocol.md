@@ -6,6 +6,18 @@ This document is the authoritative contract for terminal traffic between the tty
 
 The WebSocket bridge MUST complete the authenticated, single-use ticket redemption flow before accepting terminal traffic. Tickets, secrets, and session identifiers MUST NOT appear in WebSocket URLs or protocol messages defined here.
 
+## Pre-protocol authentication envelope
+
+After the HTTP upgrade has passed Origin and browser-session-cookie authentication, the client MUST send exactly one complete text message before any terminal protocol traffic:
+
+```json
+{"ticket":"<opaque-ticket>"}
+```
+
+This envelope is not a versioned terminal control message and is not accepted after authentication. It is a closed schema: `ticket` is the only field and is required exactly once. The bridge applies a short deadline and a 256-byte UTF-8 bound before parsing. Empty, binary, malformed, duplicate-key, missing-field, unknown-field, wrong-type, and oversized handshakes fail closed without starting a child. The WebSocket transport reassembles frames into one bounded message; the bridge never parses partial fragments.
+
+The ticket is a secret bearer value. Implementations MUST NOT place it in the WebSocket URL, path, query, headers, subprotocol, errors, lifecycle events, or logs, and MUST NOT reflect the raw envelope. The bridge first authenticates the cookie-bound identity and then atomically redeems the ticket against that identity. Successful redemption is single use and yields the server-configured target authority used to create the session.
+
 ## Versioning and compatibility
 
 The current protocol version is the JSON integer `1`. Every control message MUST contain `"version":1` and a `type` discriminator. Binary frames inherit the version established by the surrounding bridge and carry no header.

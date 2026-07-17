@@ -6,8 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+futures-util = { version = "0.3", features = ["sink"] }
 getrandom = "0.4"
 nix = { version = "0.30.1", features = ["process", "signal"] }
 pty-process = { version = "0.5.3", features = ["async"] }
@@ -30,4 +31,5 @@ url = "2"
 http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
