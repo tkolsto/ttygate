@@ -4,7 +4,7 @@ use std::{
 };
 
 use nix::{
-    sys::signal::{Signal, killpg},
+    sys::signal::{Signal, kill, killpg},
     unistd::Pid,
 };
 use thiserror::Error;
@@ -122,24 +122,75 @@ pub(crate) struct PtyChild {
 }
 
 impl PtyChild {
-    #[cfg(test)]
-    async fn terminate_for_test(&mut self) {
-        use std::time::Duration;
-
-        use tokio::time::timeout;
-
-        let _ = killpg(self.process_group, Signal::SIGHUP);
-        if timeout(Duration::from_millis(100), self.inner.wait())
+    pub(crate) async fn wait(&mut self) -> Result<std::process::ExitStatus, BackendError> {
+        self.inner
+            .wait()
             .await
-            .is_err()
-        {
-            let _ = killpg(self.process_group, Signal::SIGKILL);
-            timeout(Duration::from_secs(3), self.inner.wait())
-                .await
-                .expect("child kill wait timed out")
-                .expect("child wait failed");
+            .map_err(|_| BackendError::Unavailable)
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, BackendError> {
+        self.inner.try_wait().map_err(|_| BackendError::Unavailable)
+    }
+
+    pub(crate) async fn terminate(
+        &mut self,
+        grace: std::time::Duration,
+    ) -> Result<std::process::ExitStatus, BackendError> {
+        signal_group(self.process_group, Signal::SIGHUP)?;
+        match tokio::time::timeout(grace, self.inner.wait()).await {
+            Ok(result) => {
+                let status = result.map_err(|_| BackendError::Unavailable)?;
+                kill_group_if_present(self.process_group)?;
+                Ok(status)
+            }
+            Err(_) => {
+                signal_group(self.process_group, Signal::SIGKILL)?;
+                self.inner
+                    .wait()
+                    .await
+                    .map_err(|_| BackendError::Unavailable)
+            }
         }
     }
+
+    pub(crate) async fn cleanup_group_after_exit(
+        &self,
+        grace: std::time::Duration,
+    ) -> Result<(), BackendError> {
+        signal_group(self.process_group, Signal::SIGHUP)?;
+        tokio::time::sleep(grace).await;
+        kill_group_if_present(self.process_group)
+    }
+
+    #[cfg(test)]
+    async fn terminate_for_test(&mut self) {
+        self.terminate(std::time::Duration::from_millis(100))
+            .await
+            .expect("fixture teardown");
+    }
+}
+
+fn signal_group(process_group: Pid, signal: Signal) -> Result<(), BackendError> {
+    match killpg(process_group, signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(_) => Err(BackendError::Unavailable),
+    }
+}
+
+fn group_exists(process_group: Pid) -> Result<bool, BackendError> {
+    match kill(Pid::from_raw(-process_group.as_raw()), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(_) => Err(BackendError::Unavailable),
+    }
+}
+
+fn kill_group_if_present(process_group: Pid) -> Result<(), BackendError> {
+    if group_exists(process_group)? {
+        signal_group(process_group, Signal::SIGKILL)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

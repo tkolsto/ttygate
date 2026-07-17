@@ -2,12 +2,29 @@ use std::{
     collections::HashMap,
     os::unix::process::ExitStatusExt,
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use thiserror::Error;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::{Instant, sleep_until},
+};
 
-use crate::{config::Limits, protocol, ticket::Identity};
+use crate::{
+    config::{Limits, PtyTarget},
+    protocol::{self, MAX_BINARY_BYTES, Resize},
+    pty_backend::{BackendError, PtyProcessBackend, RunningPty},
+    ticket::Identity,
+};
+
+const INPUT_CHANNEL_CAPACITY: usize = 8;
+const OUTPUT_CHANNEL_CAPACITY: usize = 8;
+const LIFECYCLE_CHANNEL_CAPACITY: usize = 3;
+const CLEANUP_GRACE: Duration = Duration::from_millis(150);
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -39,13 +56,6 @@ pub enum ChildOutcome {
 }
 
 impl ChildOutcome {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "wired into the PTY supervisor in the next TDD batch"
-        )
-    )]
     fn from_status(status: std::process::ExitStatus) -> Self {
         if let Some(code) = status.code().and_then(|code| u8::try_from(code).ok()) {
             Self::Code(code)
@@ -106,39 +116,18 @@ pub enum SessionError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the PTY supervisor in the next TDD batch"
-    )
-)]
-struct TerminalState {
-    state: SessionState,
-    reason: SessionCloseReason,
-    outcome: Option<ChildOutcome>,
+pub struct SessionClosed {
+    pub state: SessionState,
+    pub reason: SessionCloseReason,
+    pub outcome: Option<ChildOutcome>,
 }
 
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the PTY supervisor in the next TDD batch"
-    )
-)]
 struct StateMachine {
     state: SessionState,
-    terminal: Option<TerminalState>,
+    terminal: Option<SessionClosed>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the PTY supervisor in the next TDD batch"
-    )
-)]
 impl StateMachine {
     fn new() -> Self {
         Self {
@@ -163,14 +152,14 @@ impl StateMachine {
         &mut self,
         reason: SessionCloseReason,
         outcome: Option<ChildOutcome>,
-    ) -> Result<TerminalState, SessionError> {
+    ) -> Result<SessionClosed, SessionError> {
         if let Some(terminal) = self.terminal {
             return Ok(terminal);
         }
         if self.state != SessionState::Running {
             return Err(SessionError::InvalidTransition);
         }
-        let terminal = TerminalState {
+        let terminal = SessionClosed {
             state: SessionState::Closed,
             reason,
             outcome,
@@ -182,19 +171,11 @@ impl StateMachine {
 }
 
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
-)]
 struct Capacity {
     inner: Arc<CapacityInner>,
 }
 
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
-)]
 struct CapacityInner {
     max_sessions: usize,
     max_sessions_per_identity: usize,
@@ -202,19 +183,11 @@ struct CapacityInner {
 }
 
 #[derive(Debug, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
-)]
 struct CapacityCounts {
     total: usize,
     by_identity: HashMap<Identity, usize>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
-)]
 impl Capacity {
     fn new(limits: &Limits) -> Self {
         Self {
@@ -264,10 +237,6 @@ impl Capacity {
 }
 
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
-)]
 struct Reservation {
     capacity: Arc<CapacityInner>,
     identity: Option<Identity>,
@@ -303,6 +272,442 @@ impl Drop for Reservation {
     }
 }
 
+trait Backend: Send + Sync {
+    fn spawn(&self, target: &PtyTarget, size: Resize) -> Result<RunningPty, BackendError>;
+}
+
+impl Backend for PtyProcessBackend {
+    fn spawn(&self, target: &PtyTarget, size: Resize) -> Result<RunningPty, BackendError> {
+        Self::spawn(target, size)
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionManager {
+    limits: Limits,
+    capacity: Arc<Capacity>,
+    backend: Arc<dyn Backend>,
+}
+
+impl std::fmt::Debug for SessionManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionManager")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionManager {
+    pub fn new(limits: Limits) -> Self {
+        Self {
+            capacity: Arc::new(Capacity::new(&limits)),
+            limits,
+            backend: Arc::new(PtyProcessBackend),
+        }
+    }
+
+    pub async fn start(
+        &self,
+        identity: Identity,
+        target: PtyTarget,
+        initial_size: Resize,
+    ) -> Result<Session, SessionError> {
+        let created_at = Instant::now();
+        let reservation = self.capacity.reserve(&identity)?;
+        let mut state = StateMachine::new();
+        let (event_tx, event_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
+        event_tx
+            .try_send(lifecycle_event(
+                &identity,
+                &target,
+                LifecycleTransition::Created,
+            ))
+            .expect("lifecycle channel holds every possible transition");
+
+        let running = self
+            .backend
+            .spawn(&target, initial_size)
+            .map_err(|_| SessionError::SpawnUnavailable)?;
+        state.start()?;
+        debug_assert_eq!(state.state(), SessionState::Running);
+        event_tx
+            .try_send(lifecycle_event(
+                &identity,
+                &target,
+                LifecycleTransition::Running,
+            ))
+            .expect("lifecycle channel holds every possible transition");
+
+        let (command_tx, command_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
+        let (close_tx, close_rx) = watch::channel(None);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (activity_tx, activity_rx) = watch::channel(created_at);
+        let (final_tx, final_rx) = watch::channel(None);
+        let (worker_event_tx, worker_event_rx) = mpsc::channel(2);
+        let (reader, writer, child) = running.into_parts();
+
+        let reader_task = tokio::spawn(read_output(
+            reader,
+            output_tx,
+            cancel_rx.clone(),
+            activity_tx.clone(),
+            worker_event_tx.clone(),
+        ));
+        let writer_task = tokio::spawn(write_input(
+            writer,
+            command_rx,
+            cancel_rx,
+            activity_tx,
+            worker_event_tx,
+            target.read_only,
+        ));
+        tokio::spawn(supervise(Supervisor {
+            state,
+            identity,
+            target_name: target.name,
+            limits: self.limits.clone(),
+            created_at,
+            reservation,
+            child,
+            close_rx,
+            cancel_tx,
+            activity_rx,
+            final_tx,
+            event_tx,
+            worker_event_rx,
+            reader_task,
+            writer_task,
+        }));
+
+        Ok(Session {
+            command_tx,
+            output_rx,
+            close_tx,
+            final_rx,
+            event_rx,
+            read_only: target.read_only,
+        })
+    }
+}
+
+fn lifecycle_event(
+    identity: &Identity,
+    target: &PtyTarget,
+    transition: LifecycleTransition,
+) -> LifecycleEvent {
+    LifecycleEvent {
+        identity: identity.clone(),
+        target: target.name.clone(),
+        at: SystemTime::now(),
+        transition,
+    }
+}
+
+pub struct Session {
+    command_tx: mpsc::Sender<SessionCommand>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    close_tx: watch::Sender<Option<SessionCloseReason>>,
+    final_rx: watch::Receiver<Option<SessionClosed>>,
+    event_rx: mpsc::Receiver<LifecycleEvent>,
+    read_only: bool,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("state", &self.state())
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Session {
+    pub fn state(&self) -> SessionState {
+        if self.final_rx.borrow().is_some() {
+            SessionState::Closed
+        } else {
+            SessionState::Running
+        }
+    }
+
+    pub async fn read(&mut self) -> Result<Vec<u8>, SessionError> {
+        self.output_rx.recv().await.ok_or(SessionError::Closed)
+    }
+
+    pub async fn write(&self, bytes: Vec<u8>) -> Result<(), SessionError> {
+        if bytes.len() > MAX_BINARY_BYTES {
+            return Err(SessionError::InputTooLarge);
+        }
+        if self.read_only {
+            return Err(SessionError::ReadOnly);
+        }
+        self.command_tx
+            .send(SessionCommand::Input(bytes))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+
+    pub async fn resize(&self, size: Resize) -> Result<(), SessionError> {
+        self.command_tx
+            .send(SessionCommand::Resize(size))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+
+    pub async fn close(&mut self) -> Result<SessionClosed, SessionError> {
+        request_close(&self.close_tx, SessionCloseReason::Explicit);
+        loop {
+            if let Some(closed) = *self.final_rx.borrow() {
+                return Ok(closed);
+            }
+            self.final_rx
+                .changed()
+                .await
+                .map_err(|_| SessionError::BackendUnavailable)?;
+        }
+    }
+
+    pub async fn next_event(&mut self) -> Option<LifecycleEvent> {
+        self.event_rx.recv().await
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.final_rx.borrow().is_none() {
+            request_close(&self.close_tx, SessionCloseReason::HandleDropped);
+        }
+    }
+}
+
+fn request_close(sender: &watch::Sender<Option<SessionCloseReason>>, reason: SessionCloseReason) {
+    sender.send_if_modified(|current| {
+        if current.is_some() {
+            false
+        } else {
+            *current = Some(reason);
+            true
+        }
+    });
+}
+
+enum SessionCommand {
+    Input(Vec<u8>),
+    Resize(Resize),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkerEvent {
+    ReaderEnded,
+    WriterEnded,
+}
+
+async fn read_output(
+    mut reader: crate::pty_backend::PtyReader,
+    output: mpsc::Sender<Vec<u8>>,
+    mut cancel: watch::Receiver<bool>,
+    activity: watch::Sender<Instant>,
+    worker_events: mpsc::Sender<WorkerEvent>,
+) {
+    let mut buffer = vec![0_u8; MAX_BINARY_BYTES];
+    loop {
+        let count = tokio::select! {
+            biased;
+            _ = cancelled(&mut cancel) => break,
+            result = reader.read(&mut buffer) => match result {
+                Ok(0) | Err(_) => break,
+                Ok(count) => count,
+            },
+        };
+        let chunk = buffer[..count].to_vec();
+        let sent = tokio::select! {
+            biased;
+            _ = cancelled(&mut cancel) => false,
+            result = output.send(chunk) => result.is_ok(),
+        };
+        if !sent {
+            break;
+        }
+        activity.send_replace(Instant::now());
+    }
+    let _ = worker_events.try_send(WorkerEvent::ReaderEnded);
+}
+
+async fn write_input(
+    mut writer: crate::pty_backend::PtyWriter,
+    mut commands: mpsc::Receiver<SessionCommand>,
+    mut cancel: watch::Receiver<bool>,
+    activity: watch::Sender<Instant>,
+    worker_events: mpsc::Sender<WorkerEvent>,
+    read_only: bool,
+) {
+    loop {
+        let command = tokio::select! {
+            biased;
+            _ = cancelled(&mut cancel) => break,
+            command = commands.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+        };
+        let result = match command {
+            SessionCommand::Input(bytes) if read_only => {
+                let _ = bytes;
+                continue;
+            }
+            SessionCommand::Input(bytes) => {
+                if bytes.is_empty() {
+                    continue;
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut cancel) => break,
+                    result = async {
+                        writer.write_all(&bytes).await?;
+                        writer.flush().await
+                    } => result.map(|()| true),
+                }
+            }
+            SessionCommand::Resize(size) => writer
+                .resize(size)
+                .map(|()| true)
+                .map_err(|_| std::io::Error::other("curated backend failure")),
+        };
+        match result {
+            Ok(true) => {
+                activity.send_replace(Instant::now());
+            }
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = worker_events.try_send(WorkerEvent::WriterEnded);
+}
+
+async fn cancelled(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+struct Supervisor {
+    state: StateMachine,
+    identity: Identity,
+    target_name: String,
+    limits: Limits,
+    created_at: Instant,
+    reservation: Reservation,
+    child: crate::pty_backend::PtyChild,
+    close_rx: watch::Receiver<Option<SessionCloseReason>>,
+    cancel_tx: watch::Sender<bool>,
+    activity_rx: watch::Receiver<Instant>,
+    final_tx: watch::Sender<Option<SessionClosed>>,
+    event_tx: mpsc::Sender<LifecycleEvent>,
+    worker_event_rx: mpsc::Receiver<WorkerEvent>,
+    reader_task: JoinHandle<()>,
+    writer_task: JoinHandle<()>,
+}
+
+async fn supervise(mut supervisor: Supervisor) {
+    let absolute_deadline = supervisor.created_at + supervisor.limits.absolute_timeout;
+    let idle_deadline = supervisor.created_at + supervisor.limits.idle_timeout;
+    let absolute_sleep = sleep_until(absolute_deadline);
+    let idle_sleep = sleep_until(idle_deadline);
+    tokio::pin!(absolute_sleep);
+    tokio::pin!(idle_sleep);
+
+    let (mut reason, natural_status) = loop {
+        tokio::select! {
+            biased;
+            _ = &mut absolute_sleep => {
+                break (SessionCloseReason::Timeout(TimeoutKind::Absolute), None);
+            }
+            status = supervisor.child.wait() => {
+                break match status {
+                    Ok(status) => (SessionCloseReason::ChildExited, Some(status)),
+                    Err(_) => (SessionCloseReason::BackendFailure, None),
+                };
+            }
+            changed = supervisor.close_rx.changed() => {
+                let requested = if changed.is_err() {
+                    SessionCloseReason::HandleDropped
+                } else {
+                    (*supervisor.close_rx.borrow_and_update())
+                        .unwrap_or(SessionCloseReason::HandleDropped)
+                };
+                break (requested, None);
+            }
+            changed = supervisor.activity_rx.changed() => {
+                if changed.is_ok() {
+                    let last_activity = *supervisor.activity_rx.borrow_and_update();
+                    idle_sleep.as_mut().reset(last_activity + supervisor.limits.idle_timeout);
+                }
+            }
+            _ = &mut idle_sleep => {
+                break (SessionCloseReason::Timeout(TimeoutKind::Idle), None);
+            }
+            worker = supervisor.worker_event_rx.recv() => {
+                let _ = worker;
+                break match supervisor.child.try_wait() {
+                    Ok(Some(status)) => (SessionCloseReason::ChildExited, Some(status)),
+                    Ok(None) | Err(_) => (SessionCloseReason::BackendFailure, None),
+                };
+            }
+        }
+    };
+
+    supervisor.cancel_tx.send_replace(true);
+    let outcome = if let Some(status) = natural_status {
+        if supervisor
+            .child
+            .cleanup_group_after_exit(CLEANUP_GRACE)
+            .await
+            .is_err()
+        {
+            reason = SessionCloseReason::BackendFailure;
+        }
+        Some(ChildOutcome::from_status(status))
+    } else {
+        match supervisor.child.terminate(CLEANUP_GRACE).await {
+            Ok(status) => Some(ChildOutcome::from_status(status)),
+            Err(_) => {
+                reason = SessionCloseReason::BackendFailure;
+                None
+            }
+        }
+    };
+
+    join_worker(supervisor.reader_task).await;
+    join_worker(supervisor.writer_task).await;
+    let closed = supervisor
+        .state
+        .close(reason, outcome)
+        .expect("supervisor closes a running session exactly once");
+    supervisor.final_tx.send_replace(Some(closed));
+    let _ = supervisor.event_tx.try_send(LifecycleEvent {
+        identity: supervisor.identity,
+        target: supervisor.target_name,
+        at: SystemTime::now(),
+        transition: LifecycleTransition::Closed { reason, outcome },
+    });
+    drop(supervisor.reservation);
+}
+
+async fn join_worker(mut worker: JoinHandle<()>) {
+    if tokio::time::timeout(WORKER_JOIN_TIMEOUT, &mut worker)
+        .await
+        .is_err()
+    {
+        worker.abort();
+        let _ = worker.await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -312,11 +717,15 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use crate::{config::Limits, ticket::Identity};
+    use crate::{
+        config::{Limits, PtyTarget},
+        protocol::{MAX_BINARY_BYTES, Resize},
+        ticket::Identity,
+    };
 
     use super::{
         Capacity, ChildOutcome, LifecycleEvent, LifecycleTransition, SessionCloseReason,
-        SessionError, SessionState, StateMachine, TimeoutKind,
+        SessionError, SessionManager, SessionState, StateMachine, TimeoutKind,
     };
 
     #[test]
@@ -497,5 +906,173 @@ mod tests {
         assert_eq!(capacity.active(), (2, 2));
         drop(reservations);
         assert_eq!(capacity.active(), (0, 0));
+    }
+
+    fn fixture_target(read_only: bool) -> PtyTarget {
+        PtyTarget {
+            name: "fixture".to_owned(),
+            executable: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pty_child.sh"),
+            argv: Vec::new(),
+            read_only,
+        }
+    }
+
+    async fn session_read_until(session: &mut super::Session, marker: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !output.windows(marker.len()).any(|window| window == marker) {
+                let chunk = session.read().await.expect("session output");
+                output.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("session output marker timed out");
+        output
+    }
+
+    #[tokio::test]
+    async fn io_session_echoes_opaque_output_and_propagates_resize() {
+        let manager = SessionManager::new(limits(4, 2));
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                fixture_target(false),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        session_read_until(&mut session, b"INITIAL:24 80").await;
+        session.resize(Resize::new(132, 41).unwrap()).await.unwrap();
+        session.write(b"size\n".to_vec()).await.unwrap();
+        session_read_until(&mut session, b"RESIZED:41 132").await;
+        session.write(b"opaque-token\n".to_vec()).await.unwrap();
+        session_read_until(&mut session, b"ECHO:opaque-token").await;
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_input_is_rejected_before_reaching_the_pty() {
+        let manager = SessionManager::new(limits(4, 2));
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                fixture_target(true),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        session_read_until(&mut session, b"READY").await;
+        assert_eq!(
+            session.write(b"forbidden-token\n".to_vec()).await,
+            Err(SessionError::ReadOnly)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), session.read())
+                .await
+                .is_err()
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn io_rejects_oversized_input_and_close_is_idempotent() {
+        let manager = SessionManager::new(limits(4, 2));
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                fixture_target(false),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.write(vec![0; MAX_BINARY_BYTES + 1]).await,
+            Err(SessionError::InputTooLarge)
+        );
+        let first = session.close().await.unwrap();
+        let repeated = session.close().await.unwrap();
+        assert_eq!(first, repeated);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_stream_has_exactly_created_running_closed() {
+        let manager = SessionManager::new(limits(4, 2));
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                fixture_target(false),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        let created = session.next_event().await.unwrap();
+        let running = session.next_event().await.unwrap();
+        assert_eq!(created.transition, LifecycleTransition::Created);
+        assert_eq!(running.transition, LifecycleTransition::Running);
+        session.close().await.unwrap();
+        let closed = session.next_event().await.unwrap();
+        assert!(matches!(
+            closed.transition,
+            LifecycleTransition::Closed {
+                reason: SessionCloseReason::Explicit,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn io_output_flood_is_bounded_and_close_remains_selectable() {
+        let manager = SessionManager::new(limits(4, 2));
+        let flood = PtyTarget {
+            name: "flood".to_owned(),
+            executable: "/usr/bin/yes".into(),
+            argv: Vec::new(),
+            read_only: false,
+        };
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                flood,
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while session.output_rx.len() < super::OUTPUT_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded output queue did not fill");
+        assert_eq!(session.output_rx.len(), super::OUTPUT_CHANNEL_CAPACITY);
+        let closed = tokio::time::timeout(Duration::from_secs(3), session.close())
+            .await
+            .expect("close was blocked by output backpressure")
+            .unwrap();
+        assert_eq!(closed.reason, SessionCloseReason::Explicit);
+    }
+
+    #[tokio::test]
+    async fn reservation_is_released_when_real_spawn_fails() {
+        let manager = SessionManager::new(limits(1, 1));
+        let identity = Identity::new("alice").unwrap();
+        let mut missing = fixture_target(false);
+        missing.executable = "/definitely/not/a/ttygate-program".into();
+        assert!(matches!(
+            manager
+                .start(identity.clone(), missing, Resize::new(80, 24).unwrap())
+                .await,
+            Err(SessionError::SpawnUnavailable)
+        ));
+        let mut session = manager
+            .start(
+                identity,
+                fixture_target(false),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .expect("spawn failure must release reservation");
+        session.close().await.unwrap();
     }
 }
