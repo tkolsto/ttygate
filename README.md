@@ -7,7 +7,7 @@ ttygate is a security-first browser terminal gateway inspired by Shell In A Box.
 
 ## Current status
 
-ttygate is pre-release software. The repository currently contains the Rust HTTP daemon foundation, bundled xterm.js frontend scaffold, explicit browser Origin checks, a development identity cookie, bounded single-use session tickets, and an allowlisted PTY session backend with bounded I/O and guaranteed process-group teardown. There is no usable browser terminal yet: the WebSocket bridge, frontend terminal integration, SSH execution, production authentication and transport gating, audit persistence, and deployment controls are still planned.
+ttygate is pre-release software. The repository currently contains the Rust HTTP daemon foundation, bundled xterm.js frontend scaffold, explicit browser Origin checks, a development identity cookie, bounded single-use session tickets, and an allowlisted PTY session backend with bounded I/O and guaranteed process-group teardown. There is no terminal gateway yet: the WebSocket bridge, frontend terminal integration, SSH execution, production authentication and transport gating, audit persistence, and deployment controls are still planned.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
 

@@ -133,19 +133,39 @@ impl PtyChild {
         &mut self,
         grace: std::time::Duration,
     ) -> Result<std::process::ExitStatus, BackendError> {
-        signal_group(self.process_group, Signal::SIGHUP)?;
-        match tokio::time::timeout(grace, self.inner.wait()).await {
+        self.terminate_with(grace, signal_group).await
+    }
+
+    async fn terminate_with(
+        &mut self,
+        grace: std::time::Duration,
+        mut signal: impl FnMut(Pid, Signal) -> Result<(), BackendError>,
+    ) -> Result<std::process::ExitStatus, BackendError> {
+        let mut cleanup_failed = signal(self.process_group, Signal::SIGHUP).is_err();
+        let grace_deadline = tokio::time::Instant::now() + grace;
+        match tokio::time::timeout_at(grace_deadline, self.inner.wait()).await {
             Ok(result) => {
-                let status = result.map_err(|_| BackendError::Unavailable)?;
-                kill_group_if_present(self.process_group)?;
-                Ok(status)
+                let status = result.map_err(|_| BackendError::Unavailable);
+                tokio::time::sleep_until(grace_deadline).await;
+                cleanup_failed |= signal(self.process_group, Signal::SIGKILL).is_err();
+                if cleanup_failed {
+                    Err(BackendError::Unavailable)
+                } else {
+                    status
+                }
             }
             Err(_) => {
-                signal_group(self.process_group, Signal::SIGKILL)?;
-                self.inner
+                cleanup_failed |= signal(self.process_group, Signal::SIGKILL).is_err();
+                let status = self
+                    .inner
                     .wait()
                     .await
-                    .map_err(|_| BackendError::Unavailable)
+                    .map_err(|_| BackendError::Unavailable);
+                if cleanup_failed {
+                    Err(BackendError::Unavailable)
+                } else {
+                    status
+                }
             }
         }
     }
@@ -154,9 +174,14 @@ impl PtyChild {
         &self,
         grace: std::time::Duration,
     ) -> Result<(), BackendError> {
-        signal_group(self.process_group, Signal::SIGHUP)?;
+        let mut cleanup_failed = signal_group(self.process_group, Signal::SIGHUP).is_err();
         tokio::time::sleep(grace).await;
-        kill_group_if_present(self.process_group)
+        cleanup_failed |= kill_group_if_present(self.process_group).is_err();
+        if cleanup_failed {
+            Err(BackendError::Unavailable)
+        } else {
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -182,6 +207,10 @@ fn kill_group_if_present(process_group: Pid) -> Result<(), BackendError> {
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         time::timeout,
@@ -189,7 +218,7 @@ mod tests {
 
     use crate::{config::PtyTarget, protocol::Resize};
 
-    use super::PtyProcessBackend;
+    use super::{BackendError, PtyProcessBackend, signal_group};
 
     const WAIT: Duration = Duration::from_secs(3);
 
@@ -268,5 +297,32 @@ mod tests {
         let message = error.to_string();
         assert!(!message.contains("definitely"));
         assert!(!message.contains("ttygate-fixture"));
+    }
+
+    #[tokio::test]
+    async fn signal_error_still_waits_for_and_reaps_the_child() {
+        let running = PtyProcessBackend::spawn(&target(&[]), Resize::new(80, 24).unwrap())
+            .expect("spawn fixture");
+        let (mut reader, _writer, mut child) = running.into_parts();
+        let mut output = Vec::new();
+        read_until(&mut reader, &mut output, b"READY").await;
+        let pid = child.process_group;
+        let mut first = true;
+        let result = child
+            .terminate_with(Duration::from_millis(100), |group, signal| {
+                signal_group(group, signal)?;
+                if first && signal == Signal::SIGHUP {
+                    first = false;
+                    Err(BackendError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+        assert_eq!(result, Err(BackendError::Unavailable));
+        assert_eq!(
+            kill(Pid::from_raw(pid.as_raw()), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
     }
 }

@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, watch},
+    sync::{Notify, broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, sleep_until},
 };
@@ -23,6 +23,7 @@ use crate::{
 const INPUT_CHANNEL_CAPACITY: usize = 8;
 const OUTPUT_CHANNEL_CAPACITY: usize = 8;
 const LIFECYCLE_CHANNEL_CAPACITY: usize = 3;
+const AUDIT_CHANNEL_CAPACITY: usize = 64;
 const CLEANUP_GRACE: Duration = Duration::from_millis(150);
 const CHILD_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -45,6 +46,7 @@ pub enum SessionCloseReason {
     ChildExited,
     Explicit,
     HandleDropped,
+    ManagerShutdown,
     Timeout(TimeoutKind),
     BackendFailure,
 }
@@ -106,6 +108,8 @@ pub enum SessionError {
     SpawnUnavailable,
     #[error("The requested terminal target is unavailable.")]
     TargetUnavailable,
+    #[error("The terminal session manager is shutting down.")]
+    ManagerClosed,
     #[error("The terminal backend is unavailable.")]
     BackendUnavailable,
     #[error("The terminal session is closed.")]
@@ -114,6 +118,8 @@ pub enum SessionError {
     ReadOnly,
     #[error("The terminal input is too large.")]
     InputTooLarge,
+    #[error("The terminal dimensions are invalid.")]
+    InvalidResize,
     #[error("The session state transition is invalid.")]
     InvalidTransition,
 }
@@ -291,6 +297,45 @@ pub struct SessionManager {
     capacity: Arc<Capacity>,
     backend: Arc<dyn Backend>,
     targets: Arc<TargetAllowlist>,
+    supervisors: Arc<SupervisorRegistry>,
+    audit_tx: broadcast::Sender<LifecycleEvent>,
+}
+
+#[derive(Default)]
+struct SupervisorRegistry {
+    inner: Mutex<SupervisorRegistryState>,
+    admission: tokio::sync::RwLock<()>,
+    shutdown: tokio::sync::Mutex<()>,
+    completed: Notify,
+}
+
+#[derive(Default)]
+struct SupervisorRegistryState {
+    next_id: u64,
+    shutting_down: bool,
+    active: HashMap<u64, ActiveSupervisor>,
+}
+
+struct ActiveSupervisor {
+    close_tx: watch::Sender<Option<SessionCloseReason>>,
+    _task: JoinHandle<()>,
+}
+
+struct SupervisorCompletion {
+    registry: Arc<SupervisorRegistry>,
+    id: u64,
+}
+
+impl Drop for SupervisorCompletion {
+    fn drop(&mut self) {
+        self.registry
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .remove(&self.id);
+        self.registry.completed.notify_one();
+    }
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -304,37 +349,46 @@ impl std::fmt::Debug for SessionManager {
 
 impl SessionManager {
     pub fn new(limits: Limits, targets: TargetAllowlist) -> Self {
+        let (audit_tx, _) = broadcast::channel(AUDIT_CHANNEL_CAPACITY);
         Self {
             capacity: Arc::new(Capacity::new(&limits)),
             limits,
             backend: Arc::new(PtyProcessBackend),
             targets: Arc::new(targets),
+            supervisors: Arc::new(SupervisorRegistry::default()),
+            audit_tx,
         }
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<LifecycleEvent> {
+        self.audit_tx.subscribe()
     }
 
     pub async fn start(
         &self,
         identity: Identity,
-        target: PtyTarget,
+        target_name: &str,
         initial_size: Resize,
     ) -> Result<Session, SessionError> {
-        match self.targets.resolve(&target.name) {
-            Ok(Target::Pty(configured)) if configured == &target => {}
-            Ok(Target::Pty(_) | Target::Ssh(_)) | Err(_) => {
-                return Err(SessionError::TargetUnavailable);
-            }
+        let _admission = self.supervisors.admission.read().await;
+        if self
+            .supervisors
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutting_down
+        {
+            return Err(SessionError::ManagerClosed);
         }
+        let target = match self.targets.resolve(target_name) {
+            Ok(Target::Pty(configured)) => configured.clone(),
+            Ok(Target::Ssh(_)) | Err(_) => return Err(SessionError::TargetUnavailable),
+        };
+        validate_resize(&initial_size)?;
         let created_at = Instant::now();
         let reservation = self.capacity.reserve(&identity)?;
         let mut state = StateMachine::new();
         let (event_tx, event_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
-        event_tx
-            .try_send(lifecycle_event(
-                &identity,
-                &target,
-                LifecycleTransition::Created,
-            ))
-            .expect("lifecycle channel holds every possible transition");
 
         let running = self
             .backend
@@ -342,13 +396,13 @@ impl SessionManager {
             .map_err(|_| SessionError::SpawnUnavailable)?;
         state.start()?;
         debug_assert_eq!(state.state(), SessionState::Running);
-        event_tx
-            .try_send(lifecycle_event(
-                &identity,
-                &target,
-                LifecycleTransition::Running,
-            ))
-            .expect("lifecycle channel holds every possible transition");
+        for transition in [LifecycleTransition::Created, LifecycleTransition::Running] {
+            let event = lifecycle_event(&identity, &target, transition);
+            event_tx
+                .try_send(event.clone())
+                .expect("lifecycle channel holds every possible transition");
+            let _ = self.audit_tx.send(event);
+        }
 
         let (command_tx, command_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
@@ -374,7 +428,7 @@ impl SessionManager {
             worker_event_tx,
             target.read_only,
         ));
-        tokio::spawn(supervise(Supervisor {
+        let supervisor = Supervisor {
             state,
             identity,
             target_name: target.name,
@@ -387,10 +441,39 @@ impl SessionManager {
             activity_rx,
             final_tx,
             event_tx,
+            audit_tx: self.audit_tx.clone(),
             worker_event_rx,
             reader_task,
             writer_task,
-        }));
+        };
+        let (start_tx, start_rx) = oneshot::channel();
+        let supervisors = Arc::clone(&self.supervisors);
+        {
+            let mut registry = supervisors
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            debug_assert!(!registry.shutting_down);
+            let id = registry.next_id;
+            registry.next_id = registry.next_id.wrapping_add(1);
+            let registry_for_task = Arc::clone(&supervisors);
+            let task = tokio::spawn(async move {
+                let _completion = SupervisorCompletion {
+                    registry: registry_for_task,
+                    id,
+                };
+                let _ = start_rx.await;
+                supervise(supervisor).await;
+            });
+            registry.active.insert(
+                id,
+                ActiveSupervisor {
+                    close_tx: close_tx.clone(),
+                    _task: task,
+                },
+            );
+        }
+        let _ = start_tx.send(());
 
         Ok(Session {
             command_tx,
@@ -401,6 +484,48 @@ impl SessionManager {
             read_only: target.read_only,
         })
     }
+
+    pub async fn shutdown(&self) {
+        let _shutdown = self.supervisors.shutdown.lock().await;
+        let admission = self.supervisors.admission.write().await;
+        let close_senders = {
+            let mut registry = self
+                .supervisors
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.shutting_down = true;
+            registry
+                .active
+                .values()
+                .map(|active| active.close_tx.clone())
+                .collect::<Vec<_>>()
+        };
+        drop(admission);
+        for close_tx in close_senders {
+            request_close(&close_tx, SessionCloseReason::ManagerShutdown);
+        }
+        loop {
+            let completed = self.supervisors.completed.notified();
+            if self
+                .supervisors
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active
+                .is_empty()
+            {
+                break;
+            }
+            completed.await;
+        }
+    }
+}
+
+fn validate_resize(size: &Resize) -> Result<(), SessionError> {
+    Resize::new(size.cols, size.rows)
+        .map(|_| ())
+        .map_err(|_| SessionError::InvalidResize)
 }
 
 fn lifecycle_event(
@@ -462,6 +587,7 @@ impl Session {
     }
 
     pub async fn resize(&self, size: Resize) -> Result<(), SessionError> {
+        validate_resize(&size)?;
         self.command_tx
             .send(SessionCommand::Resize(size))
             .await
@@ -470,6 +596,10 @@ impl Session {
 
     pub async fn close(&mut self) -> Result<SessionClosed, SessionError> {
         request_close(&self.close_tx, SessionCloseReason::Explicit);
+        self.wait_closed().await
+    }
+
+    pub async fn wait_closed(&mut self) -> Result<SessionClosed, SessionError> {
         loop {
             if let Some(closed) = *self.final_rx.borrow() {
                 return Ok(closed);
@@ -619,6 +749,7 @@ struct Supervisor {
     activity_rx: watch::Receiver<Instant>,
     final_tx: watch::Sender<Option<SessionClosed>>,
     event_tx: mpsc::Sender<LifecycleEvent>,
+    audit_tx: broadcast::Sender<LifecycleEvent>,
     worker_event_rx: mpsc::Receiver<WorkerEvent>,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
@@ -703,12 +834,14 @@ async fn supervise(mut supervisor: Supervisor) {
         .close(reason, outcome)
         .expect("supervisor closes a running session exactly once");
     supervisor.final_tx.send_replace(Some(closed));
-    let _ = supervisor.event_tx.try_send(LifecycleEvent {
+    let closed_event = LifecycleEvent {
         identity: supervisor.identity,
         target: supervisor.target_name,
         at: SystemTime::now(),
         transition: LifecycleTransition::Closed { reason, outcome },
-    });
+    };
+    let _ = supervisor.event_tx.try_send(closed_event.clone());
+    let _ = supervisor.audit_tx.send(closed_event);
     drop(supervisor.reservation);
 }
 
@@ -797,6 +930,7 @@ mod tests {
         let reasons = [
             SessionCloseReason::Explicit,
             SessionCloseReason::HandleDropped,
+            SessionCloseReason::ManagerShutdown,
             SessionCloseReason::Timeout(TimeoutKind::Idle),
             SessionCloseReason::Timeout(TimeoutKind::Absolute),
             SessionCloseReason::ChildExited,
@@ -817,10 +951,12 @@ mod tests {
             SessionError::IdentityLimit,
             SessionError::SpawnUnavailable,
             SessionError::TargetUnavailable,
+            SessionError::ManagerClosed,
             SessionError::BackendUnavailable,
             SessionError::Closed,
             SessionError::ReadOnly,
             SessionError::InputTooLarge,
+            SessionError::InvalidResize,
             SessionError::InvalidTransition,
         ];
         for error in errors {
@@ -942,17 +1078,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowlist_rejects_forged_typed_target_before_spawn() {
+    async fn allowlist_rejects_unknown_target_before_spawn() {
         let configured = fixture_target(false);
-        let manager = SessionManager::new(limits(4, 2), allowlist(&[configured.clone()]));
-        let mut forged = configured;
-        forged.executable = "/bin/sh".into();
-        forged.argv = vec!["-c".to_owned(), "echo bypass".to_owned()];
+        let manager =
+            SessionManager::new(limits(4, 2), allowlist(std::slice::from_ref(&configured)));
         assert!(matches!(
             manager
                 .start(
                     Identity::new("alice").unwrap(),
-                    forged,
+                    "unknown",
                     Resize::new(80, 24).unwrap(),
                 )
                 .await,
@@ -979,7 +1113,7 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                fixture_target(false),
+                "fixture",
                 Resize::new(80, 24).unwrap(),
             )
             .await
@@ -999,7 +1133,7 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                fixture_target(true),
+                "fixture",
                 Resize::new(80, 24).unwrap(),
             )
             .await
@@ -1023,7 +1157,7 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                fixture_target(false),
+                "fixture",
                 Resize::new(80, 24).unwrap(),
             )
             .await
@@ -1043,7 +1177,7 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                fixture_target(false),
+                "fixture",
                 Resize::new(80, 24).unwrap(),
             )
             .await
@@ -1064,6 +1198,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_audit_stream_survives_session_handle_drop() {
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
+        let mut audit = manager.subscribe_events();
+        let session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            audit.recv().await.unwrap().transition,
+            LifecycleTransition::Created
+        );
+        assert_eq!(
+            audit.recv().await.unwrap().transition,
+            LifecycleTransition::Running
+        );
+        drop(session);
+        let closed = tokio::time::timeout(Duration::from_secs(3), audit.recv())
+            .await
+            .expect("audit close event timed out")
+            .unwrap();
+        assert!(matches!(
+            closed.transition,
+            LifecycleTransition::Closed {
+                reason: SessionCloseReason::HandleDropped,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_awaits_supervisors_and_rejects_new_sessions() {
+        let mut resistant = fixture_target(false);
+        resistant.argv = vec!["ignore-hup".to_owned()];
+        let manager = manager(limits(4, 2), &[resistant]);
+        let _session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        manager.shutdown().await;
+        assert!(matches!(
+            manager
+                .start(
+                    Identity::new("bob").unwrap(),
+                    "fixture",
+                    Resize::new(80, 24).unwrap(),
+                )
+                .await,
+            Err(SessionError::ManagerClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_start_and_shutdown_leave_no_unowned_supervisor() {
+        let target = PtyTarget {
+            name: "short".to_owned(),
+            executable: "/usr/bin/true".into(),
+            argv: Vec::new(),
+            read_only: false,
+        };
+        for index in 0..20 {
+            let manager = manager(limits(4, 2), std::slice::from_ref(&target));
+            let starting = {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .start(
+                            Identity::new(format!("user-{index}")).unwrap(),
+                            "short",
+                            Resize::new(80, 24).unwrap(),
+                        )
+                        .await
+                })
+            };
+            let shutting_down = {
+                let manager = manager.clone();
+                tokio::spawn(async move { manager.shutdown().await })
+            };
+            let result = starting.await.unwrap();
+            shutting_down.await.unwrap();
+            drop(result);
+            assert!(
+                manager
+                    .supervisors
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .active
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_resize_is_rejected_at_every_public_boundary() {
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
+        let invalid = Resize { cols: 0, rows: 24 };
+        assert!(matches!(
+            manager
+                .start(Identity::new("alice").unwrap(), "fixture", invalid.clone())
+                .await,
+            Err(SessionError::InvalidResize)
+        ));
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.resize(invalid).await,
+            Err(SessionError::InvalidResize)
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_closed_observes_natural_exit_without_overwriting_reason() {
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        session_read_until(&mut session, b"READY").await;
+        session.write(b"exit\n".to_vec()).await.unwrap();
+        let closed = session.wait_closed().await.unwrap();
+        assert_eq!(closed.outcome, Some(ChildOutcome::Code(0)));
+        assert!(matches!(
+            closed.reason,
+            SessionCloseReason::ChildExited | SessionCloseReason::BackendFailure
+        ));
+    }
+
+    #[tokio::test]
+    async fn io_output_remains_opaque_binary_data() {
+        let binary = PtyTarget {
+            name: "binary".to_owned(),
+            executable: "/usr/bin/printf".into(),
+            argv: vec!["\\377\\000X".to_owned()],
+            read_only: false,
+        };
+        let manager = manager(limits(4, 2), std::slice::from_ref(&binary));
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "binary",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(3), session.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.windows(3).any(|window| window == [0xff, 0x00, b'X']));
+        session.wait_closed().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn io_output_flood_is_bounded_and_close_remains_selectable() {
         let flood = PtyTarget {
             name: "flood".to_owned(),
@@ -1075,7 +1381,7 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                flood,
+                "flood",
                 Resize::new(80, 24).unwrap(),
             )
             .await
@@ -1096,6 +1402,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn output_worker_failure_enters_supervised_backend_teardown() {
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        session_read_until(&mut session, b"READY").await;
+        let (_replacement_tx, replacement_rx) = tokio::sync::mpsc::channel(1);
+        let original_rx = std::mem::replace(&mut session.output_rx, replacement_rx);
+        drop(original_rx);
+        session.write(b"force-output\n".to_vec()).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(3), session.wait_closed())
+            .await
+            .expect("worker failure did not close session")
+            .unwrap();
+        assert_eq!(closed.reason, SessionCloseReason::BackendFailure);
+    }
+
+    #[tokio::test]
     async fn reservation_is_released_when_real_spawn_fails() {
         let identity = Identity::new("alice").unwrap();
         let mut missing = fixture_target(false);
@@ -1104,16 +1433,12 @@ mod tests {
         let manager = manager(limits(1, 1), &[missing.clone(), fixture_target(false)]);
         assert!(matches!(
             manager
-                .start(identity.clone(), missing, Resize::new(80, 24).unwrap())
+                .start(identity.clone(), "missing", Resize::new(80, 24).unwrap())
                 .await,
             Err(SessionError::SpawnUnavailable)
         ));
         let mut session = manager
-            .start(
-                identity,
-                fixture_target(false),
-                Resize::new(80, 24).unwrap(),
-            )
+            .start(identity, "fixture", Resize::new(80, 24).unwrap())
             .await
             .expect("spawn failure must release reservation");
         session.close().await.unwrap();
@@ -1142,7 +1467,7 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                fixture_target(false),
+                "fixture",
                 Resize::new(80, 24).unwrap(),
             )
             .await
@@ -1154,7 +1479,8 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(9)).await;
         assert_eq!(session.state(), SessionState::Running);
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_millis(900)).await;
+        assert_eq!(session.state(), SessionState::Running);
         tokio::time::resume();
         let transition = closed_event(&mut session).await;
         assert!(
@@ -1170,7 +1496,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn absolute_timeout_is_independent_of_activity_and_wins_ties() {
+    async fn absolute_timeout_is_independent_of_activity() {
         tokio::time::resume();
         let manager = manager(
             Limits {
@@ -1183,23 +1509,23 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                fixture_target(false),
+                "fixture",
                 Resize::new(80, 24).unwrap(),
             )
             .await
             .unwrap();
         session_read_until(&mut session, b"READY").await;
         tokio::time::pause();
-        for cols in 81..=85 {
+        for cols in 81..=84 {
             tokio::time::advance(Duration::from_secs(2)).await;
-            if cols < 85 {
-                session
-                    .resize(Resize::new(cols, 24).unwrap())
-                    .await
-                    .unwrap();
-                tokio::task::yield_now().await;
-            }
+            session
+                .resize(Resize::new(cols, 24).unwrap())
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
         }
+        tokio::time::advance(Duration::from_millis(1_900)).await;
+        assert_eq!(session.state(), SessionState::Running);
         tokio::time::resume();
         let transition = closed_event(&mut session).await;
         assert!(
@@ -1228,7 +1554,7 @@ mod tests {
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
-                fixture_target(true),
+                "fixture",
                 Resize::new(80, 24).unwrap(),
             )
             .await
