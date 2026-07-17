@@ -24,6 +24,7 @@ const INPUT_CHANNEL_CAPACITY: usize = 8;
 const OUTPUT_CHANNEL_CAPACITY: usize = 8;
 const LIFECYCLE_CHANNEL_CAPACITY: usize = 3;
 const CLEANUP_GRACE: Duration = Duration::from_millis(150);
+const CHILD_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,9 +654,12 @@ async fn supervise(mut supervisor: Supervisor) {
             }
             worker = supervisor.worker_event_rx.recv() => {
                 let _ = worker;
-                break match supervisor.child.try_wait() {
-                    Ok(Some(status)) => (SessionCloseReason::ChildExited, Some(status)),
-                    Ok(None) | Err(_) => (SessionCloseReason::BackendFailure, None),
+                break match tokio::time::timeout(
+                    CHILD_EXIT_SETTLE,
+                    supervisor.child.wait(),
+                ).await {
+                    Ok(Ok(status)) => (SessionCloseReason::ChildExited, Some(status)),
+                    Ok(Err(_)) | Err(_) => (SessionCloseReason::BackendFailure, None),
                 };
             }
         }

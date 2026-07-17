@@ -129,10 +129,6 @@ impl PtyChild {
             .map_err(|_| BackendError::Unavailable)
     }
 
-    pub(crate) fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, BackendError> {
-        self.inner.try_wait().map_err(|_| BackendError::Unavailable)
-    }
-
     pub(crate) async fn terminate(
         &mut self,
         grace: std::time::Duration,
