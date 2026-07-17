@@ -1,8 +1,13 @@
-use std::{os::unix::process::ExitStatusExt, time::SystemTime};
+use std::{
+    collections::HashMap,
+    os::unix::process::ExitStatusExt,
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
 
 use thiserror::Error;
 
-use crate::{protocol, ticket::Identity};
+use crate::{config::Limits, protocol, ticket::Identity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -176,18 +181,142 @@ impl StateMachine {
     }
 }
 
+#[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
+)]
+struct Capacity {
+    inner: Arc<CapacityInner>,
+}
+
+#[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
+)]
+struct CapacityInner {
+    max_sessions: usize,
+    max_sessions_per_identity: usize,
+    counts: Mutex<CapacityCounts>,
+}
+
+#[derive(Debug, Default)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
+)]
+struct CapacityCounts {
+    total: usize,
+    by_identity: HashMap<Identity, usize>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
+)]
+impl Capacity {
+    fn new(limits: &Limits) -> Self {
+        Self {
+            inner: Arc::new(CapacityInner {
+                max_sessions: limits.max_sessions,
+                max_sessions_per_identity: limits.max_sessions_per_user,
+                counts: Mutex::new(CapacityCounts::default()),
+            }),
+        }
+    }
+
+    fn reserve(&self, identity: &Identity) -> Result<Reservation, SessionError> {
+        let mut counts = self
+            .inner
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if counts.total >= self.inner.max_sessions {
+            return Err(SessionError::GlobalLimit);
+        }
+        let identity_count = counts.by_identity.get(identity).copied().unwrap_or(0);
+        if identity_count >= self.inner.max_sessions_per_identity {
+            return Err(SessionError::IdentityLimit);
+        }
+        counts.total += 1;
+        counts
+            .by_identity
+            .insert(identity.clone(), identity_count + 1);
+        Ok(Reservation {
+            capacity: Arc::clone(&self.inner),
+            identity: Some(identity.clone()),
+        })
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> (usize, usize) {
+        let counts = self
+            .inner
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            counts.total,
+            counts.by_identity.values().copied().max().unwrap_or(0),
+        )
+    }
+}
+
+#[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into SessionManager in the next TDD batch")
+)]
+struct Reservation {
+    capacity: Arc<CapacityInner>,
+    identity: Option<Identity>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let Some(identity) = self.identity.take() else {
+            return;
+        };
+        let mut counts = self
+            .capacity
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counts.total = counts
+            .total
+            .checked_sub(1)
+            .expect("a live reservation contributes to total");
+        let remove_identity = {
+            let identity_count = counts
+                .by_identity
+                .get_mut(&identity)
+                .expect("a live reservation contributes to its identity");
+            *identity_count = identity_count
+                .checked_sub(1)
+                .expect("a live reservation has a positive identity count");
+            *identity_count == 0
+        };
+        if remove_identity {
+            counts.by_identity.remove(&identity);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         os::unix::process::ExitStatusExt,
+        sync::{Arc, Barrier},
+        thread,
         time::{Duration, SystemTime},
     };
 
-    use crate::ticket::Identity;
+    use crate::{config::Limits, ticket::Identity};
 
     use super::{
-        ChildOutcome, LifecycleEvent, LifecycleTransition, SessionCloseReason, SessionError,
-        SessionState, StateMachine, TimeoutKind,
+        Capacity, ChildOutcome, LifecycleEvent, LifecycleTransition, SessionCloseReason,
+        SessionError, SessionState, StateMachine, TimeoutKind,
     };
 
     #[test]
@@ -306,5 +435,76 @@ mod tests {
         assert!(!debug.contains("cookie"));
         assert!(!debug.contains("ticket"));
         assert!(!debug.contains("argv"));
+    }
+
+    fn limits(global: usize, per_identity: usize) -> Limits {
+        Limits {
+            max_sessions: global,
+            max_sessions_per_user: per_identity,
+            idle_timeout: Duration::from_secs(60),
+            absolute_timeout: Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn limits_enforce_global_and_per_identity_atomically() {
+        let capacity = Capacity::new(&limits(2, 1));
+        let alice = Identity::new("alice").unwrap();
+        let bob = Identity::new("bob").unwrap();
+        let carol = Identity::new("carol").unwrap();
+
+        let alice_reservation = capacity.reserve(&alice).unwrap();
+        assert!(matches!(
+            capacity.reserve(&alice),
+            Err(SessionError::IdentityLimit)
+        ));
+        let bob_reservation = capacity.reserve(&bob).unwrap();
+        assert!(matches!(
+            capacity.reserve(&carol),
+            Err(SessionError::GlobalLimit)
+        ));
+
+        drop(alice_reservation);
+        let carol_reservation = capacity.reserve(&carol).unwrap();
+        assert_eq!(capacity.active(), (2, 1));
+        drop((bob_reservation, carol_reservation));
+        assert_eq!(capacity.active(), (0, 0));
+    }
+
+    #[test]
+    fn reservation_release_after_simulated_spawn_failure_is_exactly_once() {
+        let capacity = Capacity::new(&limits(1, 1));
+        let identity = Identity::new("alice").unwrap();
+        let reservation = capacity.reserve(&identity).unwrap();
+        assert_eq!(capacity.active(), (1, 1));
+        drop(reservation);
+        assert_eq!(capacity.active(), (0, 0));
+        assert!(capacity.reserve(&identity).is_ok());
+    }
+
+    #[test]
+    fn limits_concurrent_reservations_never_exceed_bounds() {
+        let capacity = Arc::new(Capacity::new(&limits(4, 2)));
+        let barrier = Arc::new(Barrier::new(17));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let capacity = Arc::clone(&capacity);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let identity = Identity::new("alice").unwrap();
+                    barrier.wait();
+                    capacity.reserve(&identity)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let reservations: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().ok())
+            .collect();
+        assert_eq!(reservations.len(), 2);
+        assert_eq!(capacity.active(), (2, 2));
+        drop(reservations);
+        assert_eq!(capacity.active(), (0, 0));
     }
 }
