@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Duration};
 use nix::{sys::signal::kill, unistd::Pid};
 use tokio::time::timeout;
 use ttygated::{
-    config::{Limits, PtyTarget},
+    config::{Limits, PtyTarget, Target, TargetAllowlist},
     protocol::Resize,
     session::{ChildOutcome, LifecycleTransition, Session, SessionCloseReason, SessionManager},
     ticket::Identity,
@@ -32,14 +32,18 @@ fn limits(idle: Duration, absolute: Duration) -> Limits {
 }
 
 async fn running_session(arguments: &[&str]) -> Session {
-    SessionManager::new(limits(Duration::from_secs(60), Duration::from_secs(600)))
-        .start(
-            Identity::new("integration-user").unwrap(),
-            fixture_target(arguments),
-            Resize::new(80, 24).unwrap(),
-        )
-        .await
-        .unwrap()
+    let target = fixture_target(arguments);
+    SessionManager::new(
+        limits(Duration::from_secs(60), Duration::from_secs(600)),
+        TargetAllowlist::new(vec![Target::Pty(target.clone())]).unwrap(),
+    )
+    .start(
+        Identity::new("integration-user").unwrap(),
+        target,
+        Resize::new(80, 24).unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 fn parse_pid(output: &[u8], key: &str) -> u32 {
@@ -155,11 +159,15 @@ async fn hup_resistant_group_escalates_to_sigkill_and_is_reaped() {
 
 #[tokio::test]
 async fn idle_timeout_terminates_and_reaps_process_group() {
-    let manager = SessionManager::new(limits(Duration::from_millis(500), Duration::from_secs(2)));
+    let target = fixture_target(&[]);
+    let manager = SessionManager::new(
+        limits(Duration::from_millis(500), Duration::from_secs(2)),
+        TargetAllowlist::new(vec![Target::Pty(target.clone())]).unwrap(),
+    );
     let mut session = manager
         .start(
             Identity::new("integration-user").unwrap(),
-            fixture_target(&[]),
+            target,
             Resize::new(80, 24).unwrap(),
         )
         .await
@@ -179,11 +187,15 @@ async fn idle_timeout_terminates_and_reaps_process_group() {
 
 #[tokio::test]
 async fn absolute_timeout_terminates_and_reaps_process_group() {
-    let manager = SessionManager::new(limits(Duration::from_secs(2), Duration::from_millis(500)));
+    let target = fixture_target(&[]);
+    let manager = SessionManager::new(
+        limits(Duration::from_secs(2), Duration::from_millis(500)),
+        TargetAllowlist::new(vec![Target::Pty(target.clone())]).unwrap(),
+    );
     let mut session = manager
         .start(
             Identity::new("integration-user").unwrap(),
-            fixture_target(&[]),
+            target,
             Resize::new(80, 24).unwrap(),
         )
         .await

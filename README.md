@@ -7,7 +7,7 @@ ttygate is a security-first browser terminal gateway inspired by Shell In A Box.
 
 ## Current status
 
-ttygate is pre-release software. The repository currently contains the Rust HTTP daemon foundation, bundled xterm.js frontend scaffold, explicit browser Origin checks, a development identity cookie, and bounded single-use session tickets. There is no terminal server yet and no usable browser terminal: PTY execution, the WebSocket bridge, SSH execution, production authentication and transport gating, audit logging, and deployment controls are still planned.
+ttygate is pre-release software. The repository currently contains the Rust HTTP daemon foundation, bundled xterm.js frontend scaffold, explicit browser Origin checks, a development identity cookie, bounded single-use session tickets, and an allowlisted PTY session backend with bounded I/O and guaranteed process-group teardown. There is no usable browser terminal yet: the WebSocket bridge, frontend terminal integration, SSH execution, production authentication and transport gating, audit persistence, and deployment controls are still planned.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
 
@@ -32,13 +32,13 @@ npm --prefix frontend run check
 npm --prefix frontend run build
 ```
 
-These commands test the HTTP/config/protocol foundations and build the static frontend into `frontend/dist/`. Running a browser terminal is not yet possible because the PTY and WebSocket bridge chunks are not implemented.
+These commands test the HTTP/config/protocol foundations and the PTY session lifecycle, then build the static frontend into `frontend/dist/`. Running a browser terminal is not yet possible because the WebSocket bridge and frontend integration chunks are not implemented.
 
 ## Planned v0.1 posture
 
 The planned first release will default to `127.0.0.1`, but localhost-only binding will be only one layer. Every mode, including local development, is intended to require Origin validation, a real browser session cookie, and a short-lived single-use ticket presented after the WebSocket opens. Targets will come from a server-side allowlist rather than request-supplied commands, and output will use bounded buffers with backpressure.
 
-Production mode is planned to fail closed unless real authentication and either direct TLS or an explicitly trusted reverse proxy are configured. It will add rate and concurrency limits and structured session-lifecycle audit logs. These controls are not implemented yet; see the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+The PTY session manager already enforces configured global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode is planned to fail closed unless real authentication and either direct TLS or an explicitly trusted reverse proxy are configured. It will add request rate limits and structured session-lifecycle audit persistence. These production controls are not implemented yet; see the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
 
 ## Security model and non-goals
 

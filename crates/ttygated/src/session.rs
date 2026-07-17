@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{Limits, PtyTarget},
+    config::{Limits, PtyTarget, Target, TargetAllowlist},
     protocol::{self, MAX_BINARY_BYTES, Resize},
     pty_backend::{BackendError, PtyProcessBackend, RunningPty},
     ticket::Identity,
@@ -104,6 +104,8 @@ pub enum SessionError {
     IdentityLimit,
     #[error("The configured terminal could not be started.")]
     SpawnUnavailable,
+    #[error("The requested terminal target is unavailable.")]
+    TargetUnavailable,
     #[error("The terminal backend is unavailable.")]
     BackendUnavailable,
     #[error("The terminal session is closed.")]
@@ -288,6 +290,7 @@ pub struct SessionManager {
     limits: Limits,
     capacity: Arc<Capacity>,
     backend: Arc<dyn Backend>,
+    targets: Arc<TargetAllowlist>,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -300,11 +303,12 @@ impl std::fmt::Debug for SessionManager {
 }
 
 impl SessionManager {
-    pub fn new(limits: Limits) -> Self {
+    pub fn new(limits: Limits, targets: TargetAllowlist) -> Self {
         Self {
             capacity: Arc::new(Capacity::new(&limits)),
             limits,
             backend: Arc::new(PtyProcessBackend),
+            targets: Arc::new(targets),
         }
     }
 
@@ -314,6 +318,12 @@ impl SessionManager {
         target: PtyTarget,
         initial_size: Resize,
     ) -> Result<Session, SessionError> {
+        match self.targets.resolve(&target.name) {
+            Ok(Target::Pty(configured)) if configured == &target => {}
+            Ok(Target::Pty(_) | Target::Ssh(_)) | Err(_) => {
+                return Err(SessionError::TargetUnavailable);
+            }
+        }
         let created_at = Instant::now();
         let reservation = self.capacity.reserve(&identity)?;
         let mut state = StateMachine::new();
@@ -722,7 +732,7 @@ mod tests {
     };
 
     use crate::{
-        config::{Limits, PtyTarget},
+        config::{Limits, PtyTarget, Target, TargetAllowlist},
         protocol::{MAX_BINARY_BYTES, Resize},
         ticket::Identity,
     };
@@ -806,6 +816,7 @@ mod tests {
             SessionError::GlobalLimit,
             SessionError::IdentityLimit,
             SessionError::SpawnUnavailable,
+            SessionError::TargetUnavailable,
             SessionError::BackendUnavailable,
             SessionError::Closed,
             SessionError::ReadOnly,
@@ -922,6 +933,33 @@ mod tests {
         }
     }
 
+    fn allowlist(targets: &[PtyTarget]) -> TargetAllowlist {
+        TargetAllowlist::new(targets.iter().cloned().map(Target::Pty).collect()).unwrap()
+    }
+
+    fn manager(limits: Limits, targets: &[PtyTarget]) -> SessionManager {
+        SessionManager::new(limits, allowlist(targets))
+    }
+
+    #[tokio::test]
+    async fn allowlist_rejects_forged_typed_target_before_spawn() {
+        let configured = fixture_target(false);
+        let manager = SessionManager::new(limits(4, 2), allowlist(&[configured.clone()]));
+        let mut forged = configured;
+        forged.executable = "/bin/sh".into();
+        forged.argv = vec!["-c".to_owned(), "echo bypass".to_owned()];
+        assert!(matches!(
+            manager
+                .start(
+                    Identity::new("alice").unwrap(),
+                    forged,
+                    Resize::new(80, 24).unwrap(),
+                )
+                .await,
+            Err(SessionError::TargetUnavailable)
+        ));
+    }
+
     async fn session_read_until(session: &mut super::Session, marker: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -937,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn io_session_echoes_opaque_output_and_propagates_resize() {
-        let manager = SessionManager::new(limits(4, 2));
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
@@ -957,7 +995,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_input_is_rejected_before_reaching_the_pty() {
-        let manager = SessionManager::new(limits(4, 2));
+        let manager = manager(limits(4, 2), &[fixture_target(true)]);
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
@@ -981,7 +1019,7 @@ mod tests {
 
     #[tokio::test]
     async fn io_rejects_oversized_input_and_close_is_idempotent() {
-        let manager = SessionManager::new(limits(4, 2));
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
@@ -1001,7 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_stream_has_exactly_created_running_closed() {
-        let manager = SessionManager::new(limits(4, 2));
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
@@ -1027,13 +1065,13 @@ mod tests {
 
     #[tokio::test]
     async fn io_output_flood_is_bounded_and_close_remains_selectable() {
-        let manager = SessionManager::new(limits(4, 2));
         let flood = PtyTarget {
             name: "flood".to_owned(),
             executable: "/usr/bin/yes".into(),
             argv: Vec::new(),
             read_only: false,
         };
+        let manager = manager(limits(4, 2), std::slice::from_ref(&flood));
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
@@ -1059,10 +1097,11 @@ mod tests {
 
     #[tokio::test]
     async fn reservation_is_released_when_real_spawn_fails() {
-        let manager = SessionManager::new(limits(1, 1));
         let identity = Identity::new("alice").unwrap();
         let mut missing = fixture_target(false);
+        missing.name = "missing".to_owned();
         missing.executable = "/definitely/not/a/ttygate-program".into();
+        let manager = manager(limits(1, 1), &[missing.clone(), fixture_target(false)]);
         assert!(matches!(
             manager
                 .start(identity.clone(), missing, Resize::new(80, 24).unwrap())
@@ -1092,11 +1131,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_resets_after_successful_activity() {
         tokio::time::resume();
-        let manager = SessionManager::new(Limits {
-            idle_timeout: Duration::from_secs(10),
-            absolute_timeout: Duration::from_secs(100),
-            ..limits(4, 2)
-        });
+        let manager = manager(
+            Limits {
+                idle_timeout: Duration::from_secs(10),
+                absolute_timeout: Duration::from_secs(100),
+                ..limits(4, 2)
+            },
+            &[fixture_target(false)],
+        );
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
@@ -1130,11 +1172,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn absolute_timeout_is_independent_of_activity_and_wins_ties() {
         tokio::time::resume();
-        let manager = SessionManager::new(Limits {
-            idle_timeout: Duration::from_secs(10),
-            absolute_timeout: Duration::from_secs(10),
-            ..limits(4, 2)
-        });
+        let manager = manager(
+            Limits {
+                idle_timeout: Duration::from_secs(10),
+                absolute_timeout: Duration::from_secs(10),
+                ..limits(4, 2)
+            },
+            &[fixture_target(false)],
+        );
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
@@ -1172,11 +1217,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn rejected_read_only_input_does_not_reset_idle_timeout() {
         tokio::time::resume();
-        let manager = SessionManager::new(Limits {
-            idle_timeout: Duration::from_secs(5),
-            absolute_timeout: Duration::from_secs(50),
-            ..limits(4, 2)
-        });
+        let manager = manager(
+            Limits {
+                idle_timeout: Duration::from_secs(5),
+                absolute_timeout: Duration::from_secs(50),
+                ..limits(4, 2)
+            },
+            &[fixture_target(true)],
+        );
         let mut session = manager
             .start(
                 Identity::new("alice").unwrap(),
