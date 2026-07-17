@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod origin;
 pub mod protocol;
+mod pty_backend;
 pub mod server;
 pub mod session;
 pub mod ticket;
