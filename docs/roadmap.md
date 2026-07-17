@@ -67,6 +67,7 @@ The first running build already enforces Origin checks and ticket-bound WebSocke
 
 ### Chunk 1.4 — PTY backend and session lifecycle
 
+- **Status:** implemented by the work tracked in issue #5.
 - **Deliverables:** PTY spawn of allowlisted commands (chosen crate from 0.3); session state machine (created → running → closed with exit status/reason); idle and absolute timeouts; max-session and per-user limits from config; resize; bounded output buffer with backpressure; guaranteed child teardown on close; read-only flag dropping input server-side.
 - **Consumes:** `Target`/`Limits` (1.1), control-message types (1.2).
 - **Produces:** `Session` handle with async read/write/resize/close consumed by 1.5; lifecycle events consumed by M2 audit.
