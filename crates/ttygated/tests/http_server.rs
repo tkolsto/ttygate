@@ -1,20 +1,54 @@
-use std::sync::Arc;
+use std::{
+    io::{Read, Write},
+    net::SocketAddr,
+    net::TcpStream,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
+use tokio::net::TcpListener;
 use tower::ServiceExt;
 use ttygated::{
-    auth::{AuthProvider, DevAuthProvider},
+    auth::{
+        AuthContext, AuthError, AuthProvider, DevAuthProvider, ProvisionedIdentity,
+        SESSION_COOKIE_NAME,
+    },
     config::{PtyTarget, Target, TargetAllowlist},
     origin::OriginPolicy,
-    server::{AppState, build_router},
-    ticket::TicketStore,
+    server::{AppState, build_router, serve},
+    ticket::{Identity, TicketStore},
 };
 
 const ORIGIN: &str = "https://ttygate.local:7681";
+
+struct PeerRecordingAuthProvider {
+    peer_addr: Mutex<Option<SocketAddr>>,
+}
+
+impl AuthProvider for PeerRecordingAuthProvider {
+    fn establish(&self, context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
+        *self.peer_addr.lock().unwrap() = context.peer_addr();
+        Ok(ProvisionedIdentity {
+            identity: Identity::new("developer").unwrap(),
+            cookie: format!(
+                "{SESSION_COOKIE_NAME}={}; Path=/; Secure; HttpOnly; SameSite=Strict",
+                "A".repeat(43)
+            ),
+        })
+    }
+
+    fn authenticate(
+        &self,
+        _context: &AuthContext<'_>,
+        _cookie_header: Option<&str>,
+    ) -> Result<Identity, AuthError> {
+        Err(AuthError::Missing)
+    }
+}
 
 fn app() -> axum::Router {
     let target = Target::Pty(PtyTarget {
@@ -60,6 +94,18 @@ async fn json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
 }
 
+async fn provision_cookie(app: &axum::Router) -> String {
+    let response = response(app, "POST", "/api/identity", Some(ORIGIN), None, "").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn healthz_is_deterministic_without_browser_credentials() {
     let app = app();
@@ -72,7 +118,7 @@ async fn healthz_is_deterministic_without_browser_credentials() {
 }
 
 #[tokio::test]
-async fn static_frontend_requires_allowed_origin_and_provisions_dev_identity() {
+async fn static_frontend_is_origin_checked_when_present_and_side_effect_free() {
     let app = app();
     for origin in [Some("https://attacker.test"), Some("not an origin")] {
         assert_eq!(
@@ -82,12 +128,7 @@ async fn static_frontend_requires_allowed_origin_and_provisions_dev_identity() {
     }
     let index_response = response(&app, "GET", "/", None, None, "").await;
     assert_eq!(index_response.status(), StatusCode::OK);
-    assert!(
-        index_response.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .contains("Secure")
-    );
+    assert!(!index_response.headers().contains_key(header::SET_COOKIE));
     let body = index_response
         .into_body()
         .collect()
@@ -113,21 +154,114 @@ async fn static_frontend_requires_allowed_origin_and_provisions_dev_identity() {
 }
 
 #[tokio::test]
+async fn identity_establishment_requires_one_allowed_origin() {
+    let app = app();
+    for origin in [None, Some("https://attacker.test"), Some("not an origin")] {
+        assert_eq!(
+            response(&app, "POST", "/api/identity", origin, None, "")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    let duplicate = Request::builder()
+        .method("POST")
+        .uri("/api/identity")
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::ORIGIN, ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(duplicate).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn allowed_origin_establishes_secure_development_identity() {
+    let app = app();
+    let response = response(&app, "POST", "/api/identity", Some(ORIGIN), None, "").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+    for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Path=/"] {
+        assert!(cookie.contains(attribute));
+    }
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn valid_development_identity_establishment_is_idempotent() {
+    let app = app();
+    let cookie = provision_cookie(&app).await;
+    let identity_response = response(
+        &app,
+        "POST",
+        "/api/identity",
+        Some(ORIGIN),
+        Some(&cookie),
+        "",
+    )
+    .await;
+    assert_eq!(identity_response.status(), StatusCode::NO_CONTENT);
+    assert!(!identity_response.headers().contains_key(header::SET_COOKIE));
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some(&cookie),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn originless_static_requests_cannot_evict_a_development_identity() {
+    let app = app();
+    let cookie = provision_cookie(&app).await;
+    for _ in 0..1_100 {
+        let response = response(&app, "GET", "/", None, None, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+    }
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some(&cookie),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
 async fn session_creation_rejects_duplicate_cookie_headers_and_wrong_content_type() {
     let app = app();
-    let provision = response(&app, "GET", "/", None, None, "").await;
-    let cookie = provision.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap();
+    let cookie = provision_cookie(&app).await;
     let duplicate = Request::builder()
         .method("POST")
         .uri("/api/sessions")
         .header(header::ORIGIN, ORIGIN)
-        .header(header::COOKIE, cookie)
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, &cookie)
+        .header(header::COOKIE, &cookie)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"target":"shell"}"#))
         .unwrap();
@@ -140,7 +274,7 @@ async fn session_creation_rejects_duplicate_cookie_headers_and_wrong_content_typ
         .method("POST")
         .uri("/api/sessions")
         .header(header::ORIGIN, ORIGIN)
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, &cookie)
         .header(header::CONTENT_TYPE, "text/plain")
         .body(Body::from(r#"{"target":"shell"}"#))
         .unwrap();
@@ -180,14 +314,7 @@ async fn session_creation_rejects_origin_identity_target_and_bad_bodies_safely()
         StatusCode::UNAUTHORIZED
     );
 
-    let provision = response(&app, "GET", "/", Some(ORIGIN), None, "").await;
-    let cookie = provision.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let cookie = provision_cookie(&app).await;
     for (body, expected) in [
         ("not json".to_owned(), StatusCode::BAD_REQUEST),
         (r#"{"target":"missing"}"#.to_owned(), StatusCode::NOT_FOUND),
@@ -219,14 +346,7 @@ async fn session_creation_rejects_origin_identity_target_and_bad_bodies_safely()
 #[tokio::test]
 async fn successful_session_creation_returns_only_an_opaque_ticket() {
     let app = app();
-    let provision = response(&app, "GET", "/", Some(ORIGIN), None, "").await;
-    let cookie = provision.headers()[header::SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let cookie = provision_cookie(&app).await;
     let response = response(
         &app,
         "POST",
@@ -243,4 +363,49 @@ async fn successful_session_creation_returns_only_an_opaque_ticket() {
         vec!["ticket"]
     );
     assert_eq!(value["ticket"].as_str().unwrap().len(), 43);
+}
+
+#[tokio::test]
+async fn listener_injects_the_actual_peer_into_authentication_context() {
+    let target = Target::Pty(PtyTarget {
+        name: "shell".into(),
+        executable: "/bin/sh".into(),
+        argv: Vec::new(),
+        read_only: false,
+    });
+    let auth = Arc::new(PeerRecordingAuthProvider {
+        peer_addr: Mutex::new(None),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve(
+        listener,
+        AppState::new(
+            OriginPolicy::new(ORIGIN).unwrap(),
+            auth.clone(),
+            TargetAllowlist::new(vec![target]).unwrap(),
+            TicketStore::new(std::time::Duration::from_secs(10), 32),
+        ),
+    ));
+
+    let (client_addr, response) = tokio::task::spawn_blocking(move || {
+        let mut client = TcpStream::connect(server_addr).unwrap();
+        let client_addr = client.local_addr().unwrap();
+        client
+            .write_all(
+            format!(
+                "POST /api/identity HTTP/1.1\r\nHost: {server_addr}\r\nOrigin: {ORIGIN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        (client_addr, response)
+    })
+    .await
+    .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 204"));
+    assert_eq!(*auth.peer_addr.lock().unwrap(), Some(client_addr));
+    server.abort();
 }

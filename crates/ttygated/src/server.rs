@@ -1,9 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
     body::to_bytes,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
-    auth::{AuthProvider, DevAuthProvider},
+    auth::{AuthContext, AuthProvider, DevAuthProvider},
     config::{Config, TargetAllowlist},
     origin::OriginPolicy,
     ticket::{TicketError, TicketStore},
@@ -88,7 +88,8 @@ pub fn build_router(state: AppState) -> Router {
             Arc::clone(&state.origin),
             enforce_origin_if_present,
         ));
-    let session_api = Router::new()
+    let authority_api = Router::new()
+        .route("/api/identity", post(establish_identity))
         .route("/api/sessions", post(create_session))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state.origin),
@@ -97,7 +98,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { (StatusCode::OK, "ok\n") }))
         .merge(static_routes)
-        .merge(session_api)
+        .merge(authority_api)
         .with_state(state)
 }
 
@@ -133,7 +134,11 @@ async fn frontend_stylesheet() -> impl IntoResponse {
 }
 
 pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()> {
-    axum::serve(listener, build_router(state)).await
+    axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 async fn enforce_origin(
@@ -157,33 +162,48 @@ async fn enforce_origin(
     next.run(request).await
 }
 
-async fn frontend(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let existing = single_cookie_header(&headers).ok().flatten();
-    let cookie = if state.auth.authenticate(existing).is_ok() {
-        None
-    } else {
-        match state.auth.provision() {
-            Ok(provisioned) => Some(provisioned.cookie),
-            Err(_) => {
-                return api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "identity-unavailable",
-                    "Development identity is unavailable.",
-                );
-            }
-        }
-    };
-    let mut response = (
+async fn frontend() -> impl IntoResponse {
+    (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("../../../frontend/src/index.html"),
     )
-        .into_response();
-    if let Some(cookie) = cookie
-        && let Ok(value) = cookie.parse()
-    {
-        response.headers_mut().insert(header::SET_COOKIE, value);
+}
+
+async fn establish_identity(State(state): State<AppState>, request: Request) -> Response {
+    let context = auth_context(&request);
+    match single_cookie_header(request.headers()) {
+        Ok(cookie) if state.auth.authenticate(&context, cookie).is_ok() => {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        Ok(_) => {}
+        Err(()) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "identity-required",
+                "A valid identity session is required.",
+            );
+        }
     }
+    let provisioned = match state.auth.establish(&context) {
+        Ok(provisioned) => provisioned,
+        Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity-unavailable",
+                "Development identity is unavailable.",
+            );
+        }
+    };
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let Ok(cookie) = provisioned.cookie.parse() else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal-error",
+            "The request could not be completed.",
+        );
+    };
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
     response
 }
 
@@ -199,6 +219,7 @@ struct TicketResponse<'a> {
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
+    let context = auth_context(&request);
     let cookie = match single_cookie_header(request.headers()) {
         Ok(cookie) => cookie,
         Err(()) => {
@@ -209,7 +230,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             );
         }
     };
-    let identity = match state.auth.authenticate(cookie) {
+    let identity = match state.auth.authenticate(&context, cookie) {
         Ok(identity) => identity,
         Err(_) => {
             return api_error(
@@ -288,6 +309,14 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             "The request could not be completed.",
         ),
     }
+}
+
+fn auth_context(request: &Request) -> AuthContext<'_> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    AuthContext::new(request.headers(), peer_addr)
 }
 
 fn single_cookie_header(headers: &HeaderMap) -> Result<Option<&str>, ()> {

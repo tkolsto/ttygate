@@ -1,5 +1,6 @@
-use std::{collections::HashMap, sync::Mutex, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, sync::Mutex, time::Instant};
 
+use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use thiserror::Error;
 
@@ -10,9 +11,32 @@ const SESSION_BYTES: usize = 32;
 const SESSION_LENGTH: usize = 43;
 const MAX_SESSIONS: usize = 1024;
 
+pub struct AuthContext<'a> {
+    headers: &'a HeaderMap,
+    peer_addr: Option<SocketAddr>,
+}
+
+impl<'a> AuthContext<'a> {
+    pub fn new(headers: &'a HeaderMap, peer_addr: Option<SocketAddr>) -> Self {
+        Self { headers, peer_addr }
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        self.headers
+    }
+
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+}
+
 pub trait AuthProvider: Send + Sync {
-    fn provision(&self) -> Result<ProvisionedIdentity, AuthError>;
-    fn authenticate(&self, cookie_header: Option<&str>) -> Result<Identity, AuthError>;
+    fn establish(&self, context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError>;
+    fn authenticate(
+        &self,
+        context: &AuthContext<'_>,
+        cookie_header: Option<&str>,
+    ) -> Result<Identity, AuthError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +83,7 @@ impl DevAuthProvider {
 }
 
 impl AuthProvider for DevAuthProvider {
-    fn provision(&self) -> Result<ProvisionedIdentity, AuthError> {
+    fn establish(&self, _context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         if sessions.len() >= MAX_SESSIONS
             && let Some(oldest) = sessions
@@ -92,7 +116,11 @@ impl AuthProvider for DevAuthProvider {
         Err(AuthError::Generation)
     }
 
-    fn authenticate(&self, cookie_header: Option<&str>) -> Result<Identity, AuthError> {
+    fn authenticate(
+        &self,
+        _context: &AuthContext<'_>,
+        cookie_header: Option<&str>,
+    ) -> Result<Identity, AuthError> {
         let header = cookie_header.ok_or(AuthError::Missing)?;
         if header.len() > 4096 {
             return Err(AuthError::Malformed);
@@ -126,12 +154,26 @@ impl AuthProvider for DevAuthProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthError, AuthProvider, DevAuthProvider, MAX_SESSIONS, SESSION_COOKIE_NAME};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::{
+        AuthContext, AuthError, AuthProvider, DevAuthProvider, MAX_SESSIONS, SESSION_COOKIE_NAME,
+    };
+
+    fn context(headers: &HeaderMap) -> AuthContext<'_> {
+        AuthContext::new(
+            headers,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43210)),
+        )
+    }
 
     #[test]
     fn development_provider_provisions_and_authenticates_opaque_cookie_session() {
         let provider = DevAuthProvider::new("developer").unwrap();
-        let provisioned = provider.provision().unwrap();
+        let headers = HeaderMap::new();
+        let provisioned = provider.establish(&context(&headers)).unwrap();
         assert_eq!(provisioned.identity.as_str(), "developer");
         assert!(!provisioned.cookie.contains("developer"));
         assert!(
@@ -144,25 +186,52 @@ mod tests {
         }
         let pair = provisioned.cookie.split(';').next().unwrap();
         assert_eq!(
-            provider.authenticate(Some(pair)).unwrap().as_str(),
+            provider
+                .authenticate(&context(&headers), Some(pair))
+                .unwrap()
+                .as_str(),
             "developer"
+        );
+    }
+
+    #[test]
+    fn authentication_context_exposes_borrowed_headers_and_peer_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-user", HeaderValue::from_static("alice"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("test-client"));
+        let context = context(&headers);
+        assert_eq!(context.headers()["x-auth-user"], "alice");
+        assert_eq!(
+            context.peer_addr().unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43210)
         );
     }
 
     #[test]
     fn development_provider_rejects_missing_malformed_and_unknown_cookies() {
         let provider = DevAuthProvider::new("developer").unwrap();
-        assert_eq!(provider.authenticate(None), Err(AuthError::Missing));
+        let headers = HeaderMap::new();
+        let context = context(&headers);
         assert_eq!(
-            provider.authenticate(Some("broken")),
+            provider.authenticate(&context, None),
+            Err(AuthError::Missing)
+        );
+        assert_eq!(
+            provider.authenticate(&context, Some("broken")),
             Err(AuthError::Malformed)
         );
         assert_eq!(
-            provider.authenticate(Some(&format!("ttgate_session={}", "A".repeat(43)))),
+            provider.authenticate(
+                &context,
+                Some(&format!("ttgate_session={}", "A".repeat(43)))
+            ),
             Err(AuthError::Unknown)
         );
         assert_eq!(
-            provider.authenticate(Some(&format!("ttgate_session={}", "x".repeat(10_000)))),
+            provider.authenticate(
+                &context,
+                Some(&format!("ttgate_session={}", "x".repeat(10_000)))
+            ),
             Err(AuthError::Malformed)
         );
     }
@@ -170,15 +239,17 @@ mod tests {
     #[test]
     fn development_sessions_recover_from_capacity_pressure() {
         let provider = DevAuthProvider::new("developer").unwrap();
-        let first = provider.provision().unwrap().cookie;
+        let headers = HeaderMap::new();
+        let context = context(&headers);
+        let first = provider.establish(&context).unwrap().cookie;
         for _ in 0..MAX_SESSIONS {
-            provider.provision().unwrap();
+            provider.establish(&context).unwrap();
         }
         let first_pair = first.split(';').next().unwrap();
         assert_eq!(
-            provider.authenticate(Some(first_pair)),
+            provider.authenticate(&context, Some(first_pair)),
             Err(AuthError::Unknown)
         );
-        assert!(provider.provision().is_ok());
+        assert!(provider.establish(&context).is_ok());
     }
 }
