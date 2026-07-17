@@ -84,12 +84,21 @@ fn state_with_components(
     tickets: TicketStore,
     auth: Arc<dyn AuthProvider>,
 ) -> AppState {
+    state_with_all(target, tickets, auth, limits())
+}
+
+fn state_with_all(
+    target: Target,
+    tickets: TicketStore,
+    auth: Arc<dyn AuthProvider>,
+    limits: Limits,
+) -> AppState {
     AppState::new(
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
         tickets,
-        limits(),
+        limits,
     )
 }
 
@@ -215,6 +224,7 @@ async fn collect_binary_until(
                 tungstenite::Message::Binary(bytes) => {
                     output.extend_from_slice(&bytes);
                 }
+                tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {}
                 other => panic!("expected terminal output, got {other:?}"),
             }
         }
@@ -567,6 +577,28 @@ async fn fragmented_transport_is_reassembled_before_handshake_parsing() {
 }
 
 #[tokio::test]
+async fn ping_before_handshake_does_not_replace_or_extend_the_ticket_message() {
+    let configured = fixture_target(&[], false);
+    let state = state_with_target(configured.clone());
+    let ticket = state
+        .tickets()
+        .issue(Identity::new("developer").unwrap(), configured)
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    socket
+        .send(tungstenite::Message::Ping(b"health".to_vec().into()))
+        .await
+        .unwrap();
+    send_ticket(&mut socket, &ticket).await;
+    let _ = collect_binary_until(&mut socket, b"READY").await;
+    socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
 async fn expired_ssh_and_spawn_failure_tickets_are_safe_and_consumed() {
     let expired_target = fixture_target(&[], false);
     let expired_state = state_with_components(
@@ -834,6 +866,25 @@ async fn oversized_handshake_and_post_handshake_control_close_with_1009() {
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
 
+    let mut transport_handshake = connect_websocket(server.address, &cookie).await;
+    transport_handshake
+        .send(tungstenite::Message::Frame(Frame::message(
+            vec![b'x'; 32_768],
+            OpCode::Data(Data::Text),
+            false,
+        )))
+        .await
+        .unwrap();
+    transport_handshake
+        .send(tungstenite::Message::Frame(Frame::message(
+            vec![b'x'; 32_769],
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(next_close_code(&mut transport_handshake).await, 1009);
+
     let mut handshake = connect_websocket(server.address, &cookie).await;
     handshake
         .send(tungstenite::Message::Text("x".repeat(257).into()))
@@ -884,10 +935,22 @@ async fn oversized_handshake_and_post_handshake_control_close_with_1009() {
     send_ticket(&mut binary, &ticket).await;
     let _ = collect_binary_until(&mut binary, b"READY").await;
     binary
-        .send(tungstenite::Message::Binary(vec![0; 65_537].into()))
+        .send(tungstenite::Message::Frame(Frame::message(
+            vec![0; 32_768],
+            OpCode::Data(Data::Binary),
+            false,
+        )))
         .await
         .unwrap();
-    assert!(matches!(next_close_code(&mut binary).await, 1005 | 1009));
+    binary
+        .send(tungstenite::Message::Frame(Frame::message(
+            vec![0; 32_769],
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(next_close_code(&mut binary).await, 1009);
 }
 
 #[tokio::test]
@@ -913,5 +976,71 @@ async fn non_reading_client_drop_during_output_flood_reaps_process_group() {
     drop(socket);
     assert_absent(leader).await;
     assert_absent(descendant).await;
+    guard.disarm();
+}
+
+#[tokio::test]
+async fn connected_non_reader_backpressures_the_real_producer_until_timeout_reaps_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let progress = temp.path().join("progress");
+    let progress_arg = progress.to_str().unwrap();
+    let configured = fixture_target(&["flood-count", progress_arg], false);
+    let state = state_with_all(
+        configured.clone(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        Arc::new(DevAuthProvider::new("developer").unwrap()),
+        Limits {
+            max_sessions: 8,
+            max_sessions_per_user: 4,
+            idle_timeout: Duration::from_secs(5),
+            absolute_timeout: Duration::from_secs(2),
+        },
+    );
+    let ticket = state
+        .tickets()
+        .issue(Identity::new("developer").unwrap(), configured)
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    let ready = collect_binary_until(&mut socket, b"READY").await;
+    let leader = parse_pid(&ready, "PID:");
+    let descendant = parse_pid(&ready, "DESC:");
+    let mut guard = ProcessGroupGuard::new(leader);
+
+    let stalled_at = tokio::time::timeout(Duration::from_millis(1_500), async {
+        let mut previous = 0_u64;
+        let mut stable_samples = 0_u8;
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let current = std::fs::read_to_string(&progress)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            if current > 0 && current == previous {
+                stable_samples += 1;
+                if stable_samples == 5 {
+                    break current;
+                }
+            } else {
+                stable_samples = 0;
+                previous = current;
+            }
+        }
+    })
+    .await
+    .expect("producer never became backpressured");
+    assert!(stalled_at > 0);
+    assert!(
+        process_exists(leader),
+        "producer stopped because it exited, not because output backpressured"
+    );
+
+    assert_absent(leader).await;
+    assert_absent(descendant).await;
+    drop(socket);
     guard.disarm();
 }

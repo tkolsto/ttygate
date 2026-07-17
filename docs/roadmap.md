@@ -75,6 +75,7 @@ The first running build already enforces Origin checks and ticket-bound WebSocke
 
 ### Chunk 1.5 — WebSocket bridge
 
+- **Status:** implemented as the backend prerequisite referenced by issue #7.
 - **Deliverables:** WS upgrade endpoint that accepts a connection, requires a valid ticket in the first message (never URL), redeems it, starts the session via 1.4, then bridges PTY↔WS using the 1.2 codec; WS drop terminates the session.
 - **Consumes:** ticket store (1.3), `Session` (1.4), codec (1.2).
 - **Produces:** the complete backend path the frontend connects to.

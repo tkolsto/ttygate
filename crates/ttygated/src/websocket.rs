@@ -24,6 +24,7 @@ const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
 pub const BRIDGE_CHANNEL_CAPACITY: usize = 4;
 const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandshakeError {
@@ -148,11 +149,22 @@ pub async fn accept_upgrade(
     tickets: Arc<TicketStore>,
     sessions: Arc<SessionManager>,
 ) {
-    let message = match tokio::time::timeout(HANDSHAKE_DEADLINE, socket.recv()).await {
-        Ok(Some(Ok(message))) => message,
-        Ok(Some(Err(_))) | Ok(None) | Err(_) => {
-            send_failure(&mut socket, safe_ticket_error(TicketError::Malformed)).await;
-            return;
+    let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
+    let message = loop {
+        match tokio::time::timeout_at(handshake_deadline, socket.recv()).await {
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Ok(Some(Err(error))) if is_message_too_large(&error) => {
+                send_failure(&mut socket, protocol_failure(ProtocolError::BinaryTooLarge)).await;
+                return;
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                return;
+            }
+            Ok(Some(Ok(message))) => break message,
+            Err(_) => {
+                send_failure(&mut socket, safe_ticket_error(TicketError::Malformed)).await;
+                return;
+            }
         }
     };
     let ticket = match parse_handshake(&message) {
@@ -219,8 +231,31 @@ async fn send_failure(socket: &mut WebSocket, failure: BridgeFailure) {
 
 enum Termination {
     Terminal(SessionClosed),
+    BackpressuredTerminal,
     Failure(BridgeFailure),
     Transport,
+}
+
+enum Inbound {
+    Message(Message),
+    Failure(BridgeFailure),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendCompletion<S, C> {
+    Sent(S),
+    Completed(C),
+}
+
+async fn race_send_with_completion<S, C>(
+    send: impl std::future::Future<Output = S>,
+    completion: impl std::future::Future<Output = C>,
+) -> SendCompletion<S, C> {
+    tokio::select! {
+        biased;
+        sent = send => SendCompletion::Sent(sent),
+        completed = completion => SendCompletion::Completed(completed),
+    }
 }
 
 async fn bridge(socket: WebSocket, mut session: Session) {
@@ -228,6 +263,7 @@ async fn bridge(socket: WebSocket, mut session: Session) {
     let (inbound_tx, mut inbound_rx) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
     let (outbound_tx, outbound_rx) = mpsc::channel(BRIDGE_CHANNEL_CAPACITY);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let (stop_input_tx, stop_input_rx) = watch::channel(false);
 
     let reader = tokio::spawn(read_socket(
         stream,
@@ -235,6 +271,7 @@ async fn bridge(socket: WebSocket, mut session: Session) {
         outbound_tx.clone(),
         cancel_tx.clone(),
         cancel_rx.clone(),
+        stop_input_rx,
     ));
     let writer = tokio::spawn(write_socket(
         sink,
@@ -251,10 +288,17 @@ async fn bridge(socket: WebSocket, mut session: Session) {
                 let Some(inbound) = inbound else {
                     break Termination::Transport;
                 };
+                let inbound = match inbound {
+                    Inbound::Message(message) => message,
+                    Inbound::Failure(failure) => {
+                        break Termination::Failure(failure);
+                    }
+                };
                 match handle_client_message(
                     inbound,
                     &mut session,
                     &mut cancel_rx,
+                    &stop_input_tx,
                 ).await {
                     Ok(Some(closed)) => break Termination::Terminal(closed),
                     Ok(None) => {}
@@ -275,11 +319,28 @@ async fn bridge(socket: WebSocket, mut session: Session) {
                                 break Termination::Failure(internal_failure());
                             }
                         };
-                        if send_bounded(&outbound_tx, frame, &mut cancel_rx)
-                            .await
-                            .is_err()
+                        match race_send_with_completion(
+                            send_bounded(
+                                &outbound_tx,
+                                frame,
+                                &mut cancel_rx,
+                            ),
+                            session.wait_closed(),
+                        )
+                        .await
                         {
-                            break Termination::Transport;
+                            SendCompletion::Sent(Ok(())) => {}
+                            SendCompletion::Sent(Err(())) => {
+                                break Termination::Transport;
+                            }
+                            SendCompletion::Completed(Ok(_)) => {
+                                break Termination::BackpressuredTerminal;
+                            }
+                            SendCompletion::Completed(Err(error)) => {
+                                break Termination::Failure(
+                                    safe_session_error(error),
+                                );
+                            }
                         }
                     }
                     Err(SessionError::Closed) => {
@@ -297,6 +358,7 @@ async fn bridge(socket: WebSocket, mut session: Session) {
             }
         }
     };
+    stop_input_tx.send_replace(true);
 
     finish_bridge(
         termination,
@@ -314,6 +376,7 @@ async fn handle_client_message(
     message: Message,
     session: &mut Session,
     cancel: &mut watch::Receiver<bool>,
+    stop_input: &watch::Sender<bool>,
 ) -> Result<Option<SessionClosed>, BridgeFailure> {
     match message {
         Message::Binary(bytes) => {
@@ -321,25 +384,23 @@ async fn handle_client_message(
             let ClientFrame::TerminalInput(bytes) = frame else {
                 unreachable!("binary decoder only produces terminal input");
             };
-            cancellable_session(session.write(bytes), cancel)
-                .await
-                .map_err(safe_session_error)?;
-            Ok(None)
+            let result = cancellable_session(session.write(bytes), cancel).await;
+            resolve_session_operation(result, session, cancel).await
         }
         Message::Text(text) => {
             let control =
                 protocol::decode_client_control(text.as_bytes()).map_err(protocol_failure)?;
             match control {
                 ClientControl::Resize(size) => {
-                    cancellable_session(session.resize(size), cancel)
-                        .await
-                        .map_err(safe_session_error)?;
-                    Ok(None)
+                    let result = cancellable_session(session.resize(size), cancel).await;
+                    resolve_session_operation(result, session, cancel).await
                 }
-                ClientControl::Close => cancellable_session(session.close(), cancel)
-                    .await
-                    .map(Some)
-                    .map_err(safe_session_error),
+                ClientControl::Close => {
+                    stop_input_before(stop_input, cancellable_session(session.close(), cancel))
+                        .await
+                        .map(Some)
+                        .map_err(safe_session_error)
+                }
             }
         }
         Message::Close(_) => Err(transport_failure()),
@@ -355,6 +416,61 @@ async fn cancellable_session<T>(
         biased;
         _ = cancelled(cancel) => Err(SessionError::Closed),
         result = operation => result,
+    }
+}
+
+async fn resolve_session_operation<T>(
+    result: Result<T, SessionError>,
+    session: &mut Session,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<SessionClosed>, BridgeFailure> {
+    match result {
+        Ok(_) => Ok(None),
+        Err(SessionError::Closed) if !*cancel.borrow() => {
+            terminal_operation_result(session.wait_closed().await)
+        }
+        Err(error) => Err(safe_session_error(error)),
+    }
+}
+
+fn terminal_operation_result(
+    result: Result<SessionClosed, SessionError>,
+) -> Result<Option<SessionClosed>, BridgeFailure> {
+    result.map(Some).map_err(safe_session_error)
+}
+
+async fn stop_input_before<T>(
+    stop_input: &watch::Sender<bool>,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    stop_input.send_replace(true);
+    operation.await
+}
+
+async fn await_or_cancel<T>(
+    operation: impl std::future::Future<Output = T>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancelled(cancel) => None,
+        result = operation => Some(result),
+    }
+}
+
+async fn close_or_cancel<T>(
+    operation: impl std::future::Future<Output = T>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Option<T> {
+    let bounded = tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, operation);
+    tokio::pin!(bounded);
+    if *cancel.borrow() {
+        return bounded.await.ok();
+    }
+    tokio::select! {
+        biased;
+        _ = cancelled(cancel) => None,
+        result = &mut bounded => result.ok(),
     }
 }
 
@@ -394,15 +510,17 @@ fn transport_failure() -> BridgeFailure {
 
 async fn read_socket(
     mut stream: futures_util::stream::SplitStream<WebSocket>,
-    inbound: mpsc::Sender<Message>,
+    inbound: mpsc::Sender<Inbound>,
     outbound: mpsc::Sender<Message>,
     cancel_tx: watch::Sender<bool>,
     mut cancel: watch::Receiver<bool>,
+    mut stop_input: watch::Receiver<bool>,
 ) {
     loop {
         let message = tokio::select! {
             biased;
             _ = cancelled(&mut cancel) => break,
+            _ = cancelled(&mut stop_input) => break,
             message = stream.next() => message,
         };
         match message {
@@ -415,17 +533,42 @@ async fn read_socket(
                 }
             }
             Some(Ok(Message::Pong(_))) => {}
+            Some(Err(error)) if is_message_too_large(&error) => {
+                let _ = send_bounded(
+                    &inbound,
+                    Inbound::Failure(protocol_failure(ProtocolError::BinaryTooLarge)),
+                    &mut cancel,
+                )
+                .await;
+                break;
+            }
             Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                 cancel_tx.send_replace(true);
                 break;
             }
             Some(Ok(message @ (Message::Text(_) | Message::Binary(_)))) => {
-                if send_bounded(&inbound, message, &mut cancel).await.is_err() {
+                if send_bounded(&inbound, Inbound::Message(message), &mut cancel)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
         }
     }
+}
+
+fn is_message_too_large(error: &axum::Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|error| error.downcast_ref::<tungstenite::Error>())
+        .is_some_and(|error| {
+            matches!(
+                error,
+                tungstenite::Error::Capacity(
+                    tungstenite::error::CapacityError::MessageTooLong { .. }
+                )
+            )
+        })
 }
 
 async fn write_socket(
@@ -444,11 +587,9 @@ async fn write_socket(
             },
         };
         let is_close = matches!(message, Message::Close(_));
-        let sent = tokio::select! {
-            biased;
-            _ = cancelled(&mut cancel) => false,
-            result = sink.send(message) => result.is_ok(),
-        };
+        let sent = await_or_cancel(sink.send(message), &mut cancel)
+            .await
+            .is_some_and(|result| result.is_ok());
         if !sent {
             cancel_tx.send_replace(true);
             break;
@@ -457,7 +598,7 @@ async fn write_socket(
             return;
         }
     }
-    let _ = sink.close().await;
+    let _ = close_or_cancel(sink.close(), &mut cancel).await;
 }
 
 async fn send_bounded<T>(
@@ -489,6 +630,12 @@ async fn finish_bridge(
                 vec![failure.error, ServerControl::Close(failure.close_reason)],
                 failure.websocket_code,
             )
+        }
+        Termination::BackpressuredTerminal => {
+            cancel_tx.send_replace(true);
+            join_task(reader).await;
+            join_task(writer).await;
+            return;
         }
         Termination::Transport => {
             let _ = session.close().await;
@@ -568,8 +715,10 @@ mod tests {
     };
 
     use super::{
-        BRIDGE_CHANNEL_CAPACITY, HANDSHAKE_MAX_BYTES, HandshakeError, parse_handshake,
-        safe_session_error, safe_ticket_error, send_bounded, terminal_controls,
+        BRIDGE_CHANNEL_CAPACITY, HANDSHAKE_MAX_BYTES, HandshakeError, SendCompletion,
+        close_or_cancel, parse_handshake, race_send_with_completion, resolve_session_operation,
+        safe_session_error, safe_ticket_error, send_bounded, stop_input_before, terminal_controls,
+        terminal_operation_result,
     };
 
     #[test]
@@ -814,5 +963,106 @@ mod tests {
             Err(())
         );
         assert_eq!(receiver.recv().await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn client_close_stops_input_before_awaiting_session_teardown() {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = stop_input_before(&stop_tx, async move {
+            assert!(*stop_rx.borrow());
+            7
+        })
+        .await;
+        assert_eq!(result, 7);
+    }
+
+    #[tokio::test]
+    async fn blocked_socket_close_is_directly_cancellation_selectable() {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let blocked = tokio::spawn(async move {
+            let mut cancel_rx = cancel_rx;
+            close_or_cancel(std::future::pending::<()>(), &mut cancel_rx).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        cancel_tx.send_replace(true);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), blocked)
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_transport_close_gets_one_bounded_flush_after_cancellation() {
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(true);
+        assert_eq!(
+            close_or_cancel(std::future::ready(23), &mut cancel_rx).await,
+            Some(23)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_completion_interrupts_a_backpressured_output_send() {
+        let outcome = race_send_with_completion(
+            std::future::pending::<Result<(), ()>>(),
+            std::future::ready(17_u8),
+        )
+        .await;
+        assert_eq!(outcome, SendCompletion::Completed(17));
+    }
+
+    #[test]
+    fn late_client_operation_preserves_the_actual_terminal_snapshot() {
+        let closed = SessionClosed {
+            state: SessionState::Closed,
+            reason: SessionCloseReason::ChildExited,
+            outcome: Some(ChildOutcome::Code(0)),
+        };
+        assert_eq!(terminal_operation_result(Ok(closed)), Ok(Some(closed)));
+    }
+
+    #[tokio::test]
+    async fn closed_client_operation_resolves_the_real_session_terminal_state() {
+        let target = crate::config::Target::Pty(crate::config::PtyTarget {
+            name: "immediate-exit".into(),
+            executable: "/usr/bin/true".into(),
+            argv: Vec::new(),
+            read_only: false,
+        });
+        let manager = crate::session::SessionManager::new(
+            crate::config::Limits {
+                max_sessions: 1,
+                max_sessions_per_user: 1,
+                idle_timeout: Duration::from_secs(2),
+                absolute_timeout: Duration::from_secs(2),
+            },
+            crate::config::TargetAllowlist::new(vec![target]).unwrap(),
+        );
+        let mut session = manager
+            .start(
+                crate::ticket::Identity::new("review-test").unwrap(),
+                "immediate-exit",
+                crate::protocol::Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.state() != SessionState::Closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let resolved =
+            resolve_session_operation::<()>(Err(SessionError::Closed), &mut session, &cancel_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved.reason, SessionCloseReason::ChildExited);
+        assert_eq!(resolved.outcome, Some(ChildOutcome::Code(0)));
     }
 }

@@ -25,6 +25,7 @@ tokio = { version = "1", features = [
     "time",
 ] }
 toml = "1"
+tungstenite = { version = "0.29", default-features = false }
 url = "2"
 
 [dev-dependencies]

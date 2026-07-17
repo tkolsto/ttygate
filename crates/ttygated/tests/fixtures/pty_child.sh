@@ -32,6 +32,16 @@ if [ "${1-}" = "flood" ]; then
     done
 fi
 
+if [ "${1-}" = "flood-count" ]; then
+    payload=$(printf '%04096d' 0)
+    count=0
+    while :; do
+        printf '%s\r\n' "$payload"
+        count=$((count + 1))
+        printf '%s\n' "$count" > "${2:?progress path required}"
+    done
+fi
+
 while IFS= read -r line; do
     case "$line" in
         exit)
