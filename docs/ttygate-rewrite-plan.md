@@ -63,6 +63,7 @@ Non-goals for v0.1:
    - Creates sessions only after auth/policy checks, via one-time tickets (see Session Establishment).
    - Tracks session id, user identity, command target, remote address, start/end time, exit status.
    - Enforces idle timeout, absolute session lifetime, and max concurrent sessions.
+   - Defines idle activity as a successful non-empty PTY input write, a successful non-empty PTY output enqueue, or a successful resize. Empty I/O and rejected, dropped, or failed operations do not reset the idle deadline. Absolute lifetime never resets.
    - WebSocket drop terminates the session and its child process. No re-attach in v0.1.
 
 4. Execution backends

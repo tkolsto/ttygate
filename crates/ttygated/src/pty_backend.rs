@@ -4,7 +4,7 @@ use std::{
 };
 
 use nix::{
-    sys::signal::{Signal, kill, killpg},
+    sys::signal::{Signal, killpg},
     unistd::Pid,
 };
 use thiserror::Error;
@@ -178,19 +178,8 @@ fn signal_group(process_group: Pid, signal: Signal) -> Result<(), BackendError> 
     }
 }
 
-fn group_exists(process_group: Pid) -> Result<bool, BackendError> {
-    match kill(Pid::from_raw(-process_group.as_raw()), None) {
-        Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(true),
-        Err(nix::errno::Errno::ESRCH) => Ok(false),
-        Err(_) => Err(BackendError::Unavailable),
-    }
-}
-
 fn kill_group_if_present(process_group: Pid) -> Result<(), BackendError> {
-    if group_exists(process_group)? {
-        signal_group(process_group, Signal::SIGKILL)?;
-    }
-    Ok(())
+    signal_group(process_group, Signal::SIGKILL)
 }
 
 #[cfg(test)]

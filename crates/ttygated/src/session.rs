@@ -1075,4 +1075,131 @@ mod tests {
             .expect("spawn failure must release reservation");
         session.close().await.unwrap();
     }
+
+    async fn closed_event(session: &mut super::Session) -> LifecycleTransition {
+        while let Some(event) = session.next_event().await {
+            if matches!(event.transition, LifecycleTransition::Closed { .. }) {
+                return event.transition;
+            }
+        }
+        panic!("lifecycle stream ended before close");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_resets_after_successful_activity() {
+        tokio::time::resume();
+        let manager = SessionManager::new(Limits {
+            idle_timeout: Duration::from_secs(10),
+            absolute_timeout: Duration::from_secs(100),
+            ..limits(4, 2)
+        });
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                fixture_target(false),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        session_read_until(&mut session, b"READY").await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        session.resize(Resize::new(81, 24).unwrap()).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert_eq!(session.state(), SessionState::Running);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let transition = closed_event(&mut session).await;
+        assert!(
+            matches!(
+                transition,
+                LifecycleTransition::Closed {
+                    reason: SessionCloseReason::Timeout(TimeoutKind::Idle),
+                    ..
+                }
+            ),
+            "{transition:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_timeout_is_independent_of_activity_and_wins_ties() {
+        tokio::time::resume();
+        let manager = SessionManager::new(Limits {
+            idle_timeout: Duration::from_secs(10),
+            absolute_timeout: Duration::from_secs(10),
+            ..limits(4, 2)
+        });
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                fixture_target(false),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        session_read_until(&mut session, b"READY").await;
+        tokio::time::pause();
+        for cols in 81..=85 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            if cols < 85 {
+                session
+                    .resize(Resize::new(cols, 24).unwrap())
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        }
+        tokio::time::resume();
+        let transition = closed_event(&mut session).await;
+        assert!(
+            matches!(
+                transition,
+                LifecycleTransition::Closed {
+                    reason: SessionCloseReason::Timeout(TimeoutKind::Absolute),
+                    ..
+                }
+            ),
+            "{transition:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_read_only_input_does_not_reset_idle_timeout() {
+        tokio::time::resume();
+        let manager = SessionManager::new(Limits {
+            idle_timeout: Duration::from_secs(5),
+            absolute_timeout: Duration::from_secs(50),
+            ..limits(4, 2)
+        });
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                fixture_target(true),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        session_read_until(&mut session, b"READY").await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            session.write(b"rejected\n".to_vec()).await,
+            Err(SessionError::ReadOnly)
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let transition = closed_event(&mut session).await;
+        assert!(
+            matches!(
+                transition,
+                LifecycleTransition::Closed {
+                    reason: SessionCloseReason::Timeout(TimeoutKind::Idle),
+                    ..
+                }
+            ),
+            "{transition:?}"
+        );
+    }
 }
