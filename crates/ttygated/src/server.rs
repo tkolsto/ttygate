@@ -102,6 +102,7 @@ pub fn build_router(state: AppState) -> Router {
         ));
     let authority_api = Router::new()
         .route("/api/identity", post(establish_identity))
+        .route("/api/targets", post(list_targets))
         .route("/api/sessions", post(create_session))
         .route("/api/ws", get(upgrade_websocket))
         .route_layer(middleware::from_fn_with_state(
@@ -271,8 +272,62 @@ struct CreateSession {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetPresentation {
+    name: String,
+    read_only: bool,
+}
+
+impl From<&crate::config::Target> for TargetPresentation {
+    fn from(target: &crate::config::Target) -> Self {
+        Self {
+            name: target.name().to_owned(),
+            read_only: target.read_only(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TargetCatalog {
+    targets: Vec<TargetPresentation>,
+}
+
+async fn list_targets(State(state): State<AppState>, request: Request) -> Response {
+    let context = auth_context(&request);
+    let cookie = match single_cookie_header(request.headers()) {
+        Ok(cookie) => cookie,
+        Err(()) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "identity-required",
+                "A valid identity session is required.",
+            );
+        }
+    };
+    if state.auth.authenticate(&context, cookie).is_err() {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "identity-required",
+            "A valid identity session is required.",
+        );
+    }
+    if to_bytes(request.into_body(), 0).await.is_err() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+            "The request body must be empty.",
+        );
+    }
+    axum::Json(TargetCatalog {
+        targets: state.targets.iter().map(TargetPresentation::from).collect(),
+    })
+    .into_response()
+}
+
+#[derive(Serialize)]
 struct TicketResponse<'a> {
     ticket: &'a str,
+    target: TargetPresentation,
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
@@ -347,11 +402,13 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             );
         }
     };
+    let presentation = TargetPresentation::from(&target);
     match state.tickets.issue(identity, target) {
         Ok(ticket) => (
             StatusCode::CREATED,
             axum::Json(TicketResponse {
                 ticket: ticket.as_str(),
+                target: presentation,
             }),
         )
             .into_response(),

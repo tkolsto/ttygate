@@ -7,7 +7,53 @@
     <link rel="stylesheet" href="app.css" />
   </head>
   <body>
-    <div id="terminal"></div>
+    <main class="app-shell" aria-labelledby="app-title">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">Secure local terminal</p>
+          <h1 id="app-title">ttygate</h1>
+        </div>
+        <div class="connection-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+      </header>
+
+      <section class="controls" aria-label="Terminal session controls">
+        <label for="target-select">
+          <span>Configured target</span>
+          <select id="target-select" disabled>
+            <option>Loading targets…</option>
+          </select>
+        </label>
+        <button id="session-action" type="button" disabled>Connect terminal</button>
+      </section>
+
+      <div class="status-row">
+        <p id="connection-status" role="status" aria-live="polite" data-tone="pending">
+          Establishing browser identity…
+        </p>
+        <span id="read-only-badge" class="badge" hidden>Read-only</span>
+      </div>
+
+      <section
+        id="terminal-shell"
+        class="terminal-shell"
+        aria-label="Terminal session"
+        aria-busy="true"
+      >
+        <div class="terminal-chrome" aria-hidden="true">
+          <span class="terminal-title">terminal</span>
+          <span class="terminal-rule"></span>
+          <span>PTY</span>
+        </div>
+        <div id="terminal" class="terminal-surface" aria-label="Terminal output and input"></div>
+      </section>
+
+      <p class="security-note">
+        Session authority stays server-side. Reconnect is always explicit.
+      </p>
+    </main>
+    <noscript>ttygate requires JavaScript to run the browser terminal.</noscript>
     <script type="module" src="app.js"></script>
   </body>
 </html>

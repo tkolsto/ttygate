@@ -756,6 +756,67 @@ async fn successful_ticket_bridges_real_pty_echo_resize_and_natural_exit() {
 }
 
 #[tokio::test]
+async fn reconnect_after_explicit_close_preserves_the_next_natural_exit_status() {
+    let configured = fixture_target(&[], false);
+    let state = state_with_target(configured.clone());
+    let mut events = state.sessions().subscribe_events();
+    let first_ticket = state
+        .tickets()
+        .issue(Identity::new("developer").unwrap(), configured.clone())
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let second_ticket = state
+        .tickets()
+        .issue(Identity::new("developer").unwrap(), configured)
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+
+    let mut first = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut first, &first_ticket).await;
+    let _ = collect_binary_until(&mut first, b"READY").await;
+    let close = encode_client_control(&ClientControl::Close).unwrap();
+    first
+        .send(tungstenite::Message::Text(close.into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_server_control(&mut first).await,
+        ServerControl::Close(ttygated::protocol::CloseReason::ClientRequest)
+    );
+
+    let mut second = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut second, &second_ticket).await;
+    let _ = collect_binary_until(&mut second, b"READY").await;
+    let resize =
+        encode_client_control(&ClientControl::Resize(Resize::new(40, 17).unwrap())).unwrap();
+    second
+        .send(tungstenite::Message::Text(resize.into()))
+        .await
+        .unwrap();
+    second
+        .send(tungstenite::Message::Binary(b"exit\r".to_vec().into()))
+        .await
+        .unwrap();
+
+    let first_control = next_server_control(&mut second).await;
+    if first_control != ServerControl::ExitStatus(ttygated::protocol::ExitStatus::Code(0)) {
+        let mut transitions = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            transitions.push(event.transition);
+        }
+        panic!("unexpected control {first_control:?}; transitions {transitions:?}");
+    }
+    assert_eq!(
+        next_server_control(&mut second).await,
+        ServerControl::Close(ttygated::protocol::CloseReason::Exited)
+    );
+}
+
+#[tokio::test]
 async fn explicit_close_is_orderly_and_malformed_control_closes_with_1008() {
     for malformed in [false, true] {
         let configured = fixture_target(&[], false);

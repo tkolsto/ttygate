@@ -274,6 +274,8 @@ Exit criteria:
 
 ### Phase 1: Secure Local Terminal
 
+**Status:** complete through the frontend work tracked in issue #7. Detailed RED/GREEN, browser-QA, review, and verification evidence is retained in the [Chunk 1.6 implementation plan](plans/2026-07-18-chunk-1.6-browser-frontend.md).
+
 The first working build already resists browser-based attacks. Scope:
 
 - Config loading, schema validation, target allowlist, clear startup errors.
