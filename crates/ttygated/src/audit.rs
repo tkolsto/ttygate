@@ -130,6 +130,7 @@ pub enum AuditCloseReason {
     Explicit,
     WebsocketDisconnect,
     ProtocolViolation,
+    PolicyViolation,
     InternalFailure,
     ManagerShutdown,
     IdleTimeout,
@@ -321,21 +322,38 @@ impl fmt::Debug for AuditLog {
 
 impl AuditLog {
     pub fn open(path: &Path) -> Result<Self, AuditError> {
-        Self::open_with_parent_hook(path, || {})
+        Self::open_with_owner_and_hook(path, nix::unistd::geteuid().as_raw(), || {})
     }
 
+    #[cfg(test)]
     fn open_with_parent_hook(
         path: &Path,
         parent_opened: impl FnOnce(),
     ) -> Result<Self, AuditError> {
-        use std::os::unix::fs::PermissionsExt;
+        Self::open_with_owner_and_hook(path, nix::unistd::geteuid().as_raw(), parent_opened)
+    }
+
+    #[cfg(test)]
+    fn open_with_expected_owner(path: &Path, expected_owner: u32) -> Result<Self, AuditError> {
+        Self::open_with_owner_and_hook(path, expected_owner, || {})
+    }
+
+    fn open_with_owner_and_hook(
+        path: &Path,
+        expected_owner: u32,
+        parent_opened: impl FnOnce(),
+    ) -> Result<Self, AuditError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         validate_audit_path(path)?;
         let mut file = open_anchored_audit_file(path, parent_opened)?;
         let metadata = file
             .metadata()
             .map_err(|_| AuditError::DestinationUnavailable)?;
-        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        if !metadata.file_type().is_file()
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.uid() != expected_owner
+        {
             return Err(AuditError::UnsafeDestination);
         }
         validate_complete_tail(&mut file, metadata.len())?;
@@ -680,5 +698,18 @@ mod sink_failure_tests {
         });
 
         assert_eq!(result.unwrap_err(), AuditError::UnsafeDestination);
+    }
+
+    #[test]
+    fn audit_open_rejects_existing_file_not_owned_by_daemon() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = directory.path().join("audit.jsonl");
+        fs::write(&path, b"").unwrap();
+        let wrong_owner = nix::unistd::geteuid().as_raw().wrapping_add(1);
+
+        assert_eq!(
+            AuditLog::open_with_expected_owner(&path, wrong_owner).unwrap_err(),
+            AuditError::UnsafeDestination
+        );
     }
 }

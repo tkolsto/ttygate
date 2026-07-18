@@ -54,6 +54,7 @@ pub enum SessionCloseReason {
     Explicit,
     TransportDropped,
     ProtocolViolation,
+    PolicyViolation,
     InternalFailure,
     HandleDropped,
     SupervisorUnwind,
@@ -941,7 +942,9 @@ impl Session {
     ) -> Result<SessionClosed, SessionError> {
         debug_assert!(matches!(
             reason,
-            SessionCloseReason::ProtocolViolation | SessionCloseReason::InternalFailure
+            SessionCloseReason::ProtocolViolation
+                | SessionCloseReason::PolicyViolation
+                | SessionCloseReason::InternalFailure
         ));
         request_close(&self.close_tx, reason);
         self.wait_closed().await
@@ -1266,6 +1269,7 @@ fn audit_close_reason(reason: SessionCloseReason) -> AuditCloseReason {
         SessionCloseReason::Explicit => AuditCloseReason::Explicit,
         SessionCloseReason::TransportDropped => AuditCloseReason::WebsocketDisconnect,
         SessionCloseReason::ProtocolViolation => AuditCloseReason::ProtocolViolation,
+        SessionCloseReason::PolicyViolation => AuditCloseReason::PolicyViolation,
         SessionCloseReason::InternalFailure => AuditCloseReason::InternalFailure,
         SessionCloseReason::HandleDropped => AuditCloseReason::Cancellation,
         SessionCloseReason::SupervisorUnwind => AuditCloseReason::SupervisorUnwind,
@@ -1373,6 +1377,7 @@ mod tests {
             SessionCloseReason::Explicit,
             SessionCloseReason::TransportDropped,
             SessionCloseReason::ProtocolViolation,
+            SessionCloseReason::PolicyViolation,
             SessionCloseReason::InternalFailure,
             SessionCloseReason::HandleDropped,
             SessionCloseReason::SupervisorUnwind,

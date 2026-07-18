@@ -184,7 +184,8 @@ concurrent parent rename cannot redirect the final open; a raced special file
 is opened nonblocking and rejected. The destination must be a regular
 non-symlink file. A missing destination is
 created owner-only (`0600` on Unix); ttygate rejects an existing file with
-group/other permissions and never weakens it with an automatic `chmod`.
+group/other permissions or an owner other than the daemon's effective Unix
+user, and never weakens it with an automatic `chmod`.
 Existing content must end at a complete newline-delimited record.
 
 The sink writes schema-versioned JSONL in append mode. One process-owned mutex

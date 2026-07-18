@@ -136,6 +136,9 @@ fn terminal_controls(closed: SessionClosed) -> Vec<ServerControl> {
         SessionCloseReason::ProtocolViolation => {
             vec![ServerControl::Close(CloseReason::ProtocolError)]
         }
+        SessionCloseReason::PolicyViolation => {
+            vec![ServerControl::Close(CloseReason::Policy)]
+        }
         SessionCloseReason::InternalFailure => vec![
             error_control(
                 "session-unavailable",
@@ -182,7 +185,19 @@ pub async fn accept_upgrade(
         match tokio::time::timeout_at(handshake_deadline, socket.recv()).await {
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
             Ok(Some(Err(error))) if is_message_too_large(&error) => {
-                send_failure(&mut socket, protocol_failure(ProtocolError::BinaryTooLarge)).await;
+                let failure = if record_ticket_denial(
+                    &audit,
+                    &identity,
+                    remote_address,
+                    TicketError::Malformed,
+                )
+                .is_ok()
+                {
+                    protocol_failure(ProtocolError::BinaryTooLarge)
+                } else {
+                    safe_session_error(SessionError::AuditUnavailable)
+                };
+                send_failure(&mut socket, failure).await;
                 return;
             }
             Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
@@ -811,6 +826,7 @@ async fn finish_bridge(
             let reason = match failure.close_reason {
                 CloseReason::ProtocolError => SessionCloseReason::ProtocolViolation,
                 CloseReason::TransportError => SessionCloseReason::TransportDropped,
+                CloseReason::Policy => SessionCloseReason::PolicyViolation,
                 _ => SessionCloseReason::InternalFailure,
             };
             if reason == SessionCloseReason::TransportDropped {

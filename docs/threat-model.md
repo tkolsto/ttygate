@@ -145,7 +145,8 @@ configured path. An anchored non-following directory-descriptor walk prevents
 parent rename redirection, and nonblocking final open rejects raced special
 files. It rejects symlink parents/destinations, non-regular destinations,
 unsafe existing permissions, and incomplete existing tails; a new file is
-owner-only (`0600` on Unix). Authentication success, stable denials,
+owner-only (`0600` on Unix), and an existing file must be owned by the daemon's
+effective Unix user. Authentication success, stable denials,
 and admitted-session starts and completions are closed event variants with
 opaque correlation identifiers.
 

@@ -28,7 +28,8 @@ use ttygated::{
     config::{Limits, PtyTarget, SshTarget, SshUserPolicy, Target, TargetAllowlist},
     origin::OriginPolicy,
     protocol::{
-        ClientControl, Resize, ServerControl, decode_server_control, encode_client_control,
+        ClientControl, MAX_BINARY_BYTES, Resize, ServerControl, decode_server_control,
+        encode_client_control,
     },
     server::{AppState, serve},
     session::LifecycleTransition,
@@ -612,6 +613,38 @@ async fn ticket_denials_are_stable_and_never_include_ticket() {
 }
 
 #[tokio::test]
+async fn oversized_initial_websocket_message_has_secret_free_ticket_denial() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        target(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        limits(),
+        AuditLog::open(&audit_path).unwrap(),
+    );
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    let sentinel = "OVERSIZED-TICKET-SENTINEL";
+    let mut message = sentinel.repeat(MAX_BINARY_BYTES / sentinel.len() + 2);
+    message.truncate(MAX_BINARY_BYTES + 1);
+    socket
+        .send(tungstenite::Message::Text(message.into()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_server_control(&mut socket).await,
+        ServerControl::Error(message) if message.code == "protocol-error"
+    ));
+
+    let contents = std::fs::read_to_string(audit_path).unwrap();
+    assert!(contents.contains(r#""reason":"ticket-malformed""#));
+    assert!(!contents.contains(sentinel));
+}
+
+#[tokio::test]
 async fn post_redemption_session_denials_are_audited() {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     let audit_path = directory.path().join("audit.jsonl");
@@ -765,6 +798,59 @@ async fn malformed_control_frame_has_protocol_audit_completion() {
     .await
     .expect("protocol audit completion timed out");
     assert_eq!(event["close_reason"], "protocol-violation");
+}
+
+#[tokio::test]
+async fn read_only_input_has_policy_violation_audit_completion() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let configured = fixture_target(&[], true);
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        configured.clone(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        limits(),
+        AuditLog::open(&audit_path).unwrap(),
+    );
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    collect_binary_until(&mut socket, b"READY").await;
+    socket
+        .send(tungstenite::Message::Binary(
+            b"READ-ONLY-INPUT-SENTINEL".to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_server_control(&mut socket).await,
+        ServerControl::Error(message) if message.code == "session-denied"
+    ));
+
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(event) = std::fs::read_to_string(&audit_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|event| event["event_type"] == "session-ended")
+            {
+                break event;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("read-only policy audit completion timed out");
+    assert_eq!(event["close_reason"], "policy-violation");
+    assert!(
+        !std::fs::read_to_string(audit_path)
+            .unwrap()
+            .contains("READ-ONLY-INPUT-SENTINEL")
+    );
 }
 
 #[tokio::test]
