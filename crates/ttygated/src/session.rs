@@ -251,6 +251,9 @@ impl Capacity {
         identity: &Identity,
         expires_at: Instant,
     ) -> Result<Reservation, SessionError> {
+        if expires_at <= self.inner.clock.now() {
+            return Err(SessionError::ReservationUnavailable);
+        }
         self.reserve_with_state(identity, LeaseState::Pending { expires_at })
     }
 
@@ -1060,7 +1063,7 @@ mod tests {
     use crate::{
         config::{Limits, PtyTarget, Target, TargetAllowlist},
         protocol::{MAX_BINARY_BYTES, Resize},
-        ticket::Identity,
+        ticket::{Identity, TicketGrant, TicketStore},
     };
     use tokio::time::Instant;
 
@@ -1286,17 +1289,20 @@ mod tests {
     }
 
     #[test]
-    fn expired_pending_lease_releases_capacity_at_exact_boundary() {
+    fn already_expired_pending_lease_is_rejected_without_consuming_capacity() {
         let capacity = Capacity::new(&limits(1, 1));
         let alice = Identity::new("alice").unwrap();
         let bob = Identity::new("bob").unwrap();
-        let expired = capacity.reserve_pending(&alice, Instant::now()).unwrap();
+        assert!(matches!(
+            capacity.reserve_pending(&alice, Instant::now()),
+            Err(SessionError::ReservationUnavailable)
+        ));
 
         let replacement = capacity
             .reserve_pending(&bob, Instant::now() + Duration::from_secs(10))
-            .expect("an exactly expired pending lease must not retain capacity");
+            .expect("a rejected expired lease must not retain capacity");
         assert_eq!(capacity.active(), (1, 1));
-        drop((expired, replacement));
+        drop(replacement);
         assert_eq!(capacity.active(), (0, 0));
     }
 
@@ -1610,12 +1616,45 @@ mod tests {
             .reserve(&identity, Instant::now() + Duration::from_secs(10))
             .await
             .unwrap();
+        let tickets = TicketStore::new(Duration::from_secs(10), 1);
+        tickets
+            .issue(identity, Target::Pty(fixture_target(false)), reservation)
+            .unwrap();
         assert_eq!(manager.capacity.active(), (1, 1));
 
         manager.shutdown().await;
         assert_eq!(manager.capacity.active(), (0, 0));
-        drop(reservation);
+        drop(tickets);
         assert_eq!(manager.capacity.active(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn ticket_owned_pending_capacity_releases_during_unwind() {
+        let manager = manager(limits(1, 1), &[fixture_target(false)]);
+        let identity = Identity::new("alice").unwrap();
+        let reservation = manager
+            .reserve(&identity, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tickets = TicketStore::new(Duration::from_secs(10), 1);
+            tickets
+                .issue(
+                    identity.clone(),
+                    Target::Pty(fixture_target(false)),
+                    reservation,
+                )
+                .unwrap();
+            panic!("intentional ticket ownership unwind");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(manager.capacity.active(), (0, 0));
+        assert!(
+            manager
+                .reserve(&identity, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1803,6 +1842,85 @@ mod tests {
             .await
             .expect("spawn failure must release reservation");
         session.close().await.unwrap();
+    }
+
+    async fn issue_reserved_ticket(
+        manager: &SessionManager,
+        identity: &Identity,
+        target: Target,
+    ) -> TicketGrant {
+        let tickets = TicketStore::new(Duration::from_secs(10), 8);
+        let reservation = manager
+            .reserve(identity, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let ticket = tickets
+            .issue(identity.clone(), target, reservation)
+            .unwrap();
+        tickets.redeem(ticket.as_str(), identity).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ticket_owned_capacity_recovers_after_real_spawn_failure_exactly_once() {
+        let identity = Identity::new("alice").unwrap();
+        let mut missing = fixture_target(false);
+        missing.name = "missing".to_owned();
+        missing.executable = "/definitely/not/a/ttygate-program".into();
+        let manager = manager(limits(1, 1), &[missing.clone(), fixture_target(false)]);
+        let grant = issue_reserved_ticket(&manager, &identity, Target::Pty(missing)).await;
+        let (target, reservation) = grant.into_parts();
+
+        assert!(matches!(
+            manager
+                .start_reserved(
+                    reservation,
+                    identity.clone(),
+                    target.name(),
+                    Resize::new(80, 24).unwrap(),
+                )
+                .await,
+            Err(SessionError::SpawnUnavailable)
+        ));
+        assert_eq!(manager.capacity.active(), (0, 0));
+        assert!(
+            manager
+                .reserve(&identity, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_owned_capacity_recovers_after_dropped_resistant_session() {
+        let identity = Identity::new("alice").unwrap();
+        let mut resistant = fixture_target(false);
+        resistant.argv = vec!["ignore-hup".to_owned()];
+        let manager = manager(limits(1, 1), std::slice::from_ref(&resistant));
+        let grant = issue_reserved_ticket(&manager, &identity, Target::Pty(resistant)).await;
+        let (target, reservation) = grant.into_parts();
+        let session = manager
+            .start_reserved(
+                reservation,
+                identity.clone(),
+                target.name(),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while manager.capacity.active() != (0, 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped resistant session did not release ticket capacity");
+        assert!(
+            manager
+                .reserve(&identity, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
     }
 
     async fn closed_event(session: &mut super::Session) -> LifecycleTransition {

@@ -172,6 +172,9 @@ impl TicketStore {
         expiry: TicketExpiry,
     ) -> Result<Ticket, TicketError> {
         let now = self.clock.now();
+        if expiry.instant() <= now {
+            return Err(TicketError::Expired);
+        }
         let mut entries = self
             .entries
             .lock()
@@ -480,5 +483,24 @@ mod tests {
             store.redeem(ticket.as_str(), &identity),
             Err(TicketError::Expired)
         ));
+    }
+
+    #[test]
+    fn already_expired_shared_deadline_is_rejected_before_ticket_insertion() {
+        let (store, clock) = controlled_store(Duration::from_millis(10), 1);
+        let identity = Identity::new("dev").unwrap();
+        let expiry = store.next_expiry();
+        clock.millis.store(10, Ordering::SeqCst);
+
+        assert!(matches!(
+            store.issue_at(
+                identity.clone(),
+                target("shell"),
+                reservation(&identity),
+                expiry,
+            ),
+            Err(TicketError::Expired)
+        ));
+        assert!(store.entries.lock().unwrap().is_empty());
     }
 }
