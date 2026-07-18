@@ -894,6 +894,37 @@ fn validate_username_value(value: &str) -> Result<(), ()> {
     Ok(())
 }
 
+pub(crate) fn canonical_ssh_host(value: &str) -> Option<String> {
+    if let Ok(address) = value.parse::<std::net::IpAddr>() {
+        return Some(address.to_string());
+    }
+    if value.is_empty()
+        || value.len() > 253
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    let valid = value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    valid.then(|| value.to_ascii_lowercase())
+}
+
 fn validate_typed_target(index: usize, target: &Target) -> Result<(), ConfigError> {
     validate_target_name(target.name(), &format!("targets[{index}].name"))?;
     match target {
@@ -906,6 +937,12 @@ fn validate_typed_target(index: usize, target: &Target) -> Result<(), ConfigErro
                 &format!("targets[{index}].host"),
                 "must not be empty",
             )?;
+            if canonical_ssh_host(&target.host).is_none() {
+                return Err(validation(
+                    format!("targets[{index}].host"),
+                    "must be an ASCII DNS hostname or unbracketed IP literal",
+                ));
+            }
             if target.port == 0 {
                 return Err(validation(
                     format!("targets[{index}].port"),
@@ -2422,5 +2459,39 @@ user_mapping = { alice = "remote-alice" }"#,
 
         let error = allowlist.resolve("not-configured").unwrap_err();
         assert_eq!(error.name(), "not-configured");
+    }
+
+    #[test]
+    fn ssh_host_grammar_preserves_literal_dns_and_rejects_alternate_destination_syntaxes() {
+        let uppercase = ssh_target(r#"user_policy = "same-as-auth-user""#)
+            .replace("host = \"example.test\"", "host = \"Host.Example.TEST\"");
+        let parsed = parse(&uppercase).unwrap();
+        let Target::Ssh(target) = &parsed.targets[0] else {
+            panic!("expected SSH target");
+        };
+        assert_eq!(target.host, "Host.Example.TEST");
+
+        for rejected in [
+            "user@host.example",
+            "ssh://host.example",
+            "-oProxyCommand=unsafe",
+            "[2001:db8::1]",
+            "host.example/path",
+            "host..example",
+            ".host.example",
+        ] {
+            let source = ssh_target(r#"user_policy = "same-as-auth-user""#)
+                .replace("host = \"example.test\"", &format!("host = {rejected:?}"));
+            assert!(
+                parse(&source).is_err(),
+                "accepted alternate host {rejected}"
+            );
+        }
+
+        for accepted in ["192.0.2.10", "2001:db8::1"] {
+            let source = ssh_target(r#"user_policy = "same-as-auth-user""#)
+                .replace("host = \"example.test\"", &format!("host = {accepted:?}"));
+            assert!(parse(&source).is_ok(), "rejected host literal {accepted}");
+        }
     }
 }

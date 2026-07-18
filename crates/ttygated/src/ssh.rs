@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
-use crate::config::{SshTarget, Target};
+use crate::config::{SshTarget, Target, canonical_ssh_host};
 
 pub const MAX_SSH_EXECUTABLE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
@@ -122,6 +122,7 @@ impl FileSnapshot {
 pub struct PreparedSshTarget {
     name: String,
     host: String,
+    canonical_host: CanonicalSshHost,
     port: u16,
     user_policy: crate::config::SshUserPolicy,
     read_only: bool,
@@ -132,6 +133,9 @@ pub struct PreparedSshTarget {
     identity: PathBuf,
     identity_snapshot: FileSnapshot,
 }
+
+#[derive(Clone, PartialEq, Eq)]
+struct CanonicalSshHost(String);
 
 impl std::fmt::Debug for PreparedSshTarget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,6 +177,11 @@ impl PreparedSshTarget {
             && self.executable == target.ssh_executable
             && self.known_hosts == target.known_hosts
             && self.identity == target.identity_file
+    }
+
+    #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+    pub(crate) fn diagnostic_classifier(&self) -> SshDiagnosticClassifier {
+        SshDiagnosticClassifier::new(self.canonical_host.clone())
     }
 }
 
@@ -250,7 +259,7 @@ impl SshSpawnSpec {
             OsString::from("-l"),
             OsString::from(resolved_user),
             OsString::from("--"),
-            OsString::from(&prepared.host),
+            OsString::from(&prepared.canonical_host.0),
         ]);
         Ok(Self {
             executable: prepared.executable.clone(),
@@ -354,7 +363,7 @@ pub(crate) enum SshDiagnosticClass {
 
 #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
 pub(crate) struct SshDiagnosticClassifier {
-    expected_host: String,
+    expected_host: CanonicalSshHost,
     bytes: Vec<u8>,
     line_count: usize,
     current_line_bytes: usize,
@@ -374,9 +383,9 @@ impl std::fmt::Debug for SshDiagnosticClassifier {
 
 #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
 impl SshDiagnosticClassifier {
-    pub(crate) fn new(expected_host: &str) -> Self {
+    fn new(expected_host: CanonicalSshHost) -> Self {
         Self {
-            expected_host: expected_host.to_owned(),
+            expected_host,
             bytes: Vec::new(),
             line_count: 0,
             current_line_bytes: 0,
@@ -441,25 +450,29 @@ impl SshDiagnosticClassifier {
             Err(error) if error.error_len().is_none() => return None,
             Err(_) => return Some(SshDiagnosticClass::GenericFailure),
         };
-        classify_diagnostics(diagnostics, &self.expected_host)
+        classify_diagnostics(diagnostics, &self.expected_host.0)
     }
 }
 
 #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
 fn classify_diagnostics(diagnostics: &str, expected_host: &str) -> Option<SshDiagnosticClass> {
-    if diagnostics.contains("REMOTE HOST IDENTIFICATION HAS CHANGED!")
-        || diagnostics.contains("Offending ") && diagnostics.contains(" key in ")
-    {
+    let lines = || {
+        diagnostics.split_inclusive('\n').filter_map(|line| {
+            line.strip_suffix('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        })
+    };
+    if lines().any(|line| line == "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!") {
         Some(SshDiagnosticClass::HostKeyMismatch)
-    } else if diagnostics.contains("No ED25519 host key is known for ")
-        || diagnostics.contains("No ECDSA host key is known for ")
-        || diagnostics.contains("No RSA host key is known for ")
-        || diagnostics.contains("Host key verification failed.")
-    {
+    } else if lines().any(|line| {
+        ["ED25519", "ECDSA", "RSA"].iter().any(|key_type| {
+            line.strip_prefix(&format!("No {key_type} host key is known for "))
+                .and_then(|line| line.strip_suffix(" and you have requested strict checking."))
+                .is_some_and(|host| host == expected_host)
+        }) || line == "Host key verification failed."
+    }) {
         Some(SshDiagnosticClass::UnknownHostKey)
-    } else if diagnostics.split_inclusive('\n').any(|line| {
-        let line = line.strip_suffix('\n').unwrap_or_default();
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    } else if lines().any(|line| {
         let Some(authority) = line
             .strip_prefix("Authenticated to ")
             .and_then(|line| line.strip_suffix(" using \"publickey\"."))
@@ -472,16 +485,36 @@ fn classify_diagnostics(diagnostics: &str, expected_host: &str) -> Option<SshDia
                 .is_some_and(|suffix| suffix.starts_with(" ([") && suffix.ends_with(')'))
     }) {
         Some(SshDiagnosticClass::Authenticated)
-    } else if diagnostics.contains("Permission denied (publickey")
-        || diagnostics.contains("No more authentication methods to try.")
-    {
+    } else if lines().any(|line| {
+        line.strip_suffix(": Permission denied (publickey).")
+            .and_then(|authority| authority.rsplit_once('@'))
+            .is_some_and(|(user, host)| {
+                !user.is_empty()
+                    && user.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                    && host == expected_host
+            })
+            || line == "No more authentication methods to try."
+    }) {
         Some(SshDiagnosticClass::AuthenticationFailed)
-    } else if diagnostics.contains("ssh: connect to host ")
-        || diagnostics.contains("Could not resolve hostname ")
-        || diagnostics.contains("Connection closed by ")
-        || diagnostics.contains("Connection reset by ")
-        || diagnostics.contains("Connection timed out")
-    {
+    } else if lines().any(|line| {
+        let Some(rest) = line.strip_prefix("ssh: connect to host ") else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix(expected_host) else {
+            return false;
+        };
+        rest.starts_with(" port ")
+            && [
+                "Connection refused",
+                "Connection timed out",
+                "No route to host",
+                "Operation timed out",
+            ]
+            .iter()
+            .any(|reason| rest.ends_with(reason))
+    }) {
         Some(SshDiagnosticClass::ConnectionFailed)
     } else {
         None
@@ -566,6 +599,7 @@ impl PreparedSshTargets {
                     PreparedSshTarget {
                         name: name.to_owned(),
                         host: "host.example".to_owned(),
+                        canonical_host: CanonicalSshHost("host.example".to_owned()),
                         port: 22,
                         user_policy: crate::config::SshUserPolicy::Fixed("operator".to_owned()),
                         read_only: false,
@@ -637,6 +671,9 @@ where
     let prepared = PreparedSshTarget {
         name: target.name.clone(),
         host: target.host.clone(),
+        canonical_host: CanonicalSshHost(
+            canonical_ssh_host(&target.host).ok_or(SshPreparationError::CapabilityUnsupported)?,
+        ),
         port: target.port,
         user_policy: target.user_policy.clone(),
         read_only: target.read_only,
@@ -1741,6 +1778,12 @@ requesttty force\n"
             .collect()
     }
 
+    fn classifier_for_test(host: &str) -> super::SshDiagnosticClassifier {
+        super::SshDiagnosticClassifier::new(super::CanonicalSshHost(
+            crate::config::canonical_ssh_host(host).unwrap(),
+        ))
+    }
+
     #[tokio::test]
     async fn ssh_argv_serializes_every_pinned_option_exactly_once() {
         let material = Material::new();
@@ -2008,7 +2051,7 @@ requesttty force\n"
             ),
             (b"ssh: unexplained failure\n".as_slice(), GenericFailure),
         ] {
-            let mut classifier = super::SshDiagnosticClassifier::new("host.example");
+            let mut classifier = classifier_for_test("host.example");
             classifier.push(diagnostic);
             assert_eq!(classifier.finish(), expected);
         }
@@ -2044,54 +2087,54 @@ requesttty force\n"
                 AuthenticationFailed,
             ),
         ] {
-            let mut classifier = super::SshDiagnosticClassifier::new("host.example");
+            let mut classifier = classifier_for_test("host.example");
             classifier.push(diagnostic);
             assert_eq!(classifier.classification(), Some(expected));
             assert_eq!(classifier.classification(), Some(expected));
         }
 
-        let mut precedence = super::SshDiagnosticClassifier::new("host.example");
+        let mut precedence = classifier_for_test("host.example");
         precedence.push(b"Authenticated to host.example using \"publickey\".\n");
         assert_eq!(precedence.classification(), Some(Authenticated));
         precedence.push(b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n");
         assert_eq!(precedence.classification(), Some(HostKeyMismatch));
 
-        let mut partial = super::SshDiagnosticClassifier::new("host.example");
+        let mut partial = classifier_for_test("host.example");
         partial.push(b"Authenticated to host.example using \"public");
         assert_eq!(partial.classification(), None);
 
-        let mut split_utf8 = super::SshDiagnosticClassifier::new("host.example");
+        let mut split_utf8 = classifier_for_test("host.example");
         split_utf8.push(b"setup caf\xc3");
         assert_eq!(split_utf8.classification(), None);
         split_utf8.push(b"\xa9\n");
         assert_eq!(split_utf8.classification(), None);
 
-        let mut invalid_utf8 = super::SshDiagnosticClassifier::new("host.example");
+        let mut invalid_utf8 = classifier_for_test("host.example");
         invalid_utf8.push(&[0xff]);
         assert_eq!(invalid_utf8.classification(), Some(GenericFailure));
 
-        let mut unrecognized = super::SshDiagnosticClassifier::new("host.example");
+        let mut unrecognized = classifier_for_test("host.example");
         unrecognized.push(b"debug1: setup continues\n");
         assert_eq!(unrecognized.classification(), None);
         assert_eq!(unrecognized.finish(), GenericFailure);
 
-        let mut bounded = super::SshDiagnosticClassifier::new("host.example");
+        let mut bounded = classifier_for_test("host.example");
         bounded.push(&[b'x'; super::MAX_SSH_DIAGNOSTIC_BYTES + 1]);
         assert_eq!(bounded.classification(), Some(GenericFailure));
     }
 
     #[test]
     fn ssh_classifier_is_bounded_locale_pinned_and_never_returns_diagnostics() {
-        use super::{SshDiagnosticClass, SshDiagnosticClassifier};
+        use super::SshDiagnosticClass;
 
-        let mut oversized = SshDiagnosticClassifier::new("host.example");
+        let mut oversized = classifier_for_test("host.example");
         oversized.push(&[b'x'; super::MAX_SSH_DIAGNOSTIC_BYTES + 1]);
         assert_eq!(oversized.finish(), SshDiagnosticClass::GenericFailure);
 
-        let mut too_many_lines = SshDiagnosticClassifier::new("host.example");
+        let mut too_many_lines = classifier_for_test("host.example");
         too_many_lines.push(&[b'\n'; super::MAX_SSH_DIAGNOSTIC_LINES + 1]);
         assert_eq!(too_many_lines.finish(), SshDiagnosticClass::GenericFailure);
-        let mut trailing_extra_line = SshDiagnosticClassifier::new("host.example");
+        let mut trailing_extra_line = classifier_for_test("host.example");
         trailing_extra_line.push(&[b'\n'; super::MAX_SSH_DIAGNOSTIC_LINES]);
         trailing_extra_line.push(b"Authenticated to synthetic using \"publickey\".");
         assert_eq!(
@@ -2099,16 +2142,16 @@ requesttty force\n"
             SshDiagnosticClass::GenericFailure
         );
 
-        let mut long_line = SshDiagnosticClassifier::new("host.example");
+        let mut long_line = classifier_for_test("host.example");
         long_line.push(&[b'x'; super::MAX_SSH_DIAGNOSTIC_LINE_BYTES + 1]);
         assert_eq!(long_line.finish(), SshDiagnosticClass::GenericFailure);
 
-        let mut invalid_utf8 = SshDiagnosticClassifier::new("host.example");
+        let mut invalid_utf8 = classifier_for_test("host.example");
         invalid_utf8.push(&[0xff]);
         assert_eq!(invalid_utf8.finish(), SshDiagnosticClass::GenericFailure);
 
         let debug = format!("{:?}", {
-            let mut classifier = SshDiagnosticClassifier::new("host.example");
+            let mut classifier = classifier_for_test("host.example");
             classifier.push(b"secret-host secret-user /secret/path");
             classifier
         });
@@ -2158,15 +2201,39 @@ requesttty force\n"
         }
     }
 
-    #[test]
-    fn ssh_authenticated_classifier_requires_exact_complete_expected_host_line() {
+    #[tokio::test]
+    async fn ssh_authenticated_classifier_requires_exact_complete_expected_host_line() {
         use super::SshDiagnosticClass::Authenticated;
 
-        let mut classifier = super::SshDiagnosticClassifier::new("host.example");
+        let material = Material::new();
+        let mut target = material.target();
+        target.host = "Host.Example".into();
+        let prepared = prepare_target_with_probe(&target, accept_probe)
+            .await
+            .unwrap();
+        let spec = super::SshSpawnSpec::build(&prepared, "ignored").unwrap();
+        assert_eq!(spec.argv().last().unwrap(), "host.example");
+        let mut classifier = prepared.diagnostic_classifier();
         classifier.push(b"Authenticated to host.example using \"publickey\".");
         assert_eq!(classifier.classification(), None);
         classifier.push(b"\n");
         assert_eq!(classifier.classification(), Some(Authenticated));
+
+        for (configured, canonical) in
+            [("192.0.2.10", "192.0.2.10"), ("2001:DB8::1", "2001:db8::1")]
+        {
+            let mut target = material.target();
+            target.host = configured.into();
+            let prepared = prepare_target_with_probe(&target, accept_probe)
+                .await
+                .unwrap();
+            let spec = super::SshSpawnSpec::build(&prepared, "ignored").unwrap();
+            assert_eq!(spec.argv().last().unwrap(), canonical);
+            let mut classifier = prepared.diagnostic_classifier();
+            classifier
+                .push(format!("Authenticated to {canonical} using \"publickey\".\n").as_bytes());
+            assert_eq!(classifier.classification(), Some(Authenticated));
+        }
 
         for rejected in [
             b"prefix Authenticated to host.example using \"publickey\".\n".as_slice(),
@@ -2175,9 +2242,51 @@ requesttty force\n"
             b"Authenticated to host.example\nusing \"publickey\".\n".as_slice(),
             b"remote banner: Authenticated to host.example using \"publickey\".\n".as_slice(),
         ] {
-            let mut classifier = super::SshDiagnosticClassifier::new("host.example");
+            let mut classifier = prepared.diagnostic_classifier();
             classifier.push(rejected);
             assert_eq!(classifier.classification(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_failure_classifier_requires_complete_supported_lines() {
+        let material = Material::new();
+        let (_target, prepared) = prepared_runtime_fixture(&material).await;
+        let exact = [
+            (
+                "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n",
+                super::SshDiagnosticClass::HostKeyMismatch,
+            ),
+            (
+                "No ED25519 host key is known for host.example and you have requested strict checking.\n",
+                super::SshDiagnosticClass::UnknownHostKey,
+            ),
+            (
+                "ssh: connect to host host.example port 22: Connection refused\n",
+                super::SshDiagnosticClass::ConnectionFailed,
+            ),
+            (
+                "operator@host.example: Permission denied (publickey).\n",
+                super::SshDiagnosticClass::AuthenticationFailed,
+            ),
+        ];
+        for (line, expected) in exact {
+            let mut classifier = prepared.diagnostic_classifier();
+            classifier.push(line.as_bytes());
+            assert_eq!(classifier.classification(), Some(expected));
+            let mut hostile = vec![
+                format!("remote banner: {line}"),
+                format!("prefix {line} suffix\n"),
+            ];
+            let cross_line = line.replace(" host", "\n host");
+            if cross_line != line {
+                hostile.push(cross_line);
+            }
+            for hostile in hostile {
+                let mut classifier = prepared.diagnostic_classifier();
+                classifier.push(hostile.as_bytes());
+                assert_eq!(classifier.classification(), None, "{hostile:?}");
+            }
         }
     }
 
@@ -2210,7 +2319,7 @@ requesttty force\n"
         .await
         .unwrap()
         .unwrap();
-        let mut classifier = super::SshDiagnosticClassifier::new("host.example");
+        let mut classifier = classifier_for_test("host.example");
         classifier.push(&trusted[..setup_count]);
         assert_eq!(classifier.classification(), None);
         let mut raw = Vec::new();
@@ -2238,7 +2347,7 @@ requesttty force\n"
         let spec = super::SshSpawnSpec::build(&prepared, "ignored").unwrap();
         let running = super::spawn(spec, crate::protocol::Resize::new(80, 24).unwrap()).unwrap();
         let (_terminal, _writer, mut child, _raw_stderr, client_log) = running.into_parts();
-        let mut classifier = super::SshDiagnosticClassifier::new("host.example");
+        let mut classifier = classifier_for_test("host.example");
         let mut total = 0;
         let mut buffer = [0_u8; 1024];
         while classifier.classification() != Some(super::SshDiagnosticClass::GenericFailure) {
