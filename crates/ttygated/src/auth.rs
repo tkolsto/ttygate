@@ -402,10 +402,7 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert_eq!(
-            provider.trusted_peer(&peer_context(
-                &headers,
-                Ipv4Addr::new(192, 0, 2, 4).into()
-            )),
+            provider.trusted_peer(&peer_context(&headers, Ipv4Addr::new(192, 0, 2, 4).into())),
             Err(AuthError::UntrustedPeer)
         );
     }
@@ -488,17 +485,55 @@ mod tests {
         let provider = proxy(&["127.0.0.1/32", "::1/128"]);
         let headers = HeaderMap::new();
 
-        for peer in [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)] {
+        for peer in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
             assert_eq!(
                 provider.trusted_peer(&peer_context(&headers, peer)),
                 Ok(peer)
             );
         }
         assert_eq!(
-            provider.trusted_peer(&peer_context(
-                &headers,
-                Ipv4Addr::new(127, 0, 0, 2).into()
-            )),
+            provider.trusted_peer(&peer_context(&headers, Ipv4Addr::new(127, 0, 0, 2).into())),
+            Err(AuthError::UntrustedPeer)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cidr_extremes_preserve_address_family_and_exact_prefixes() {
+        let headers = HeaderMap::new();
+        let any_ipv4 = proxy(&["0.0.0.0/0"]);
+        for peer in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST] {
+            assert_eq!(
+                any_ipv4.trusted_peer(&peer_context(&headers, peer.into())),
+                Ok(peer.into())
+            );
+        }
+        assert_eq!(
+            any_ipv4.trusted_peer(&peer_context(&headers, Ipv6Addr::LOCALHOST.into())),
+            Err(AuthError::UntrustedPeer)
+        );
+
+        let exact_ipv4 = proxy(&["192.0.2.7/32"]);
+        assert_eq!(
+            exact_ipv4.trusted_peer(&peer_context(&headers, Ipv4Addr::new(192, 0, 2, 7).into())),
+            Ok(Ipv4Addr::new(192, 0, 2, 7).into())
+        );
+        assert_eq!(
+            exact_ipv4.trusted_peer(&peer_context(&headers, Ipv4Addr::new(192, 0, 2, 8).into())),
+            Err(AuthError::UntrustedPeer)
+        );
+
+        let exact_ipv6 = proxy(&["2001:db8::7/128"]);
+        let trusted_ipv6 = "2001:db8::7".parse::<IpAddr>().unwrap();
+        let adjacent_ipv6 = "2001:db8::8".parse::<IpAddr>().unwrap();
+        assert_eq!(
+            exact_ipv6.trusted_peer(&peer_context(&headers, trusted_ipv6)),
+            Ok(trusted_ipv6)
+        );
+        assert_eq!(
+            exact_ipv6.trusted_peer(&peer_context(&headers, adjacent_ipv6)),
             Err(AuthError::UntrustedPeer)
         );
     }
@@ -518,14 +553,8 @@ mod tests {
     fn trusted_proxy_rejects_duplicate_identity_headers_even_when_equal() {
         let provider = proxy(&["127.0.0.1/32"]);
         let mut headers = HeaderMap::new();
-        headers.append(
-            "x-authenticated-user",
-            HeaderValue::from_static("alice"),
-        );
-        headers.append(
-            "x-authenticated-user",
-            HeaderValue::from_static("alice"),
-        );
+        headers.append("x-authenticated-user", HeaderValue::from_static("alice"));
+        headers.append("x-authenticated-user", HeaderValue::from_static("alice"));
 
         assert_eq!(
             provider.identity_from_header(&headers),
@@ -610,10 +639,7 @@ mod tests {
         );
 
         assert_eq!(
-            provider
-                .identity_from_header(&headers)
-                .unwrap()
-                .as_str(),
+            provider.identity_from_header(&headers).unwrap().as_str(),
             value
         );
     }
@@ -682,9 +708,15 @@ mod tests {
             HeaderValue::from_static("hostile identity sentinel"),
         );
 
-        let error = provider.identity_from_header(&headers).unwrap_err().to_string();
+        let error = provider
+            .identity_from_header(&headers)
+            .unwrap_err()
+            .to_string();
         for sentinel in ["hostile", "identity sentinel", "127.0.0.1"] {
-            assert!(!error.contains(sentinel), "{error:?} reflected {sentinel:?}");
+            assert!(
+                !error.contains(sentinel),
+                "{error:?} reflected {sentinel:?}"
+            );
         }
     }
 
@@ -705,10 +737,7 @@ mod tests {
         headers: &'a mut HeaderMap,
         identity: &'static str,
     ) -> AuthContext<'a> {
-        headers.insert(
-            "x-authenticated-user",
-            HeaderValue::from_static(identity),
-        );
+        headers.insert("x-authenticated-user", HeaderValue::from_static(identity));
         peer_context(headers, IpAddr::V4(Ipv4Addr::LOCALHOST))
     }
 
@@ -766,10 +795,7 @@ mod tests {
             .unwrap();
         let pair = provisioned.cookie.split(';').next().unwrap();
         let mut changed_headers = HeaderMap::new();
-        changed_headers.insert(
-            "x-authenticated-user",
-            HeaderValue::from_static("mallory"),
-        );
+        changed_headers.insert("x-authenticated-user", HeaderValue::from_static("mallory"));
 
         let identity = provider
             .authenticate(
@@ -792,10 +818,7 @@ mod tests {
 
         assert_eq!(
             provider.authenticate(
-                &peer_context(
-                    &HeaderMap::new(),
-                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))
-                ),
+                &peer_context(&HeaderMap::new(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
                 Some(pair),
             ),
             Err(AuthError::UntrustedPeer)
@@ -808,7 +831,10 @@ mod tests {
         let headers = HeaderMap::new();
         let context = peer_context(&headers, IpAddr::V4(Ipv4Addr::LOCALHOST));
 
-        assert_eq!(provider.authenticate(&context, None), Err(AuthError::Missing));
+        assert_eq!(
+            provider.authenticate(&context, None),
+            Err(AuthError::Missing)
+        );
         assert_eq!(
             provider.authenticate(&context, Some("broken")),
             Err(AuthError::Malformed)

@@ -9,7 +9,15 @@ ttygate is a security-first browser terminal gateway inspired by Shell In A Box.
 
 ttygate is pre-release software. Milestone M1, completed by issue #7, provides an accessible xterm.js browser terminal over the Rust daemon, explicit browser Origin checks, a development identity cookie, bounded single-use session tickets, an authenticated ticket-bound WebSocket bridge, safe configured-target discovery, and an allowlisted PTY session backend with bounded I/O and guaranteed process-group teardown.
 
-Roadmap Chunk 2.1 (Refs #8) adds typed `dev`/`production` mode gating, restricts the development identity to loopback binds, rejects unsafe production configuration before application construction or listener binding, and implements one direct rustls listener for HTTPS and WSS. It does not add production authentication: the trusted-proxy shape is contract-only, and Chunk 2.2 will enforce trusted source addresses and consume identity headers. Rate limiting, audit persistence, SSH, recording, reconnect, packaging, and release hardening remain future work, so the current build is still not production-safe.
+Roadmap Chunk 2.1 (Refs #8) adds typed `dev`/`production` mode gating,
+restricts the development identity to loopback binds, rejects unsafe production
+configuration before application construction or listener binding, and
+implements one direct rustls listener for HTTPS and WSS. Roadmap Chunk 2.2 is complete (Refs #9): production trusted-proxy authentication now verifies the actual
+socket peer against configured CIDRs, consumes one configured identity header,
+and binds that identity through the secure browser cookie, session ticket, WSS
+upgrade, and PTY session. Rate limiting, audit persistence, SSH, recording,
+reconnect, packaging, and release hardening remain future work, so the current
+build is still not production-safe.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
 
@@ -69,7 +77,9 @@ cookie attributes are unchanged, and TLS failure never falls back to plaintext
 HTTP. Self-signed certificates are used only inside isolated integration tests;
 they are not production-safe.
 
-The following production trusted-proxy shape parses only as a future contract:
+## Trusted reverse-proxy authentication
+
+The implemented production trusted-proxy configuration has this exact shape:
 
 ```toml
 [server]
@@ -85,16 +95,44 @@ provider = "trusted-proxy"
 identity_header = "x-auth-request-user"
 ```
 
-The daemon deliberately refuses to build an application from that contract
-today. It does not yet trust or consume the identity header; Chunk 2.2 must add
-peer-source enforcement and identity propagation before production startup can
-succeed. Do not use this snippet as a deployment example.
+The listener is plaintext inside the protected proxy-to-daemon network boundary;
+the proxy terminates TLS for the public HTTPS/WSS authority. ttygate treats only
+the actual socket peer address supplied by the listener as authoritative. It
+ignores `Forwarded`, `X-Forwarded-For`, and similar client-controlled address
+claims, and it accepts a request only when that peer belongs to one of
+`trusted_sources`. IPv4 and IPv6 CIDRs are matched in their original address
+families; an IPv4-mapped IPv6 peer is not converted into IPv4 for matching.
+
+After the peer check, ttygate requires exactly one occurrence of
+`identity_header`. The semantic HTTP field value exposed by the HTTP parser must
+be valid UTF-8, contain 1 through 128 bytes, and contain no Unicode whitespace
+or control character. HTTP field-line optional whitespace is framing and is
+removed by the parser before ttygate receives the semantic value. ttygate does
+not trim, case-fold, Unicode-normalize, split, or otherwise transform that
+semantic value, so accepted identity bytes remain case-sensitive and distinct.
+
+The trusted proxy must authenticate the upstream user, reject or normalize
+ambiguous upstream surrounding whitespace before injection, strip every
+client-supplied instance of the configured identity header, and inject exactly
+one canonical identity header. It must also be the only component able to reach
+the backend from a trusted CIDR; direct public access to the backend must be
+blocked. A compromised trusted proxy can impersonate any user, and CIDR checks
+do not reduce that residual risk. This is the application contract, not a
+ready-to-copy deployment example; concrete hardened proxy examples remain
+future work.
+
+On `POST /api/identity`, the verified header identity is stored behind the same
+opaque secure, HTTP-only, SameSite browser cookie used in development. Later
+session and WSS requests authenticate that cookie after rechecking the socket
+peer; they never reread an identity header to replace the cookie-bound
+identity. Tickets remain short-lived, single-use, target-bound, and
+identity-bound.
 
 ## Planned v0.1 posture
 
 The daemon defaults to `127.0.0.1`, but localhost-only binding is only one layer. Local development requires Origin validation, a real browser session cookie, and a short-lived single-use ticket presented as the first WebSocket message. The frontend lists only safe presentation metadata for server-configured targets; executable paths, arguments, SSH options, credentials, and tickets never become target-selection authority. Terminal output uses bounded server and browser queues, and a dropped WebSocket ends the session without automatic reconnect.
 
-The PTY session manager already enforces configured global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode now fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and stops before binding when the selected real authentication provider is unavailable. Request rate limits, trusted-proxy identity enforcement, and structured session-lifecycle audit persistence remain planned; see the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+The PTY session manager already enforces configured global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits and structured session-lifecycle audit persistence remain planned; see the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
 
 ## Security model and non-goals
 

@@ -10,14 +10,15 @@ use std::{
 };
 
 use axum::http::{HeaderValue, StatusCode, header};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
-    net::{TcpListener, TcpSocket, TcpStream},
-    task::{JoinHandle, JoinSet},
-};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tempfile::TempDir;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    net::{TcpListener, TcpSocket, TcpStream},
+    sync::oneshot,
+    task::{JoinHandle, JoinSet},
+};
 use tokio_rustls::{
     TlsAcceptor, TlsConnector,
     client::TlsStream,
@@ -66,7 +67,8 @@ struct TlsProxy {
     address: SocketAddr,
     origin: String,
     connector: TlsConnector,
-    task: JoinHandle<()>,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<bool>,
 }
 
 impl TlsProxy {
@@ -84,10 +86,13 @@ impl TlsProxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let identity = identity.to_owned();
+        let (shutdown, mut shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else {
                             break;
@@ -105,6 +110,9 @@ impl TlsProxy {
                     }
                 }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            true
         });
 
         let mut roots = RootCertStore::empty();
@@ -120,6 +128,7 @@ impl TlsProxy {
             address,
             origin: ORIGIN.to_owned(),
             connector,
+            shutdown,
             task,
         }
     }
@@ -127,7 +136,10 @@ impl TlsProxy {
     async fn tls_stream(&self) -> TlsStream<TcpStream> {
         let stream = TcpStream::connect(self.address).await.unwrap();
         self.connector
-            .connect(ServerName::try_from("localhost").unwrap().to_owned(), stream)
+            .connect(
+                ServerName::try_from("localhost").unwrap().to_owned(),
+                stream,
+            )
             .await
             .unwrap()
     }
@@ -176,14 +188,7 @@ impl TlsProxy {
 
     async fn provision_cookie(&self) -> String {
         let response = self
-            .request(
-                "POST",
-                "/api/identity",
-                Some(&self.origin),
-                None,
-                &[],
-                b"",
-            )
+            .request("POST", "/api/identity", Some(&self.origin), None, &[], b"")
             .await;
         assert_eq!(response.status, 204);
         std::str::from_utf8(response.header("set-cookie").unwrap())
@@ -232,10 +237,12 @@ impl TlsProxy {
             .map(|(socket, _)| socket)
     }
 
-    async fn stop(self) {
-        self.task.abort();
-        let error = self.task.await.unwrap_err();
-        assert!(error.is_cancelled());
+    async fn stop(self) -> bool {
+        let _ = self.shutdown.send(());
+        tokio::time::timeout(Duration::from_secs(2), self.task)
+            .await
+            .expect("proxy task shutdown timed out")
+            .expect("proxy task join failed")
     }
 }
 
@@ -251,10 +258,7 @@ async fn proxy_connection(
         if request.len() > 16 * 1024 {
             return Err("proxy request headers are too large".into());
         }
-        if let Some(position) = request
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-        {
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
             break position;
         }
         let read = client.read_buf(&mut request).await?;
@@ -468,9 +472,7 @@ impl ProxyStack {
 
 async fn with_proxy_test<F>(identity: &str, body: F)
 where
-    F: for<'stack> FnOnce(
-        &'stack ProxyStack,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'stack>>,
+    F: for<'stack> FnOnce(&'stack ProxyStack) -> Pin<Box<dyn Future<Output = ()> + Send + 'stack>>,
 {
     let stack = ProxyStack::start(identity).await;
     let outcome = AssertUnwindSafe(body(&stack)).catch_unwind().await;
@@ -541,17 +543,18 @@ async fn real_listener_accepts_configured_loopback_peer_identity() {
     let response = server
         .request(
             IpAddr::V6(Ipv6Addr::LOCALHOST),
-            request(
-                "/api/identity",
-                &[("X-Authenticated-User", b"alice")],
-                b"",
-            ),
+            request("/api/identity", &[("X-Authenticated-User", b"alice")], b""),
         )
         .await;
 
     assert_eq!(response.status, 204);
     let cookie = response.header("set-cookie").unwrap();
-    for attribute in [b"Secure".as_slice(), b"HttpOnly", b"SameSite=Strict", b"Path=/"] {
+    for attribute in [
+        b"Secure".as_slice(),
+        b"HttpOnly",
+        b"SameSite=Strict",
+        b"Path=/",
+    ] {
         assert!(
             cookie
                 .windows(attribute.len())
@@ -609,6 +612,88 @@ async fn real_listener_duplicate_and_malformed_identity_create_no_authority() {
         assert!(!rendered.contains("alice"));
         assert!(!rendered.contains("malformed identity"));
     }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn raw_http_optional_whitespace_has_explicit_semantic_identity_behavior() {
+    let server = TestServer::start().await;
+    let raw_identity_request = format!(
+        "POST /api/identity HTTP/1.1\r\nHost: terminal.example.test\r\nOrigin: {ORIGIN}\r\nContent-Length: 0\r\nConnection: close\r\nX-Authenticated-User:\t alice \t\r\n\r\n"
+    )
+    .into_bytes();
+
+    let identity = server
+        .request(IpAddr::V6(Ipv6Addr::LOCALHOST), raw_identity_request)
+        .await;
+    assert_eq!(identity.status, 204);
+    let cookie = identity
+        .header("set-cookie")
+        .unwrap()
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap();
+    let session = server
+        .request(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            request(
+                "/api/sessions",
+                &[("Cookie", cookie), ("Content-Type", b"application/json")],
+                br#"{"target":"shell"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(session.status, 201);
+    let session_body = serde_json::from_slice::<serde_json::Value>(&session.body).unwrap();
+    let ticket = session_body["ticket"].as_str().unwrap();
+    let alice = Identity::new("alice").unwrap();
+    assert_eq!(
+        server
+            .state
+            .tickets()
+            .redeem(ticket, &alice)
+            .unwrap()
+            .name(),
+        "shell"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn untrusted_real_peer_cannot_replay_valid_ttygate_cookie() {
+    let server = TestServer::start().await;
+    let identity = server
+        .request(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            request("/api/identity", &[("X-Authenticated-User", b"alice")], b""),
+        )
+        .await;
+    let cookie = identity
+        .header("set-cookie")
+        .unwrap()
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap();
+    let mut events = server.state.sessions().subscribe_events();
+
+    let session = server
+        .request(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            request(
+                "/api/sessions",
+                &[
+                    ("Cookie", cookie),
+                    ("Content-Type", b"application/json"),
+                    ("X-Authenticated-User", b"alice"),
+                    ("X-Forwarded-For", b"::1"),
+                ],
+                br#"{"target":"shell"}"#,
+            ),
+        )
+        .await;
+
+    assert_eq!(session.status, 401);
+    assert!(events.try_recv().is_err());
     server.stop().await;
 }
 
@@ -672,9 +757,7 @@ async fn trusted_proxy_https_cookie_ticket_wss_reaches_real_pty_echo() {
             .windows(b"ECHO:proxy-flow".len())
             .any(|window| window == b"ECHO:proxy-flow")
         {
-            if let tungstenite::Message::Binary(bytes) =
-                socket.next().await.unwrap().unwrap()
-            {
+            if let tungstenite::Message::Binary(bytes) = socket.next().await.unwrap().unwrap() {
                 output.extend_from_slice(&bytes);
             }
         }
@@ -782,9 +865,7 @@ async fn proxy_cookie_identity_binds_ticket_and_wrong_identity_cannot_redeem() {
             .windows(b"ECHO:alice-only".len())
             .any(|window| window == b"ECHO:alice-only")
         {
-            if let tungstenite::Message::Binary(bytes) =
-                alice.next().await.unwrap().unwrap()
-            {
+            if let tungstenite::Message::Binary(bytes) = alice.next().await.unwrap().unwrap() {
                 output.extend_from_slice(&bytes);
             }
         }
@@ -792,6 +873,35 @@ async fn proxy_cookie_identity_binds_ticket_and_wrong_identity_cannot_redeem() {
     .await
     .unwrap();
     alice.close(None).await.unwrap();
+    bob_proxy.stop().await;
+    alice_proxy.stop().await;
+    backend.stop().await;
+}
+
+#[tokio::test]
+async fn existing_cookie_identity_survives_proxy_account_switch() {
+    let backend = TestServer::start().await;
+    let alice_proxy = TlsProxy::start(backend.address, "alice").await;
+    let bob_proxy = TlsProxy::start(backend.address, "bob").await;
+    let alice_cookie = alice_proxy.provision_cookie().await;
+
+    let ticket = bob_proxy.issue_ticket(&alice_cookie).await;
+    let bob = Identity::new("bob").unwrap();
+    assert_eq!(
+        backend.state.tickets().redeem(&ticket, &bob),
+        Err(TicketError::WrongIdentity)
+    );
+    let alice = Identity::new("alice").unwrap();
+    assert_eq!(
+        backend
+            .state
+            .tickets()
+            .redeem(&ticket, &alice)
+            .unwrap()
+            .name(),
+        "shell"
+    );
+
     bob_proxy.stop().await;
     alice_proxy.stop().await;
     backend.stop().await;
@@ -845,14 +955,7 @@ async fn failed_proxy_auth_leaves_no_cookie_ticket_session_or_pty() {
     let mut events = backend.state.sessions().subscribe_events();
 
     let response = proxy
-        .request(
-            "POST",
-            "/api/identity",
-            Some(&proxy.origin),
-            None,
-            &[],
-            b"",
-        )
+        .request("POST", "/api/identity", Some(&proxy.origin), None, &[], b"")
         .await;
 
     assert_eq!(response.status, 503);
@@ -968,6 +1071,24 @@ async fn trusted_proxy_fixture_cleanup_awaits_shutdown_before_resuming_panic() {
     let error = task.await.unwrap_err();
     assert!(error.is_panic());
     for pid in observed.lock().unwrap().iter().copied() {
-        assert!(!process_exists(pid), "fixture PID {pid} survived panic cleanup");
+        assert!(
+            !process_exists(pid),
+            "fixture PID {pid} survived panic cleanup"
+        );
     }
+}
+
+#[tokio::test]
+async fn tls_proxy_stop_drains_active_connection_tasks() {
+    let backend = TestServer::start().await;
+    let proxy = TlsProxy::start(backend.address, "alice").await;
+    let _held_open_connection = proxy.tls_stream().await;
+
+    let drained = proxy.stop().await;
+
+    assert!(
+        drained,
+        "proxy stop returned before connection tasks drained"
+    );
+    backend.stop().await;
 }

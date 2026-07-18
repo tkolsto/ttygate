@@ -126,38 +126,38 @@ async fn response(
         .unwrap()
 }
 
-async fn proxy_response(
-    app: &axum::Router,
-    method: &str,
-    uri: &str,
-    origin: Option<&str>,
-    cookie: Option<&str>,
-    identities: &[HeaderValue],
-    peer: &str,
-    forwarded_for: Option<&str>,
-    body: &str,
-) -> axum::response::Response {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(origin) = origin {
+struct ProxyRequest<'a> {
+    uri: &'a str,
+    origin: Option<&'a str>,
+    cookie: Option<&'a str>,
+    identities: &'a [HeaderValue],
+    peer: SocketAddr,
+    forwarded_for: Option<&'a str>,
+    body: &'a str,
+}
+
+async fn proxy_response(app: &axum::Router, request: ProxyRequest<'_>) -> axum::response::Response {
+    let mut builder = Request::builder().method("POST").uri(request.uri);
+    if let Some(origin) = request.origin {
         builder = builder.header(header::ORIGIN, origin);
     }
-    if let Some(cookie) = cookie {
+    if let Some(cookie) = request.cookie {
         builder = builder.header(header::COOKIE, cookie);
     }
-    if let Some(forwarded_for) = forwarded_for {
+    if let Some(forwarded_for) = request.forwarded_for {
         builder = builder.header("x-forwarded-for", forwarded_for);
     }
-    for identity in identities {
+    for identity in request.identities {
         builder = builder.header("x-authenticated-user", identity);
     }
-    if !body.is_empty() {
+    if !request.body.is_empty() {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
     }
-    let mut request = builder.body(Body::from(body.to_owned())).unwrap();
-    request
+    let mut http_request = builder.body(Body::from(request.body.to_owned())).unwrap();
+    http_request
         .extensions_mut()
-        .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
-    app.clone().oneshot(request).await.unwrap()
+        .insert(ConnectInfo(request.peer));
+    app.clone().oneshot(http_request).await.unwrap()
 }
 
 async fn json(response: axum::response::Response) -> serde_json::Value {
@@ -582,24 +582,22 @@ async fn trusted_proxy_auth_failures_return_stable_non_reflecting_errors() {
 
     let response = proxy_response(
         &app,
-        "POST",
-        "/api/identity",
-        Some(ORIGIN),
-        None,
-        &[hostile],
-        "127.0.0.1:41000",
-        None,
-        "",
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some(ORIGIN),
+            cookie: None,
+            identities: &[hostile],
+            peer: "127.0.0.1:41000".parse().unwrap(),
+            forwarded_for: None,
+            body: "",
+        },
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let error = json(response).await;
     assert_eq!(error["error"]["code"], "identity-unavailable");
-    assert_eq!(
-        error["error"]["message"],
-        "Identity is unavailable."
-    );
+    assert_eq!(error["error"]["message"], "Identity is unavailable.");
     let rendered = error.to_string();
     for sentinel in ["hostile", "identity sentinel", "127.0.0.1"] {
         assert!(!rendered.contains(sentinel));
@@ -618,14 +616,15 @@ async fn untrusted_or_malformed_identity_sets_no_cookie_or_ticket() {
     ] {
         let response = proxy_response(
             &app,
-            "POST",
-            "/api/identity",
-            Some(ORIGIN),
-            None,
-            &[identity],
-            peer,
-            None,
-            "",
+            ProxyRequest {
+                uri: "/api/identity",
+                origin: Some(ORIGIN),
+                cookie: None,
+                identities: &[identity],
+                peer: peer.parse().unwrap(),
+                forwarded_for: None,
+                body: "",
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -633,14 +632,15 @@ async fn untrusted_or_malformed_identity_sets_no_cookie_or_ticket() {
         assert_eq!(
             proxy_response(
                 &app,
-                "POST",
-                "/api/sessions",
-                Some(ORIGIN),
-                None,
-                &[],
-                peer,
-                None,
-                r#"{"target":"shell"}"#,
+                ProxyRequest {
+                    uri: "/api/sessions",
+                    origin: Some(ORIGIN),
+                    cookie: None,
+                    identities: &[],
+                    peer: peer.parse().unwrap(),
+                    forwarded_for: None,
+                    body: r#"{"target":"shell"}"#,
+                },
             )
             .await
             .status(),
@@ -655,14 +655,15 @@ async fn forwarded_headers_cannot_authorize_session_creation() {
 
     let response = proxy_response(
         &app,
-        "POST",
-        "/api/identity",
-        Some(ORIGIN),
-        None,
-        &[HeaderValue::from_static("alice")],
-        "127.0.0.2:41003",
-        Some("127.0.0.1"),
-        "",
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some(ORIGIN),
+            cookie: None,
+            identities: &[HeaderValue::from_static("alice")],
+            peer: "127.0.0.2:41003".parse().unwrap(),
+            forwarded_for: Some("127.0.0.1"),
+            body: "",
+        },
     )
     .await;
 
@@ -676,14 +677,15 @@ async fn wrong_origin_precedes_proxy_identity_establishment() {
 
     let response = proxy_response(
         &app,
-        "POST",
-        "/api/identity",
-        Some("https://attacker.invalid"),
-        None,
-        &[HeaderValue::from_static("alice")],
-        "127.0.0.1:41004",
-        None,
-        "",
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some("https://attacker.invalid"),
+            cookie: None,
+            identities: &[HeaderValue::from_static("alice")],
+            peer: "127.0.0.1:41004".parse().unwrap(),
+            forwarded_for: None,
+            body: "",
+        },
     )
     .await;
 
@@ -697,14 +699,15 @@ async fn secure_cookie_attributes_are_provider_independent() {
 
     let response = proxy_response(
         &app,
-        "POST",
-        "/api/identity",
-        Some(ORIGIN),
-        None,
-        &[HeaderValue::from_static("alice")],
-        "127.0.0.1:41005",
-        None,
-        "",
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some(ORIGIN),
+            cookie: None,
+            identities: &[HeaderValue::from_static("alice")],
+            peer: "127.0.0.1:41005".parse().unwrap(),
+            forwarded_for: None,
+            body: "",
+        },
     )
     .await;
 

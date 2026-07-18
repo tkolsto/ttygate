@@ -103,13 +103,14 @@ The first running build already enforces Origin checks and ticket-bound WebSocke
 - **Deliverables:** `mode = "dev" | "production"`; production startup refuses `auth.provider = "dev"`, public bind without TLS or trusted-proxy config, and other unsafe combinations, with actionable error messages; direct TLS listener (rustls) with cert/key config.
 - **Consumes:** config (1.1), server (1.3).
 - **Done when:** complete. A table-driven unsafe-config matrix fails closed, TLS material has stable secret-safe errors, and a verified real-TLS integration test serves the frontend and exercises HTTPS → cookie → ticket → WSS → PTY.
-- **Boundary:** this chunk defines the trusted-proxy contract but never trusts an identity header. Production application construction remains unavailable until Chunk 2.2 supplies the real provider.
+- **Boundary:** this chunk defined the typed trusted-proxy contract; Chunk 2.2 now supplies the real provider and production application construction.
 
 ### Chunk 2.2 — Trusted reverse-proxy auth provider
 
+- **Status:** complete (Refs #9). The actual listener socket peer is checked against configured CIDRs before exactly one configured identity header is accepted, then the identity is bound through the existing cookie, ticket, WebSocket, and PTY authority chain.
 - **Deliverables:** auth provider reading configured identity headers only when the peer is within trusted CIDRs (or a local listener constraint); documented header contract for oauth2-proxy / Cloudflare Access / Tailscale-style deployments; plugs into the 1.3 cookie/session layer.
 - **Consumes:** session middleware (1.3), mode gating (2.1).
-- **Done when:** tests cover missing header, spoofed header from untrusted source, and correct identity propagation into session creation and tickets.
+- **Done when:** complete. Unit and real-socket tests cover missing, duplicate, malformed, and spoofed headers; IPv4/IPv6 CIDR authority; secure cookie transition; ticket identity binding; WSS-to-PTY propagation; and cleanup under failure and panic.
 
 ### Chunk 2.3 — Rate and concurrency limits
 
