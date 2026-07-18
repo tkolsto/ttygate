@@ -1,5 +1,10 @@
 use std::{
+    fs,
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    panic::{AssertUnwindSafe, resume_unwind},
+    path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -10,8 +15,9 @@ use tokio::{
     net::{TcpListener, TcpSocket, TcpStream},
     task::{JoinHandle, JoinSet},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
+use tempfile::TempDir;
 use tokio_rustls::{
     TlsAcceptor, TlsConnector,
     client::TlsStream,
@@ -31,6 +37,7 @@ use ttygated::{
 };
 
 const ORIGIN: &str = "https://terminal.example.test";
+const PTY_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pty_child.sh");
 
 struct RawResponse {
     status: u16,
@@ -51,6 +58,8 @@ struct TestServer {
     address: SocketAddr,
     state: AppState,
     task: JoinHandle<()>,
+    marker: PathBuf,
+    _directory: TempDir,
 }
 
 struct TlsProxy {
@@ -288,8 +297,79 @@ fn rewrite_identity_header(
     Ok(rewritten)
 }
 
+fn fixture_pids(marker: &Path) -> Vec<i32> {
+    let Ok(contents) = fs::read_to_string(marker) else {
+        return Vec::new();
+    };
+    contents
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect()
+}
+
+fn process_exists(pid: i32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(Errno::ESRCH) => false,
+        Err(error) => panic!("failed to inspect PID {pid}: {error}"),
+    }
+}
+
+fn kill_fixture_pids(pids: &[i32]) {
+    use nix::{
+        errno::Errno,
+        sys::signal::{Signal, kill, killpg},
+        unistd::Pid,
+    };
+    for group in pids.chunks(2) {
+        if let Some(leader) = group.first().copied()
+            && let Err(error) = killpg(Pid::from_raw(leader), Signal::SIGKILL)
+            && error != Errno::ESRCH
+        {
+            panic!("failed to kill fixture process group {leader}: {error}");
+        }
+        for pid in group {
+            if let Err(error) = kill(Pid::from_raw(*pid), Signal::SIGKILL)
+                && error != Errno::ESRCH
+            {
+                panic!("failed to kill fixture PID {pid}: {error}");
+            }
+        }
+    }
+}
+
+async fn wait_for_pids_absent(pids: &[i32], timeout: Duration) -> Result<(), ()> {
+    tokio::time::timeout(timeout, async {
+        while pids.iter().copied().any(process_exists) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| ())
+}
+
+async fn wait_for_fixture_pids(marker: &Path, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture_pids(marker).len() != expected {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PTY fixture did not record expected PIDs");
+}
+
+async fn wait_for_fixture_absence(marker: &Path) {
+    let pids = fixture_pids(marker);
+    wait_for_pids_absent(&pids, Duration::from_secs(3))
+        .await
+        .expect("PTY fixture processes survived cleanup");
+}
+
 impl TestServer {
     async fn start() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("proxy-fixture-pids");
         let listener = TcpListener::bind("[::]:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let source = format!(
@@ -315,7 +395,7 @@ absolute_timeout_seconds = 10
 [[targets]]
 name = "shell"
 type = "pty"
-command = ["/bin/sh"]
+command = [{PTY_FIXTURE:?}, "browser-track", {marker:?}]
 "#
         );
         let state = AppState::from_config(&parse(&source).unwrap()).unwrap();
@@ -327,6 +407,8 @@ command = ["/bin/sh"]
             address,
             state,
             task,
+            marker,
+            _directory: directory,
         }
     }
 
@@ -350,9 +432,51 @@ command = ["/bin/sh"]
     }
 
     async fn stop(self) {
+        let pids = fixture_pids(&self.marker);
         self.state.sessions().shutdown().await;
         self.task.abort();
         let _ = self.task.await;
+        if wait_for_pids_absent(&pids, Duration::from_millis(500))
+            .await
+            .is_err()
+        {
+            kill_fixture_pids(&pids);
+            wait_for_pids_absent(&pids, Duration::from_secs(3))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+struct ProxyStack {
+    backend: TestServer,
+    proxy: TlsProxy,
+}
+
+impl ProxyStack {
+    async fn start(identity: &str) -> Self {
+        let backend = TestServer::start().await;
+        let proxy = TlsProxy::start(backend.address, identity).await;
+        Self { backend, proxy }
+    }
+
+    async fn stop(self) {
+        self.proxy.stop().await;
+        self.backend.stop().await;
+    }
+}
+
+async fn with_proxy_test<F>(identity: &str, body: F)
+where
+    F: for<'stack> FnOnce(
+        &'stack ProxyStack,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'stack>>,
+{
+    let stack = ProxyStack::start(identity).await;
+    let outcome = AssertUnwindSafe(body(&stack)).catch_unwind().await;
+    stack.stop().await;
+    if let Err(payload) = outcome {
+        resume_unwind(payload);
     }
 }
 
@@ -538,7 +662,7 @@ async fn trusted_proxy_https_cookie_ticket_wss_reaches_real_pty_echo() {
         .unwrap();
     socket
         .send(tungstenite::Message::Binary(
-            b"printf 'ECHO:proxy-flow\\n'\r".to_vec().into(),
+            b"proxy-flow\r".to_vec().into(),
         ))
         .await
         .unwrap();
@@ -648,7 +772,7 @@ async fn proxy_cookie_identity_binds_ticket_and_wrong_identity_cannot_redeem() {
         .unwrap();
     alice
         .send(tungstenite::Message::Binary(
-            b"printf 'ECHO:alice-only\\n'\r".to_vec().into(),
+            b"alice-only\r".to_vec().into(),
         ))
         .await
         .unwrap();
@@ -736,4 +860,114 @@ async fn failed_proxy_auth_leaves_no_cookie_ticket_session_or_pty() {
     assert!(events.try_recv().is_err());
     proxy.stop().await;
     backend.stop().await;
+}
+
+#[tokio::test]
+async fn repeated_trusted_proxy_startup_shutdown_reaps_all_tasks() {
+    for iteration in 1..=20 {
+        with_proxy_test("alice", |stack| {
+            Box::pin(async move {
+                let response = stack
+                    .proxy
+                    .request("GET", "/healthz", None, None, &[], b"")
+                    .await;
+                assert_eq!(response.status, 200, "iteration {iteration}");
+            })
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn repeated_failed_proxy_authentication_leaves_no_application_work() {
+    for iteration in 1..=20 {
+        with_proxy_test("invalid identity", |stack| {
+            Box::pin(async move {
+                let mut events = stack.backend.state.sessions().subscribe_events();
+                let response = stack
+                    .proxy
+                    .request(
+                        "POST",
+                        "/api/identity",
+                        Some(&stack.proxy.origin),
+                        None,
+                        &[],
+                        b"",
+                    )
+                    .await;
+                assert_eq!(response.status, 503, "iteration {iteration}");
+                assert!(events.try_recv().is_err(), "iteration {iteration}");
+                assert!(!stack.backend.marker.exists(), "iteration {iteration}");
+            })
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn repeated_proxy_websocket_drop_reaps_real_pty() {
+    for iteration in 1..=20 {
+        with_proxy_test("alice", |stack| {
+            Box::pin(async move {
+                let cookie = stack.proxy.provision_cookie().await;
+                let ticket = stack.proxy.issue_ticket(&cookie).await;
+                let mut socket = stack
+                    .proxy
+                    .websocket(&stack.proxy.origin, &cookie)
+                    .await
+                    .unwrap();
+                socket
+                    .send(tungstenite::Message::Text(
+                        format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+                    ))
+                    .await
+                    .unwrap();
+                wait_for_fixture_pids(&stack.backend.marker, 2).await;
+                drop(socket);
+                wait_for_fixture_absence(&stack.backend.marker).await;
+                assert!(
+                    fixture_pids(&stack.backend.marker)
+                        .into_iter()
+                        .all(|pid| !process_exists(pid)),
+                    "iteration {iteration}"
+                );
+            })
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn trusted_proxy_fixture_cleanup_awaits_shutdown_before_resuming_panic() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&observed);
+    let task = tokio::spawn(async move {
+        with_proxy_test("alice", move |stack| {
+            Box::pin(async move {
+                let cookie = stack.proxy.provision_cookie().await;
+                let ticket = stack.proxy.issue_ticket(&cookie).await;
+                let mut socket = stack
+                    .proxy
+                    .websocket(&stack.proxy.origin, &cookie)
+                    .await
+                    .unwrap();
+                socket
+                    .send(tungstenite::Message::Text(
+                        format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+                    ))
+                    .await
+                    .unwrap();
+                wait_for_fixture_pids(&stack.backend.marker, 2).await;
+                *recorded.lock().unwrap() = fixture_pids(&stack.backend.marker);
+                panic!("intentional trusted proxy fixture unwind");
+            })
+        })
+        .await;
+    });
+
+    let error = task.await.unwrap_err();
+    assert!(error.is_panic());
+    for pid in observed.lock().unwrap().iter().copied() {
+        assert!(!process_exists(pid), "fixture PID {pid} survived panic cleanup");
+    }
 }
