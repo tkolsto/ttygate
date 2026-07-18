@@ -49,6 +49,8 @@ impl PtyProcessBackend {
             child: PtyChild {
                 inner: child,
                 process_group: pid,
+                #[cfg(test)]
+                reaped: None,
             },
         })
     }
@@ -81,6 +83,8 @@ impl PtyProcessBackend {
             child: PtyChild {
                 inner: child,
                 process_group: pid,
+                #[cfg(test)]
+                reaped: None,
             },
             raw_stderr,
             client_log,
@@ -138,6 +142,11 @@ impl RunningPty {
     pub(crate) fn into_parts(self) -> (PtyReader, PtyWriter, PtyChild) {
         (self.reader, self.writer, self.child)
     }
+
+    #[cfg(test)]
+    pub(crate) fn observe_reap(&mut self, reaped: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.child.reaped = Some(reaped);
+    }
 }
 
 pub(crate) struct PtyReader(pty_process::OwnedReadPty);
@@ -189,21 +198,38 @@ impl AsyncWrite for PtyWriter {
 pub(crate) struct PtyChild {
     inner: Child,
     process_group: Pid,
+    #[cfg(test)]
+    reaped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl PtyChild {
     pub(crate) async fn wait(&mut self) -> Result<std::process::ExitStatus, BackendError> {
-        self.inner
+        let result = self
+            .inner
             .wait()
             .await
-            .map_err(|_| BackendError::Unavailable)
+            .map_err(|_| BackendError::Unavailable);
+        #[cfg(test)]
+        if result.is_ok()
+            && let Some(reaped) = &self.reaped
+        {
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
     }
 
     pub(crate) async fn terminate(
         &mut self,
         grace: std::time::Duration,
     ) -> Result<std::process::ExitStatus, BackendError> {
-        self.terminate_with(grace, signal_group).await
+        let result = self.terminate_with(grace, signal_group).await;
+        #[cfg(test)]
+        if result.is_ok()
+            && let Some(reaped) = &self.reaped
+        {
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
     }
 
     async fn terminate_with(

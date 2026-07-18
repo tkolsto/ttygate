@@ -119,6 +119,12 @@ pub enum DenialReason {
     TicketGeneration,
     OriginDenied,
     HostKeyVerificationFailed,
+    UnknownHostKey,
+    HostKeyMismatch,
+    SshConnectionFailed,
+    SshAuthenticationFailed,
+    SshUserPolicyDenied,
+    SshFailed,
     SessionUnavailable,
     AuditUnavailable,
 }

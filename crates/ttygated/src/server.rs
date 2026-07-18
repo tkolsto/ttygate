@@ -186,6 +186,12 @@ impl AppState {
     ) -> Result<Self, crate::ssh::SshPreparationError> {
         prepared_ssh.validate_for_targets(targets)?;
         self.prepared_ssh = Arc::new(prepared_ssh);
+        self.sessions = Arc::new(
+            self.sessions
+                .as_ref()
+                .clone()
+                .with_prepared_ssh(Arc::clone(&self.prepared_ssh)),
+        );
         Ok(self)
     }
 }

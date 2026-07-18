@@ -105,6 +105,11 @@ fn safe_session_error(error: SessionError) -> BridgeFailure {
         SessionError::SpawnUnavailable
         | SessionError::BackendUnavailable
         | SessionError::AuditUnavailable
+        | SessionError::SshHostKeyFailed
+        | SessionError::SshConnectionFailed
+        | SessionError::SshAuthenticationFailed
+        | SessionError::SshPolicyDenied
+        | SessionError::SshFailed
         | SessionError::Closed
         | SessionError::InvalidTransition => BridgeFailure {
             error: error_control(
@@ -368,6 +373,12 @@ fn record_session_denial(
     error: SessionError,
 ) -> Result<(), ()> {
     let (category, reason) = match error {
+        SessionError::SpawnUnavailable
+        | SessionError::SshHostKeyFailed
+        | SessionError::SshConnectionFailed
+        | SessionError::SshAuthenticationFailed
+        | SessionError::SshPolicyDenied
+        | SessionError::SshFailed => return Ok(()),
         SessionError::GlobalLimit => (DenialCategory::Capacity, DenialReason::GlobalSessionLimit),
         SessionError::IdentityLimit => {
             (DenialCategory::Capacity, DenialReason::IdentitySessionLimit)
@@ -378,8 +389,7 @@ fn record_session_denial(
         SessionError::ReservationUnavailable => {
             (DenialCategory::Ticket, DenialReason::TicketExpired)
         }
-        SessionError::SpawnUnavailable
-        | SessionError::ManagerClosed
+        SessionError::ManagerClosed
         | SessionError::BackendUnavailable
         | SessionError::Closed
         | SessionError::InvalidTransition => {

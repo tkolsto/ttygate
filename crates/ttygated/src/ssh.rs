@@ -162,6 +162,10 @@ impl PreparedSshTarget {
         &self.identity
     }
 
+    pub(crate) fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn recheck_before_spawn(&self) -> Result<(), SshPreparationError> {
         recheck(&self.executable, &self.executable_snapshot)?;
         recheck(&self.known_hosts, &self.known_hosts_snapshot)?;
@@ -649,6 +653,32 @@ impl PreparedSshTargets {
             })
             .collect();
         Self { targets }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_session_test_target(target: &SshTarget) -> Self {
+        let snapshot = |path: &Path| {
+            FileSnapshot::from_metadata(&fs::metadata(path).expect("session fixture metadata"))
+        };
+        let prepared = PreparedSshTarget {
+            name: target.name.clone(),
+            host: target.host.clone(),
+            canonical_host: CanonicalSshHost(
+                canonical_ssh_host(&target.host).expect("session fixture canonical host"),
+            ),
+            port: target.port,
+            user_policy: target.user_policy.clone(),
+            read_only: target.read_only,
+            executable: target.ssh_executable.clone(),
+            executable_snapshot: snapshot(&target.ssh_executable),
+            known_hosts: target.known_hosts.clone(),
+            known_hosts_snapshot: snapshot(&target.known_hosts),
+            identity: target.identity_file.clone(),
+            identity_snapshot: snapshot(&target.identity_file),
+        };
+        Self {
+            targets: BTreeMap::from([(target.name.clone(), prepared)]),
+        }
     }
 }
 

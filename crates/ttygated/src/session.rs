@@ -23,7 +23,11 @@ use crate::{
     },
     config::{Limits, PtyTarget, Target, TargetAllowlist},
     protocol::{self, MAX_BINARY_BYTES, Resize},
-    pty_backend::{BackendError, PtyProcessBackend, RunningPty},
+    pty_backend::{BackendError, PtyProcessBackend, RunningPty, RunningSsh},
+    ssh::{
+        PreparedSshTargets, SshClientLog, SshDiagnosticClass, SshDiagnosticClassifier,
+        SshSpawnError, SshSpawnSpec,
+    },
     ticket::Identity,
 };
 
@@ -34,6 +38,7 @@ const AUDIT_CHANNEL_CAPACITY: usize = 64;
 const CLEANUP_GRACE: Duration = Duration::from_millis(150);
 const CHILD_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const SSH_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -128,6 +133,16 @@ pub enum SessionError {
     BackendUnavailable,
     #[error("The required audit control is unavailable.")]
     AuditUnavailable,
+    #[error("The SSH host identity could not be verified.")]
+    SshHostKeyFailed,
+    #[error("The SSH connection could not be established.")]
+    SshConnectionFailed,
+    #[error("SSH authentication was rejected.")]
+    SshAuthenticationFailed,
+    #[error("The SSH user policy denied the session.")]
+    SshPolicyDenied,
+    #[error("The SSH session could not be established safely.")]
+    SshFailed,
     #[error("The terminal session is closed.")]
     Closed,
     #[error("The configured terminal is read-only.")]
@@ -161,6 +176,7 @@ impl StateMachine {
         }
     }
 
+    #[cfg(test)]
     fn state(&self) -> SessionState {
         self.state
     }
@@ -443,13 +459,40 @@ impl Capacity {
     }
 }
 
+enum BackendSpawn {
+    Pty(PtyTarget),
+    Ssh {
+        spec: Box<SshSpawnSpec>,
+        classifier: SshDiagnosticClassifier,
+    },
+}
+
+struct BackendStart {
+    target_name: String,
+    read_only: bool,
+    spawn: BackendSpawn,
+}
+
+enum SpawnedBackend {
+    Pty(RunningPty),
+    Ssh(RunningSsh, SshDiagnosticClassifier),
+    #[cfg(test)]
+    TestSsh(RunningPty, mpsc::UnboundedReceiver<SshDiagnosticClass>),
+}
+
 trait Backend: Send + Sync {
-    fn spawn(&self, target: &PtyTarget, size: Resize) -> Result<RunningPty, BackendError>;
+    fn spawn(&self, target: BackendSpawn, size: Resize) -> Result<SpawnedBackend, BackendError>;
 }
 
 impl Backend for PtyProcessBackend {
-    fn spawn(&self, target: &PtyTarget, size: Resize) -> Result<RunningPty, BackendError> {
-        Self::spawn(target, size)
+    fn spawn(&self, target: BackendSpawn, size: Resize) -> Result<SpawnedBackend, BackendError> {
+        match target {
+            BackendSpawn::Pty(target) => Self::spawn(&target, size).map(SpawnedBackend::Pty),
+            BackendSpawn::Ssh { spec, classifier } => crate::ssh::spawn(*spec, size).map_or_else(
+                |_| Err(BackendError::Unavailable),
+                |running| Ok(SpawnedBackend::Ssh(running, classifier)),
+            ),
+        }
     }
 }
 
@@ -459,6 +502,7 @@ pub struct SessionManager {
     capacity: Arc<Capacity>,
     backend: Arc<dyn Backend>,
     targets: Arc<TargetAllowlist>,
+    prepared_ssh: Arc<PreparedSshTargets>,
     supervisors: Arc<SupervisorRegistry>,
     audit_tx: broadcast::Sender<LifecycleEvent>,
     audit: Option<Arc<AuditLog>>,
@@ -528,12 +572,18 @@ impl SessionManager {
             limits,
             backend: Arc::new(PtyProcessBackend),
             targets: Arc::new(targets),
+            prepared_ssh: Arc::new(PreparedSshTargets::default()),
             supervisors: Arc::new(SupervisorRegistry::default()),
             audit_tx,
             audit,
             #[cfg(test)]
             panic_supervisor_for_test: false,
         }
+    }
+
+    pub(crate) fn with_prepared_ssh(mut self, prepared_ssh: Arc<PreparedSshTargets>) -> Self {
+        self.prepared_ssh = prepared_ssh;
+        self
     }
 
     #[cfg(test)]
@@ -544,6 +594,16 @@ impl SessionManager {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<LifecycleEvent> {
         self.audit_tx.subscribe()
+    }
+
+    #[cfg(test)]
+    fn supervisor_count_for_test(&self) -> usize {
+        self.supervisors
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .len()
     }
 
     pub async fn start(
@@ -563,7 +623,7 @@ impl SessionManager {
         initial_size: Resize,
         remote_address: Option<SocketAddr>,
     ) -> Result<Session, SessionError> {
-        let _admission = self.supervisors.admission.read().await;
+        let admission = self.supervisors.admission.read().await;
         if self
             .supervisors
             .inner
@@ -573,14 +633,36 @@ impl SessionManager {
         {
             return Err(SessionError::ManagerClosed);
         }
-        let target = match self.targets.resolve(target_name) {
-            Ok(Target::Pty(configured)) => configured.clone(),
-            Ok(Target::Ssh(_)) | Err(_) => return Err(SessionError::TargetUnavailable),
-        };
         validate_resize(&initial_size)?;
         let reservation = self.capacity.reserve(&identity)?;
-        self.start_admitted(identity, target, initial_size, reservation, remote_address)
-            .await
+        let target = match self.resolve_backend_target(&identity, target_name) {
+            Ok(target) => target,
+            Err(error) => {
+                if error == SessionError::SshPolicyDenied
+                    && self
+                        .record_denial(
+                            &identity,
+                            target_name,
+                            remote_address,
+                            DenialCategory::Target,
+                            DenialReason::SshUserPolicyDenied,
+                        )
+                        .is_err()
+                {
+                    return Err(SessionError::AuditUnavailable);
+                }
+                return Err(error);
+            }
+        };
+        self.start_admitted(
+            admission,
+            identity,
+            target,
+            initial_size,
+            reservation,
+            remote_address,
+        )
+        .await
     }
 
     pub async fn reserve(
@@ -620,7 +702,7 @@ impl SessionManager {
         initial_size: Resize,
         remote_address: Option<SocketAddr>,
     ) -> Result<Session, SessionError> {
-        let _admission = self.supervisors.admission.read().await;
+        let admission = self.supervisors.admission.read().await;
         if self
             .supervisors
             .inner
@@ -630,47 +712,102 @@ impl SessionManager {
         {
             return Err(SessionError::ManagerClosed);
         }
-        let target = match self.targets.resolve(target_name) {
-            Ok(Target::Pty(configured)) => configured.clone(),
-            Ok(Target::Ssh(_)) | Err(_) => return Err(SessionError::TargetUnavailable),
-        };
         validate_resize(&initial_size)?;
         let reservation = reservation.activate(&identity)?;
-        self.start_admitted(identity, target, initial_size, reservation, remote_address)
-            .await
+        let target = match self.resolve_backend_target(&identity, target_name) {
+            Ok(target) => target,
+            Err(error) => {
+                if error == SessionError::SshPolicyDenied
+                    && self
+                        .record_denial(
+                            &identity,
+                            target_name,
+                            remote_address,
+                            DenialCategory::Target,
+                            DenialReason::SshUserPolicyDenied,
+                        )
+                        .is_err()
+                {
+                    return Err(SessionError::AuditUnavailable);
+                }
+                return Err(error);
+            }
+        };
+        self.start_admitted(
+            admission,
+            identity,
+            target,
+            initial_size,
+            reservation,
+            remote_address,
+        )
+        .await
+    }
+
+    fn resolve_backend_target(
+        &self,
+        identity: &Identity,
+        target_name: &str,
+    ) -> Result<BackendStart, SessionError> {
+        match self.targets.resolve(target_name) {
+            Ok(Target::Pty(target)) => Ok(BackendStart {
+                target_name: target.name.clone(),
+                read_only: target.read_only,
+                spawn: BackendSpawn::Pty(target.clone()),
+            }),
+            Ok(Target::Ssh(_)) => {
+                let prepared = self
+                    .prepared_ssh
+                    .get(target_name)
+                    .ok_or(SessionError::TargetUnavailable)?;
+                let classifier = prepared.diagnostic_classifier();
+                let spec =
+                    SshSpawnSpec::build(prepared, identity.as_str()).map_err(
+                        |error| match error {
+                            SshSpawnError::PolicyDenied => SessionError::SshPolicyDenied,
+                            SshSpawnError::AuthorityUnavailable
+                            | SshSpawnError::MaterialChanged
+                            | SshSpawnError::BackendUnavailable => SessionError::SpawnUnavailable,
+                        },
+                    )?;
+                Ok(BackendStart {
+                    target_name: prepared.name().to_owned(),
+                    read_only: prepared.read_only(),
+                    spawn: BackendSpawn::Ssh {
+                        spec: Box::new(spec),
+                        classifier,
+                    },
+                })
+            }
+            Err(_) => Err(SessionError::TargetUnavailable),
+        }
     }
 
     async fn start_admitted(
         &self,
+        admission: tokio::sync::RwLockReadGuard<'_, ()>,
         identity: Identity,
-        target: PtyTarget,
+        target: BackendStart,
         initial_size: Resize,
         reservation: Reservation,
         remote_address: Option<SocketAddr>,
     ) -> Result<Session, SessionError> {
-        let created_at = Instant::now();
-        let mut state = StateMachine::new();
-        let (event_tx, event_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
-        let persistent_audit = self
-            .audit
-            .as_ref()
-            .map(|audit| {
-                Ok::<_, SessionError>(PersistentAudit {
-                    log: Arc::clone(audit),
-                    session_id: SessionId::generate()
-                        .map_err(|_| SessionError::AuditUnavailable)?,
-                    started_at: AuditTimestamp::now()
-                        .map_err(|_| SessionError::AuditUnavailable)?,
-                    remote_address,
-                })
-            })
-            .transpose()?;
-
-        let running = match self.backend.spawn(&target, initial_size) {
+        let BackendStart {
+            target_name,
+            read_only,
+            spawn,
+        } = target;
+        let running = match self.backend.spawn(spawn, initial_size) {
             Ok(running) => running,
             Err(_) => {
                 if self
-                    .record_spawn_denial(&identity, &target, remote_address)
+                    .record_denial(
+                        &identity,
+                        &target_name,
+                        remote_address,
+                        DenialCategory::Target,
+                        DenialReason::SessionUnavailable,
+                    )
                     .is_err()
                 {
                     return Err(SessionError::AuditUnavailable);
@@ -678,77 +815,42 @@ impl SessionManager {
                 return Err(SessionError::SpawnUnavailable);
             }
         };
-        state.start()?;
-        debug_assert_eq!(state.state(), SessionState::Running);
-        if let Some(audit) = &persistent_audit
-            && {
-                let target = ResolvedAuditTarget::from_resolved_name(&target.name);
-                audit.log.record(&AuditEvent::session_started(
-                    audit.session_id.clone(),
-                    &identity,
-                    &target,
-                    remote_address,
-                    audit.started_at.clone(),
-                ))
-            }
-            .is_err()
-        {
-            let (reader, writer, mut child) = running.into_parts();
-            drop(reader);
-            drop(writer);
-            let _ = child.terminate(CLEANUP_GRACE).await;
-            return Err(SessionError::AuditUnavailable);
-        }
-        for transition in [LifecycleTransition::Created, LifecycleTransition::Running] {
-            let event = lifecycle_event(&identity, &target, transition);
-            event_tx
-                .try_send(event.clone())
-                .expect("lifecycle channel holds every possible transition");
-            let _ = self.audit_tx.send(event);
-        }
-
         let (command_tx, command_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         let (output_tx, output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
         let (close_tx, close_rx) = watch::channel(None);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (activity_tx, activity_rx) = watch::channel(created_at);
+        let (activity_tx, activity_rx) = watch::channel(Instant::now());
         let (final_tx, final_rx) = watch::channel(None);
         let (worker_event_tx, worker_event_rx) = mpsc::channel(2);
-        let (reader, writer, child) = running.into_parts();
-
-        let reader_task = tokio::spawn(read_output(
-            reader,
-            output_tx,
-            cancel_rx.clone(),
-            activity_tx.clone(),
-            worker_event_tx.clone(),
-        ));
-        let writer_task = tokio::spawn(write_input(
-            writer,
+        let (event_tx, event_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
+        let (result_tx, result_rx) = oneshot::channel();
+        let connecting = ConnectingSupervisor {
+            identity,
+            target_name,
+            read_only,
+            limits: self.limits.clone(),
+            reservation,
+            running,
+            command_tx,
             command_rx,
+            output_tx,
+            output_rx,
+            close_rx,
+            close_tx: close_tx.clone(),
+            cancel_tx,
             cancel_rx,
             activity_tx,
-            worker_event_tx,
-            target.read_only,
-        ));
-        let supervisor = Supervisor {
-            state,
-            identity,
-            target_name: target.name,
-            limits: self.limits.clone(),
-            created_at,
-            reservation,
-            child,
-            close_rx,
-            cancel_tx,
             activity_rx,
             final_tx,
+            final_rx,
             event_tx,
+            event_rx,
             audit_tx: self.audit_tx.clone(),
+            audit: self.audit.clone(),
+            remote_address,
             worker_event_rx,
-            reader_task: Some(reader_task),
-            writer_task: Some(writer_task),
-            persistent_audit,
+            worker_event_tx,
+            result_tx,
             #[cfg(test)]
             panic_for_test: self.panic_supervisor_for_test,
         };
@@ -769,7 +871,7 @@ impl SessionManager {
                     id,
                 };
                 let _ = start_rx.await;
-                supervise(supervisor).await;
+                supervise_connecting(connecting).await;
             });
             registry.active.insert(
                 id,
@@ -780,34 +882,31 @@ impl SessionManager {
             );
         }
         let _ = start_tx.send(());
-
-        Ok(Session {
-            command_tx,
-            output_rx,
-            close_tx,
-            final_rx,
-            event_rx,
-            read_only: target.read_only,
-        })
+        drop(admission);
+        result_rx
+            .await
+            .unwrap_or(Err(SessionError::BackendUnavailable))
     }
 
-    fn record_spawn_denial(
+    fn record_denial(
         &self,
         identity: &Identity,
-        target: &PtyTarget,
+        target_name: &str,
         remote_address: Option<SocketAddr>,
+        category: DenialCategory,
+        reason: DenialReason,
     ) -> Result<(), ()> {
         let Some(audit) = &self.audit else {
             return Ok(());
         };
         let correlation_id = CorrelationId::generate().map_err(|_| ())?;
         let occurred_at = AuditTimestamp::now().map_err(|_| ())?;
-        let target = ResolvedAuditTarget::from_resolved_name(&target.name);
+        let target = ResolvedAuditTarget::from_resolved_name(target_name);
         audit
             .record(&AuditEvent::access_denied(
                 correlation_id,
-                DenialCategory::Target,
-                DenialReason::SessionUnavailable,
+                category,
+                reason,
                 Some(identity),
                 Some(&target),
                 remote_address,
@@ -862,12 +961,12 @@ fn validate_resize(size: &Resize) -> Result<(), SessionError> {
 
 fn lifecycle_event(
     identity: &Identity,
-    target: &PtyTarget,
+    target_name: &str,
     transition: LifecycleTransition,
 ) -> LifecycleEvent {
     LifecycleEvent {
         identity: identity.clone(),
-        target: target.name.clone(),
+        target: target_name.to_owned(),
         at: SystemTime::now(),
         transition,
     }
@@ -1104,6 +1203,7 @@ struct Supervisor {
     worker_event_rx: mpsc::Receiver<WorkerEvent>,
     reader_task: Option<JoinHandle<()>>,
     writer_task: Option<JoinHandle<()>>,
+    diagnostic_tasks: Vec<JoinHandle<()>>,
     persistent_audit: Option<PersistentAudit>,
     #[cfg(test)]
     panic_for_test: bool,
@@ -1114,6 +1214,432 @@ struct PersistentAudit {
     session_id: SessionId,
     started_at: AuditTimestamp,
     remote_address: Option<SocketAddr>,
+}
+
+struct ConnectingSupervisor {
+    identity: Identity,
+    target_name: String,
+    read_only: bool,
+    limits: Limits,
+    reservation: Reservation,
+    running: SpawnedBackend,
+    command_tx: mpsc::Sender<SessionCommand>,
+    command_rx: mpsc::Receiver<SessionCommand>,
+    output_tx: mpsc::Sender<Vec<u8>>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    close_tx: watch::Sender<Option<SessionCloseReason>>,
+    close_rx: watch::Receiver<Option<SessionCloseReason>>,
+    cancel_tx: watch::Sender<bool>,
+    cancel_rx: watch::Receiver<bool>,
+    activity_tx: watch::Sender<Instant>,
+    activity_rx: watch::Receiver<Instant>,
+    final_tx: watch::Sender<Option<SessionClosed>>,
+    final_rx: watch::Receiver<Option<SessionClosed>>,
+    event_tx: mpsc::Sender<LifecycleEvent>,
+    event_rx: mpsc::Receiver<LifecycleEvent>,
+    audit_tx: broadcast::Sender<LifecycleEvent>,
+    audit: Option<Arc<AuditLog>>,
+    remote_address: Option<SocketAddr>,
+    worker_event_tx: mpsc::Sender<WorkerEvent>,
+    worker_event_rx: mpsc::Receiver<WorkerEvent>,
+    result_tx: oneshot::Sender<Result<Session, SessionError>>,
+    #[cfg(test)]
+    panic_for_test: bool,
+}
+
+struct ConnectingParts {
+    reader: crate::pty_backend::PtyReader,
+    writer: crate::pty_backend::PtyWriter,
+    child: crate::pty_backend::PtyChild,
+    admission_rx: mpsc::UnboundedReceiver<SshDiagnosticClass>,
+    diagnostic_tasks: Vec<JoinHandle<()>>,
+}
+
+fn split_connecting_backend(
+    running: SpawnedBackend,
+    cancel: watch::Receiver<bool>,
+) -> ConnectingParts {
+    match running {
+        SpawnedBackend::Pty(running) => {
+            let (reader, writer, child) = running.into_parts();
+            let (admission_tx, admission_rx) = mpsc::unbounded_channel();
+            let _ = admission_tx.send(SshDiagnosticClass::Authenticated);
+            ConnectingParts {
+                reader,
+                writer,
+                child,
+                admission_rx,
+                diagnostic_tasks: Vec::new(),
+            }
+        }
+        SpawnedBackend::Ssh(running, classifier) => {
+            let (reader, writer, child, mut raw_stderr, client_log) = running.into_parts();
+            let (admission_tx, admission_rx) = mpsc::unbounded_channel();
+            let mut raw_cancel = cancel.clone();
+            let raw_task = tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled(&mut raw_cancel) => break,
+                        result = raw_stderr.read(&mut buffer) => {
+                            if !matches!(result, Ok(count) if count != 0) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let mut log_cancel = cancel;
+            let log_task = tokio::spawn(async move {
+                drain_client_log(client_log, classifier, admission_tx, &mut log_cancel).await;
+            });
+            ConnectingParts {
+                reader,
+                writer,
+                child,
+                admission_rx,
+                diagnostic_tasks: vec![raw_task, log_task],
+            }
+        }
+        #[cfg(test)]
+        SpawnedBackend::TestSsh(running, admission_rx) => {
+            let (reader, writer, child) = running.into_parts();
+            ConnectingParts {
+                reader,
+                writer,
+                child,
+                admission_rx,
+                diagnostic_tasks: Vec::new(),
+            }
+        }
+    }
+}
+
+async fn drain_client_log(
+    client_log: SshClientLog,
+    mut classifier: SshDiagnosticClassifier,
+    admission: mpsc::UnboundedSender<SshDiagnosticClass>,
+    cancel: &mut watch::Receiver<bool>,
+) {
+    let mut buffer = [0_u8; 4096];
+    let mut reported = false;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = cancelled(cancel) => return,
+            result = client_log.read(&mut buffer) => result,
+        };
+        let count = match result {
+            Ok(0) | Err(_) => {
+                if !reported {
+                    let _ = admission.send(classifier.finish());
+                }
+                return;
+            }
+            Ok(count) => count,
+        };
+        if !reported {
+            classifier.push(&buffer[..count]);
+            if let Some(class) = classifier.classification() {
+                reported = true;
+                let _ = admission.send(class);
+            }
+        }
+    }
+}
+
+enum ConnectingOutcome {
+    Authenticated,
+    Rejected(SshDiagnosticClass),
+    Closed(SessionCloseReason),
+    CallerDropped,
+    ChildExited(std::process::ExitStatus),
+}
+
+async fn supervise_connecting(connecting: ConnectingSupervisor) {
+    let ConnectingSupervisor {
+        identity,
+        target_name,
+        read_only,
+        limits,
+        reservation,
+        running,
+        command_tx,
+        command_rx,
+        output_tx,
+        output_rx,
+        close_tx,
+        mut close_rx,
+        cancel_tx,
+        cancel_rx,
+        activity_tx,
+        activity_rx,
+        final_tx,
+        final_rx,
+        event_tx,
+        event_rx,
+        audit_tx,
+        audit,
+        remote_address,
+        worker_event_tx,
+        worker_event_rx,
+        mut result_tx,
+        #[cfg(test)]
+        panic_for_test,
+    } = connecting;
+    let mut parts = split_connecting_backend(running, cancel_rx.clone());
+    let deadline = tokio::time::sleep(SSH_ADMISSION_TIMEOUT);
+    tokio::pin!(deadline);
+    let outcome = tokio::select! {
+        biased;
+        changed = close_rx.changed() => {
+            let reason = if changed.is_err() {
+                SessionCloseReason::HandleDropped
+            } else {
+                (*close_rx.borrow_and_update()).unwrap_or(SessionCloseReason::HandleDropped)
+            };
+            ConnectingOutcome::Closed(reason)
+        },
+        _ = result_tx.closed() => ConnectingOutcome::CallerDropped,
+        diagnostic = parts.admission_rx.recv() => match diagnostic {
+            Some(SshDiagnosticClass::Authenticated) => ConnectingOutcome::Authenticated,
+            Some(class) => ConnectingOutcome::Rejected(class),
+            None => ConnectingOutcome::Rejected(SshDiagnosticClass::GenericFailure),
+        },
+        status = parts.child.wait() => match status {
+            Ok(status) => ConnectingOutcome::ChildExited(status),
+            Err(_) => ConnectingOutcome::Rejected(SshDiagnosticClass::GenericFailure),
+        },
+        _ = &mut deadline => ConnectingOutcome::Rejected(SshDiagnosticClass::ConnectionFailed),
+    };
+
+    if !matches!(outcome, ConnectingOutcome::Authenticated) {
+        cancel_tx.send_replace(true);
+        let natural = match outcome {
+            ConnectingOutcome::ChildExited(status) => Some(status),
+            _ => None,
+        };
+        if natural.is_some() {
+            let _ = parts.child.cleanup_group_after_exit(CLEANUP_GRACE).await;
+        } else {
+            let _ = parts.child.terminate(CLEANUP_GRACE).await;
+        }
+        for task in parts.diagnostic_tasks {
+            join_worker(task).await;
+        }
+        match outcome {
+            ConnectingOutcome::Rejected(class) => {
+                let (error, category, reason) = ssh_denial(class);
+                let result = if record_access_denial(
+                    audit.as_deref(),
+                    &identity,
+                    &target_name,
+                    remote_address,
+                    category,
+                    reason,
+                )
+                .is_ok()
+                {
+                    Err(error)
+                } else {
+                    Err(SessionError::AuditUnavailable)
+                };
+                let _ = result_tx.send(result);
+            }
+            ConnectingOutcome::ChildExited(_) => {
+                let (error, category, reason) = ssh_denial(SshDiagnosticClass::GenericFailure);
+                let result = if record_access_denial(
+                    audit.as_deref(),
+                    &identity,
+                    &target_name,
+                    remote_address,
+                    category,
+                    reason,
+                )
+                .is_ok()
+                {
+                    Err(error)
+                } else {
+                    Err(SessionError::AuditUnavailable)
+                };
+                let _ = result_tx.send(result);
+            }
+            ConnectingOutcome::Closed(SessionCloseReason::ManagerShutdown) => {
+                let _ = result_tx.send(Err(SessionError::ManagerClosed));
+            }
+            ConnectingOutcome::Closed(_) => {
+                let _ = result_tx.send(Err(SessionError::BackendUnavailable));
+            }
+            ConnectingOutcome::CallerDropped => {}
+            ConnectingOutcome::Authenticated => unreachable!(),
+        }
+        drop(reservation);
+        return;
+    }
+
+    let created_at = Instant::now();
+    let persistent_audit = match audit
+        .as_ref()
+        .map(|audit| {
+            Ok::<_, SessionError>(PersistentAudit {
+                log: Arc::clone(audit),
+                session_id: SessionId::generate().map_err(|_| SessionError::AuditUnavailable)?,
+                started_at: AuditTimestamp::now().map_err(|_| SessionError::AuditUnavailable)?,
+                remote_address,
+            })
+        })
+        .transpose()
+    {
+        Ok(persistent) => persistent,
+        Err(error) => {
+            cleanup_connecting(parts, &cancel_tx).await;
+            let _ = result_tx.send(Err(error));
+            drop(reservation);
+            return;
+        }
+    };
+    if let Some(audit) = &persistent_audit {
+        let target = ResolvedAuditTarget::from_resolved_name(&target_name);
+        if audit
+            .log
+            .record(&AuditEvent::session_started(
+                audit.session_id.clone(),
+                &identity,
+                &target,
+                remote_address,
+                audit.started_at.clone(),
+            ))
+            .is_err()
+        {
+            cleanup_connecting(parts, &cancel_tx).await;
+            let _ = result_tx.send(Err(SessionError::AuditUnavailable));
+            drop(reservation);
+            return;
+        }
+    }
+
+    let mut state = StateMachine::new();
+    state.start().expect("authenticated admission starts once");
+    for transition in [LifecycleTransition::Created, LifecycleTransition::Running] {
+        let event = lifecycle_event(&identity, &target_name, transition);
+        event_tx
+            .try_send(event.clone())
+            .expect("lifecycle channel holds every possible transition");
+        let _ = audit_tx.send(event);
+    }
+    let reader_task = tokio::spawn(read_output(
+        parts.reader,
+        output_tx,
+        cancel_rx.clone(),
+        activity_tx.clone(),
+        worker_event_tx.clone(),
+    ));
+    let writer_task = tokio::spawn(write_input(
+        parts.writer,
+        command_rx,
+        cancel_rx,
+        activity_tx,
+        worker_event_tx,
+        read_only,
+    ));
+    let supervisor = Supervisor {
+        state,
+        identity,
+        target_name,
+        limits,
+        created_at,
+        reservation,
+        child: parts.child,
+        close_rx,
+        cancel_tx,
+        activity_rx,
+        final_tx,
+        event_tx,
+        audit_tx,
+        worker_event_rx,
+        reader_task: Some(reader_task),
+        writer_task: Some(writer_task),
+        diagnostic_tasks: parts.diagnostic_tasks,
+        persistent_audit,
+        #[cfg(test)]
+        panic_for_test,
+    };
+    let session = Session {
+        command_tx,
+        output_rx,
+        close_tx,
+        final_rx,
+        event_rx,
+        read_only,
+    };
+    let _ = result_tx.send(Ok(session));
+    supervise(supervisor).await;
+}
+
+async fn cleanup_connecting(mut parts: ConnectingParts, cancel: &watch::Sender<bool>) {
+    cancel.send_replace(true);
+    let _ = parts.child.terminate(CLEANUP_GRACE).await;
+    for task in parts.diagnostic_tasks {
+        join_worker(task).await;
+    }
+}
+
+fn ssh_denial(class: SshDiagnosticClass) -> (SessionError, DenialCategory, DenialReason) {
+    match class {
+        SshDiagnosticClass::UnknownHostKey => (
+            SessionError::SshHostKeyFailed,
+            DenialCategory::HostKey,
+            DenialReason::UnknownHostKey,
+        ),
+        SshDiagnosticClass::HostKeyMismatch => (
+            SessionError::SshHostKeyFailed,
+            DenialCategory::HostKey,
+            DenialReason::HostKeyMismatch,
+        ),
+        SshDiagnosticClass::ConnectionFailed => (
+            SessionError::SshConnectionFailed,
+            DenialCategory::Target,
+            DenialReason::SshConnectionFailed,
+        ),
+        SshDiagnosticClass::AuthenticationFailed => (
+            SessionError::SshAuthenticationFailed,
+            DenialCategory::Authentication,
+            DenialReason::SshAuthenticationFailed,
+        ),
+        SshDiagnosticClass::GenericFailure | SshDiagnosticClass::Authenticated => (
+            SessionError::SshFailed,
+            DenialCategory::Target,
+            DenialReason::SshFailed,
+        ),
+    }
+}
+
+fn record_access_denial(
+    audit: Option<&AuditLog>,
+    identity: &Identity,
+    target_name: &str,
+    remote_address: Option<SocketAddr>,
+    category: DenialCategory,
+    reason: DenialReason,
+) -> Result<(), ()> {
+    let Some(audit) = audit else {
+        return Ok(());
+    };
+    let correlation_id = CorrelationId::generate().map_err(|_| ())?;
+    let occurred_at = AuditTimestamp::now().map_err(|_| ())?;
+    let target = ResolvedAuditTarget::from_resolved_name(target_name);
+    audit
+        .record(&AuditEvent::access_denied(
+            correlation_id,
+            category,
+            reason,
+            Some(identity),
+            Some(&target),
+            remote_address,
+            occurred_at,
+        ))
+        .map_err(|_| ())
 }
 
 async fn supervise(mut supervisor: Supervisor) {
@@ -1225,6 +1751,9 @@ async fn join_supervisor_workers(supervisor: &mut Supervisor) {
     if let Some(writer) = supervisor.writer_task.take() {
         join_worker(writer).await;
     }
+    for task in supervisor.diagnostic_tasks.drain(..) {
+        join_worker(task).await;
+    }
 }
 
 fn complete_supervisor(
@@ -1303,17 +1832,21 @@ mod tests {
     use std::{
         fs,
         os::unix::process::ExitStatusExt,
-        sync::{Arc, Barrier, Mutex as StdMutex},
+        sync::{
+            Arc, Barrier, Mutex as StdMutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         thread,
         time::{Duration, SystemTime},
     };
 
     use crate::{
         audit::AuditLog,
-        config::{Limits, PtyTarget, Target, TargetAllowlist},
+        config::{Limits, PtyTarget, SshTarget, SshUserPolicy, Target, TargetAllowlist},
         protocol::{MAX_BINARY_BYTES, Resize},
         ticket::{Identity, TicketGrant, TicketStore},
     };
+    use tokio::sync::mpsc;
     use tokio::time::Instant;
 
     use super::{
@@ -1404,6 +1937,12 @@ mod tests {
             SessionError::TargetUnavailable,
             SessionError::ManagerClosed,
             SessionError::BackendUnavailable,
+            SessionError::AuditUnavailable,
+            SessionError::SshHostKeyFailed,
+            SessionError::SshConnectionFailed,
+            SessionError::SshAuthenticationFailed,
+            SessionError::SshPolicyDenied,
+            SessionError::SshFailed,
             SessionError::Closed,
             SessionError::ReadOnly,
             SessionError::InputTooLarge,
@@ -1690,6 +2229,451 @@ mod tests {
 
     fn manager(limits: Limits, targets: &[PtyTarget]) -> SessionManager {
         SessionManager::new(limits, allowlist(targets))
+    }
+
+    #[derive(Clone, Copy)]
+    enum SshAdmissionScript {
+        Authenticated,
+        Pending,
+        Failure(crate::ssh::SshDiagnosticClass),
+        AuthenticatedThenExit(u8),
+    }
+
+    struct ScriptedSshBackend {
+        script: SshAdmissionScript,
+        spawn_count: AtomicUsize,
+        spawned: tokio::sync::Notify,
+        admission: StdMutex<Option<mpsc::UnboundedSender<crate::ssh::SshDiagnosticClass>>>,
+        reaped: Arc<AtomicBool>,
+    }
+
+    impl super::Backend for ScriptedSshBackend {
+        fn spawn(
+            &self,
+            target: super::BackendSpawn,
+            size: Resize,
+        ) -> Result<super::SpawnedBackend, crate::pty_backend::BackendError> {
+            assert!(matches!(target, super::BackendSpawn::Ssh { .. }));
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            let process_target = match self.script {
+                SshAdmissionScript::AuthenticatedThenExit(code) => PtyTarget {
+                    name: "scripted-ssh-child".to_owned(),
+                    executable: "/bin/sh".into(),
+                    argv: vec!["-c".to_owned(), format!("exit {code}")],
+                    read_only: false,
+                },
+                _ => fixture_target(false),
+            };
+            let mut running = crate::pty_backend::PtyProcessBackend::spawn(&process_target, size)?;
+            running.observe_reap(Arc::clone(&self.reaped));
+            let (admission_tx, admission_rx) = mpsc::unbounded_channel();
+            match self.script {
+                SshAdmissionScript::Authenticated
+                | SshAdmissionScript::AuthenticatedThenExit(_) => {
+                    let _ = admission_tx.send(crate::ssh::SshDiagnosticClass::Authenticated);
+                }
+                SshAdmissionScript::Failure(class) => {
+                    let _ = admission_tx.send(class);
+                }
+                SshAdmissionScript::Pending => {
+                    *self.admission.lock().unwrap() = Some(admission_tx);
+                }
+            }
+            self.spawned.notify_waiters();
+            Ok(super::SpawnedBackend::TestSsh(running, admission_rx))
+        }
+    }
+
+    struct SshAdmissionFixture {
+        backend: Arc<ScriptedSshBackend>,
+        audit: Arc<AuditLog>,
+        audit_path: std::path::PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    impl SshAdmissionFixture {
+        fn new(script: SshAdmissionScript) -> Self {
+            Self::build(script, false)
+        }
+
+        fn with_failing_audit(script: SshAdmissionScript) -> Self {
+            Self::build(script, true)
+        }
+
+        fn build(script: SshAdmissionScript, failing_audit: bool) -> Self {
+            let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let audit_path = directory.path().join("audit.jsonl");
+            let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+            if failing_audit {
+                audit.fail_for_test();
+            }
+            Self {
+                backend: Arc::new(ScriptedSshBackend {
+                    script,
+                    spawn_count: AtomicUsize::new(0),
+                    spawned: tokio::sync::Notify::new(),
+                    admission: StdMutex::new(None),
+                    reaped: Arc::new(AtomicBool::new(false)),
+                }),
+                audit,
+                audit_path,
+                _directory: directory,
+            }
+        }
+
+        fn manager(&self) -> SessionManager {
+            self.manager_with_policy(SshUserPolicy::Fixed("operator".to_owned()))
+        }
+
+        fn manager_with_policy(&self, user_policy: SshUserPolicy) -> SessionManager {
+            let fixture = fixture_target(false).executable;
+            let target = SshTarget {
+                name: "remote".to_owned(),
+                host: "host.example".to_owned(),
+                port: 22,
+                ssh_executable: fixture.clone(),
+                identity_file: fixture.clone(),
+                known_hosts: fixture,
+                user_policy,
+                read_only: false,
+            };
+            let prepared = crate::ssh::PreparedSshTargets::from_session_test_target(&target);
+            let mut manager = SessionManager::new_with_audit(
+                limits(1, 1),
+                TargetAllowlist::new(vec![Target::Ssh(target)]).unwrap(),
+                Arc::clone(&self.audit),
+            )
+            .with_prepared_ssh(Arc::new(prepared));
+            manager.backend = self.backend.clone();
+            manager
+        }
+
+        fn spawn_count(&self) -> usize {
+            self.backend.spawn_count.load(Ordering::SeqCst)
+        }
+
+        async fn wait_spawned(&self) {
+            while self.spawn_count() == 0 {
+                self.backend.spawned.notified().await;
+            }
+        }
+
+        fn admit(&self) {
+            self.backend
+                .admission
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("pending admission sender")
+                .send(crate::ssh::SshDiagnosticClass::Authenticated)
+                .unwrap();
+        }
+
+        fn was_reaped(&self) -> bool {
+            self.backend.reaped.load(Ordering::SeqCst)
+        }
+
+        async fn wait_reaped(&self) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !self.was_reaped() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("scripted SSH child was not reaped");
+        }
+
+        fn audit_events(&self) -> Vec<serde_json::Value> {
+            fs::read_to_string(&self.audit_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    async fn assert_ssh_setup_denial(
+        script: SshAdmissionScript,
+        expected_error: SessionError,
+        expected_category: &str,
+        expected_reason: &str,
+    ) {
+        let fixture = SshAdmissionFixture::new(script);
+        let manager = fixture.manager();
+        let mut lifecycle = manager.subscribe_events();
+        assert!(matches!(
+            manager
+                .start(
+                    Identity::new("alice").unwrap(),
+                    "remote",
+                    Resize::new(80, 24).unwrap(),
+                )
+                .await,
+            Err(error) if error == expected_error
+        ));
+        fixture.wait_reaped().await;
+        assert!(lifecycle.try_recv().is_err());
+        let events = fixture.audit_events();
+        let denials = events
+            .iter()
+            .filter(|event| event["event_type"] == "access-denied")
+            .collect::<Vec<_>>();
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0]["category"], expected_category);
+        assert_eq!(denials[0]["reason"], expected_reason);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event_type"] != "session-started"
+                    && event["event_type"] != "session-ended")
+        );
+        assert_eq!(manager.capacity.active(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn ssh_policy_denial_happens_before_spawn_and_releases_capacity() {
+        let fixture = SshAdmissionFixture::new(SshAdmissionScript::Authenticated);
+        let manager = fixture.manager_with_policy(crate::config::SshUserPolicy::Mapping(
+            std::collections::BTreeMap::from([("bob".to_owned(), "operator".to_owned())]),
+        ));
+
+        assert!(matches!(
+            manager
+                .start(
+                    Identity::new("alice").unwrap(),
+                    "remote",
+                    Resize::new(80, 24).unwrap(),
+                )
+                .await,
+            Err(SessionError::SshPolicyDenied)
+        ));
+        assert_eq!(fixture.spawn_count(), 0);
+        assert_eq!(manager.capacity.active(), (0, 0));
+        let events = fixture.audit_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "access-denied");
+        assert_eq!(events[0]["category"], "target");
+        assert_eq!(events[0]["reason"], "ssh-user-policy-denied");
+    }
+
+    #[tokio::test]
+    async fn ssh_host_key_failure_has_one_denial_and_no_session_lifecycle() {
+        assert_ssh_setup_denial(
+            SshAdmissionScript::Failure(crate::ssh::SshDiagnosticClass::UnknownHostKey),
+            SessionError::SshHostKeyFailed,
+            "host-key",
+            "unknown-host-key",
+        )
+        .await;
+        assert_ssh_setup_denial(
+            SshAdmissionScript::Failure(crate::ssh::SshDiagnosticClass::HostKeyMismatch),
+            SessionError::SshHostKeyFailed,
+            "host-key",
+            "host-key-mismatch",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ssh_connection_failure_has_one_denial_and_no_session_lifecycle() {
+        assert_ssh_setup_denial(
+            SshAdmissionScript::Failure(crate::ssh::SshDiagnosticClass::ConnectionFailed),
+            SessionError::SshConnectionFailed,
+            "target",
+            "ssh-connection-failed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ssh_authentication_failure_has_one_denial_and_no_session_lifecycle() {
+        assert_ssh_setup_denial(
+            SshAdmissionScript::Failure(crate::ssh::SshDiagnosticClass::AuthenticationFailed),
+            SessionError::SshAuthenticationFailed,
+            "authentication",
+            "ssh-authentication-failed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ssh_generic_setup_failure_has_one_denial_and_no_session_lifecycle() {
+        assert_ssh_setup_denial(
+            SshAdmissionScript::Failure(crate::ssh::SshDiagnosticClass::GenericFailure),
+            SessionError::SshFailed,
+            "target",
+            "ssh-failed",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ssh_admission_emits_created_running_and_one_correlated_start_only_after_authentication()
+     {
+        let fixture = SshAdmissionFixture::new(SshAdmissionScript::Pending);
+        let manager = fixture.manager();
+        let mut events = manager.subscribe_events();
+        let starting = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .start(
+                        Identity::new("alice").unwrap(),
+                        "remote",
+                        Resize::new(80, 24).unwrap(),
+                    )
+                    .await
+            })
+        };
+        fixture.wait_spawned().await;
+        assert!(events.try_recv().is_err());
+        assert_eq!(fixture.audit_events().len(), 0);
+
+        fixture.admit();
+        let mut session = starting.await.unwrap().unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap().transition,
+            LifecycleTransition::Created
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().transition,
+            LifecycleTransition::Running
+        ));
+        let audit = fixture.audit_events();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event["event_type"] == "session-started")
+                .count(),
+            1
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_ssh_setup_is_registered_terminated_reaped_and_releases_capacity() {
+        for _ in 0..20 {
+            let fixture = SshAdmissionFixture::new(SshAdmissionScript::Pending);
+            let manager = fixture.manager();
+            let starting = {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .start(
+                            Identity::new("alice").unwrap(),
+                            "remote",
+                            Resize::new(80, 24).unwrap(),
+                        )
+                        .await
+                })
+            };
+            fixture.wait_spawned().await;
+            assert_eq!(manager.supervisor_count_for_test(), 1);
+            starting.abort();
+            fixture.wait_reaped().await;
+            assert_eq!(manager.capacity.active(), (0, 0));
+            assert_eq!(manager.supervisor_count_for_test(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_ssh_setup_terminates_reaps_and_releases_capacity() {
+        for _ in 0..20 {
+            let fixture = SshAdmissionFixture::new(SshAdmissionScript::Pending);
+            let manager = fixture.manager();
+            let starting = {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .start(
+                            Identity::new("alice").unwrap(),
+                            "remote",
+                            Resize::new(80, 24).unwrap(),
+                        )
+                        .await
+                })
+            };
+            fixture.wait_spawned().await;
+            manager.shutdown().await;
+            assert!(matches!(
+                starting.await.unwrap(),
+                Err(SessionError::ManagerClosed)
+            ));
+            assert!(fixture.was_reaped());
+            assert_eq!(manager.capacity.active(), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_failure_during_ssh_setup_terminates_and_reaps_without_authority() {
+        let fixture = SshAdmissionFixture::with_failing_audit(SshAdmissionScript::Pending);
+        let manager = fixture.manager();
+        let starting = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .start(
+                        Identity::new("alice").unwrap(),
+                        "remote",
+                        Resize::new(80, 24).unwrap(),
+                    )
+                    .await
+            })
+        };
+        fixture.wait_spawned().await;
+        fixture.admit();
+        assert!(matches!(
+            starting.await.unwrap(),
+            Err(SessionError::AuditUnavailable)
+        ));
+        fixture.wait_reaped().await;
+        assert_eq!(manager.capacity.active(), (0, 0));
+        assert!(manager.subscribe_events().try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ssh_remote_exit_status_is_not_connection_setup_failure() {
+        let fixture = SshAdmissionFixture::new(SshAdmissionScript::AuthenticatedThenExit(23));
+        let manager = fixture.manager();
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "remote",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        let closed = session.wait_closed().await.unwrap();
+        assert_eq!(closed.reason, SessionCloseReason::ChildExited);
+        assert_eq!(closed.outcome, Some(ChildOutcome::Code(23)));
+        assert!(
+            fixture
+                .audit_events()
+                .iter()
+                .all(|event| event["event_type"] != "access-denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_local_pty_lifecycle_is_unchanged() {
+        let manager = manager(limits(4, 2), &[fixture_target(false)]);
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.next_event().await.unwrap().transition,
+            LifecycleTransition::Created
+        ));
+        assert!(matches!(
+            session.next_event().await.unwrap().transition,
+            LifecycleTransition::Running
+        ));
+        session.close().await.unwrap();
     }
 
     #[tokio::test]
