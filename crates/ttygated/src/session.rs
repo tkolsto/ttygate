@@ -1457,8 +1457,8 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
             Some(class) => ConnectingOutcome::Rejected(class),
             None => ConnectingOutcome::Rejected(SshDiagnosticClass::GenericFailure),
         },
-        status = parts.child.wait() => match status {
-            Ok(_) => ConnectingOutcome::ChildExited,
+        observed = parts.child.wait_for_exit_observed() => match observed {
+            Ok(()) => ConnectingOutcome::ChildExited,
             Err(_) => ConnectingOutcome::Rejected(SshDiagnosticClass::GenericFailure),
         },
         _ = &mut deadline => ConnectingOutcome::Rejected(SshDiagnosticClass::ConnectionFailed),
@@ -1466,13 +1466,7 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
 
     if !matches!(outcome, ConnectingOutcome::Authenticated) {
         connecting.cancel_tx.send_replace(true);
-        if matches!(outcome, ConnectingOutcome::ChildExited) {
-            drop(parts.reader.take());
-            drop(parts.writer.take());
-            cleanup_group_until_proven(&parts.child).await;
-        } else {
-            let _ = terminate_until_proven(&mut parts.child).await;
-        }
+        let _ = terminate_until_proven(&mut parts.child).await;
         for task in parts.diagnostic_tasks.drain(..) {
             join_worker(task).await;
         }
@@ -1845,19 +1839,6 @@ async fn terminate_until_proven(
     }
 }
 
-async fn cleanup_group_until_proven(child: &crate::pty_backend::PtyChild) -> bool {
-    let mut retried = false;
-    loop {
-        match child.cleanup_group_after_exit(CLEANUP_GRACE).await {
-            Ok(()) => return retried,
-            Err(_) => {
-                retried = true;
-                tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
-            }
-        }
-    }
-}
-
 fn ssh_denial(class: SshDiagnosticClass) -> (SessionError, DenialCategory, DenialReason) {
     match class {
         SshDiagnosticClass::UnknownHostKey => (
@@ -1945,16 +1926,16 @@ async fn run_supervisor(supervisor: &mut Supervisor) -> (SessionCloseReason, Opt
     tokio::pin!(absolute_sleep);
     tokio::pin!(idle_sleep);
 
-    let (mut reason, natural_status) = loop {
+    let mut reason = loop {
         tokio::select! {
             biased;
             _ = &mut absolute_sleep => {
-                break (SessionCloseReason::Timeout(TimeoutKind::Absolute), None);
+                break SessionCloseReason::Timeout(TimeoutKind::Absolute);
             }
-            status = supervisor.child.wait() => {
-                break match status {
-                    Ok(status) => (SessionCloseReason::ChildExited, Some(status)),
-                    Err(_) => (SessionCloseReason::BackendFailure, None),
+            observed = supervisor.child.wait_for_exit_observed() => {
+                break match observed {
+                    Ok(()) => SessionCloseReason::ChildExited,
+                    Err(_) => SessionCloseReason::BackendFailure,
                 };
             }
             changed = supervisor.close_rx.changed() => {
@@ -1964,7 +1945,7 @@ async fn run_supervisor(supervisor: &mut Supervisor) -> (SessionCloseReason, Opt
                     (*supervisor.close_rx.borrow_and_update())
                         .unwrap_or(SessionCloseReason::HandleDropped)
                 };
-                break (requested, None);
+                break requested;
             }
             changed = supervisor.activity_rx.changed() => {
                 if changed.is_ok() {
@@ -1973,39 +1954,29 @@ async fn run_supervisor(supervisor: &mut Supervisor) -> (SessionCloseReason, Opt
                 }
             }
             _ = &mut idle_sleep => {
-                break (SessionCloseReason::Timeout(TimeoutKind::Idle), None);
+                break SessionCloseReason::Timeout(TimeoutKind::Idle);
             }
             worker = supervisor.worker_event_rx.recv() => {
                 let _ = worker;
                 break match tokio::time::timeout(
                     CHILD_EXIT_SETTLE,
-                    supervisor.child.wait(),
+                    supervisor.child.wait_for_exit_observed(),
                 ).await {
-                    Ok(Ok(status)) => (SessionCloseReason::ChildExited, Some(status)),
-                    Ok(Err(_)) | Err(_) => (SessionCloseReason::BackendFailure, None),
+                    Ok(Ok(())) => SessionCloseReason::ChildExited,
+                    Ok(Err(_)) | Err(_) => SessionCloseReason::BackendFailure,
                 };
             }
         }
     };
 
     supervisor.cancel_tx.send_replace(true);
-    let outcome = if let Some(status) = natural_status {
-        join_supervisor_workers(supervisor).await;
-        if cleanup_group_until_proven(&supervisor.child).await {
-            reason = SessionCloseReason::BackendFailure;
-        }
-        Some(ChildOutcome::from_status(status))
-    } else {
-        let (status, retried) = terminate_until_proven(&mut supervisor.child).await;
-        if retried {
-            reason = SessionCloseReason::BackendFailure;
-        }
-        Some(ChildOutcome::from_status(status))
-    };
-
-    if natural_status.is_none() {
-        join_supervisor_workers(supervisor).await;
+    let (status, retried) = terminate_until_proven(&mut supervisor.child).await;
+    if retried {
+        reason = SessionCloseReason::BackendFailure;
     }
+    let outcome = Some(ChildOutcome::from_status(status));
+
+    join_supervisor_workers(supervisor).await;
     (reason, outcome)
 }
 

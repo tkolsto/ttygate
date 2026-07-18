@@ -7,7 +7,21 @@ fi
 if [ "${1-}" = "natural-resistant" ]; then
     trap '' HUP
 fi
-sleep 300 &
+if [ "${1-}" = "natural-resistant" ]; then
+    if [ "${3-}" = "record-hup-exit-23" ]; then
+        hup_marker=${2-}
+    else
+        hup_marker=
+    fi
+    (
+        trap 'if [ -n "$hup_marker" ]; then printf "HUP\n" > "$hup_marker"; fi' HUP
+        while :; do
+            sleep 1
+        done
+    ) &
+else
+    sleep 300 &
+fi
 descendant=$!
 if [ "${1-}" = "browser-track" ]; then
     printf '%s %s\n' "$$" "$descendant" >> "${2:?browser PID marker required}"
@@ -48,8 +62,9 @@ fi
 while IFS= read -r line; do
     case "$line" in
         exit)
-            kill "$descendant" 2>/dev/null || true
-            wait "$descendant" 2>/dev/null || true
+            if [ "${1-}" = "natural-resistant" ] && [ "${3-}" = "record-hup-exit-23" ]; then
+                exit 23
+            fi
             exit 0
             ;;
         size)

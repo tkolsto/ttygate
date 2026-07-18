@@ -4,7 +4,7 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use nix::{
     sys::signal::{Signal, kill, killpg},
-    unistd::Pid,
+    unistd::{Pid, getpgid},
 };
 use tokio::time::timeout;
 use ttygated::{
@@ -253,6 +253,95 @@ async fn normal_exit_has_exactly_one_audit_completion() {
     assert_absent(leader).await;
     assert_absent(descendant).await;
     assert_one_audit_completion(&path, "child-exited").await;
+    guard.disarm();
+}
+
+#[tokio::test]
+async fn natural_leader_exit_cleans_resistant_group_before_capacity_release() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let hup_marker = directory.path().join("natural-resistant-hup");
+    let marker = hup_marker.to_str().expect("fixture marker path is UTF-8");
+    let target = fixture_target(&["natural-resistant", marker, "record-hup-exit-23"]);
+    let manager = SessionManager::new(
+        Limits {
+            max_sessions: 1,
+            max_sessions_per_user: 1,
+            idle_timeout: Duration::from_secs(60),
+            absolute_timeout: Duration::from_secs(600),
+            session_requests_per_window: 10,
+            session_request_window: Duration::from_secs(60),
+            authentication_failures_per_window: 20,
+            authentication_failure_window: Duration::from_secs(60),
+        },
+        TargetAllowlist::new(vec![Target::Pty(target)]).unwrap(),
+    );
+    let mut first = manager
+        .start(
+            Identity::new("first").unwrap(),
+            "lifecycle-fixture",
+            Resize::new(80, 24).unwrap(),
+        )
+        .await
+        .unwrap();
+    let (leader, descendant) = process_ids(&mut first).await;
+    let mut guard = ProcessGroupGuard::new(leader);
+    assert_eq!(
+        getpgid(Some(Pid::from_raw(i32::try_from(descendant).unwrap()))).unwrap(),
+        Pid::from_raw(i32::try_from(leader).unwrap()),
+        "resistant descendant must share the leader's process group"
+    );
+
+    first.write(b"exit\n".to_vec()).await.unwrap();
+    timeout(WAIT, async {
+        while !matches!(fs::read_to_string(&hup_marker), Ok(marker) if marker == "HUP\n") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resistant descendant did not observe the graceful group HUP");
+    assert!(
+        process_exists(descendant),
+        "resistant descendant must remain alive when the HUP marker is observed"
+    );
+    assert!(matches!(
+        manager
+            .start(
+                Identity::new("second").unwrap(),
+                "lifecycle-fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await,
+        Err(ttygated::session::SessionError::GlobalLimit)
+    ));
+
+    let closed = timeout(WAIT, first.wait_closed())
+        .await
+        .expect("natural-exit group cleanup timed out")
+        .unwrap();
+    assert_eq!(closed.reason, SessionCloseReason::ChildExited);
+    assert_eq!(closed.outcome, Some(ChildOutcome::Code(23)));
+    assert!(
+        !process_exists(leader),
+        "leader remained after capacity release"
+    );
+    assert!(
+        !process_exists(descendant),
+        "descendant remained after capacity release"
+    );
+    assert!(
+        !process_group_exists(leader),
+        "process group remained after capacity release"
+    );
+
+    let mut second = manager
+        .start(
+            Identity::new("second").unwrap(),
+            "lifecycle-fixture",
+            Resize::new(80, 24).unwrap(),
+        )
+        .await
+        .expect("capacity must release after natural-exit group cleanup");
+    second.close().await.unwrap();
     guard.disarm();
 }
 
