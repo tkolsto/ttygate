@@ -499,26 +499,61 @@ fn classify_diagnostics(diagnostics: &str, expected_host: &str) -> Option<SshDia
     }) {
         Some(SshDiagnosticClass::AuthenticationFailed)
     } else if lines().any(|line| {
-        let Some(rest) = line.strip_prefix("ssh: connect to host ") else {
-            return false;
-        };
-        let Some(rest) = rest.strip_prefix(expected_host) else {
-            return false;
-        };
-        rest.starts_with(" port ")
-            && [
-                "Connection refused",
-                "Connection timed out",
-                "No route to host",
-                "Operation timed out",
-            ]
-            .iter()
-            .any(|reason| rest.ends_with(reason))
+        connect_failure_line(line, expected_host)
+            || resolution_failure_line(line, expected_host)
+            || peer_disconnect_line(line, "Connection closed by ", expected_host)
+            || peer_disconnect_line(line, "Connection reset by ", expected_host)
+            || line == "kex_exchange_identification: Connection closed by remote host"
     }) {
         Some(SshDiagnosticClass::ConnectionFailed)
     } else {
         None
     }
+}
+
+fn connect_failure_line(line: &str, expected_host: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix("ssh: connect to host ")
+        .and_then(|line| line.strip_prefix(expected_host))
+    else {
+        return false;
+    };
+    rest.starts_with(" port ")
+        && [
+            "Connection refused",
+            "Connection timed out",
+            "No route to host",
+            "Operation timed out",
+        ]
+        .iter()
+        .any(|reason| rest.ends_with(reason))
+}
+
+fn resolution_failure_line(line: &str, expected_host: &str) -> bool {
+    let Some(reason) = line
+        .strip_prefix("ssh: Could not resolve hostname ")
+        .and_then(|line| line.strip_prefix(expected_host))
+        .and_then(|line| line.strip_prefix(": "))
+    else {
+        return false;
+    };
+    matches!(
+        reason,
+        "Name or service not known"
+            | "nodename nor servname provided, or not known"
+            | "Temporary failure in name resolution"
+    )
+}
+
+fn peer_disconnect_line(line: &str, prefix: &str, expected_host: &str) -> bool {
+    let Some((authority, port)) = line
+        .strip_prefix(prefix)
+        .and_then(|line| line.rsplit_once(" port "))
+    else {
+        return false;
+    };
+    (authority == expected_host || authority.parse::<std::net::IpAddr>().is_ok())
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
@@ -2263,6 +2298,22 @@ requesttty force\n"
             ),
             (
                 "ssh: connect to host host.example port 22: Connection refused\n",
+                super::SshDiagnosticClass::ConnectionFailed,
+            ),
+            (
+                "ssh: Could not resolve hostname host.example: Name or service not known\n",
+                super::SshDiagnosticClass::ConnectionFailed,
+            ),
+            (
+                "Connection closed by 192.0.2.10 port 22\n",
+                super::SshDiagnosticClass::ConnectionFailed,
+            ),
+            (
+                "Connection reset by 2001:db8::10 port 22\n",
+                super::SshDiagnosticClass::ConnectionFailed,
+            ),
+            (
+                "kex_exchange_identification: Connection closed by remote host\n",
                 super::SshDiagnosticClass::ConnectionFailed,
             ),
             (
