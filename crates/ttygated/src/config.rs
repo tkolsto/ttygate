@@ -1678,6 +1678,32 @@ user_mapping = { alice = "one", alice = "two" }"#,
     }
 
     #[test]
+    fn allowlist_rejects_invalid_typed_ssh_credential_paths() {
+        for (ssh_executable, identity_file, field) in [
+            ("~/bin/ssh", "./id_ed25519", "targets[0].ssh_executable"),
+            (
+                "/usr/bin/ssh",
+                "$HOME/id_ed25519",
+                "targets[0].identity_file",
+            ),
+        ] {
+            let target = Target::Ssh(SshTarget {
+                name: "host".into(),
+                host: "example.test".into(),
+                port: 22,
+                ssh_executable: ssh_executable.into(),
+                identity_file: identity_file.into(),
+                known_hosts: "./known_hosts".into(),
+                user_policy: SshUserPolicy::SameAsAuthenticatedUser,
+                read_only: false,
+            });
+
+            let error = TargetAllowlist::new(vec![target]).unwrap_err().to_string();
+            assert!(error.contains(field), "{error:?} did not contain {field:?}");
+        }
+    }
+
+    #[test]
     fn file_loading_has_typed_safe_errors_and_never_executes_targets() {
         let directory = tempdir().unwrap();
         let config_path = directory.path().join("literal-$HOME-config.toml");
@@ -2265,6 +2291,29 @@ user = "operator_1""#,
     fn same_as_authenticated_user_policy_resolves_exactly() {
         let target = parsed_ssh(r#"user_policy = "same-as-auth-user""#);
         assert_eq!(target.user_policy.resolve("alice.1").unwrap(), "alice.1");
+    }
+
+    #[test]
+    fn same_as_authenticated_user_policy_rejects_hostile_runtime_identities() {
+        let policy = SshUserPolicy::SameAsAuthenticatedUser;
+        let hostile_identities = [
+            "-oProxyCommand=bad".to_owned(),
+            "operator name".to_owned(),
+            "operator\nname".to_owned(),
+            "oper\u{0000}ator".to_owned(),
+            "operаtor".to_owned(),
+            "a".repeat(129),
+        ];
+
+        for identity in hostile_identities {
+            assert!(
+                matches!(
+                    policy.resolve(&identity),
+                    Err(super::UserPolicyError::InvalidResolvedUser)
+                ),
+                "accepted hostile runtime identity {identity:?}"
+            );
+        }
     }
 
     #[test]
