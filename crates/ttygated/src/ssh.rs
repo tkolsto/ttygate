@@ -19,34 +19,51 @@ pub const MAX_SSH_EXECUTABLE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_IDENTITY_BYTES: u64 = 1024 * 1024;
 const MAX_PROBE_OUTPUT_BYTES: u64 = 64 * 1024;
+const MAX_IDENTITY_COMMENT_BYTES: usize = 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-const CAPABILITY_PROBE_ARGV: [&str; 24] = [
-    "-G",
-    "-F",
-    "/dev/null",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ClearAllForwardings=yes",
-    "-o",
-    "IdentitiesOnly=yes",
-    "-o",
-    "IdentityAgent=none",
-    "-o",
-    "PasswordAuthentication=no",
-    "-o",
-    "KbdInteractiveAuthentication=no",
-    "-o",
-    "PubkeyAuthentication=yes",
-    "-o",
+// This is the ordered source of truth for the strict option vocabulary. Runtime
+// argv construction must use the same keys while replacing material placeholders.
+pub(crate) const STRICT_SSH_PROBE_OPTIONS: [&str; 28] = [
     "StrictHostKeyChecking=yes",
-    "-o",
     "UserKnownHostsFile=/dev/null",
-    "-o",
     "GlobalKnownHostsFile=/dev/null",
-    "ttygate-capability.invalid",
+    "UpdateHostKeys=no",
+    "CheckHostIP=yes",
+    "BatchMode=yes",
+    "IdentitiesOnly=yes",
+    "IdentityFile=/dev/null",
+    "IdentityAgent=none",
+    "AddKeysToAgent=no",
+    "PreferredAuthentications=publickey",
+    "PubkeyAuthentication=yes",
+    "PasswordAuthentication=no",
+    "KbdInteractiveAuthentication=no",
+    "ChallengeResponseAuthentication=no",
+    "HostbasedAuthentication=no",
+    "GSSAPIAuthentication=no",
+    "ForwardAgent=no",
+    "ForwardX11=no",
+    "ForwardX11Trusted=no",
+    "ClearAllForwardings=yes",
+    "PermitLocalCommand=no",
+    "ProxyCommand=none",
+    "ProxyJump=none",
+    "EnableEscapeCommandline=no",
+    "EscapeChar=none",
+    "CanonicalizeHostname=no",
+    "RequestTTY=force",
 ];
+
+fn capability_probe_argv() -> Vec<&'static str> {
+    let mut argv = Vec::with_capacity(STRICT_SSH_PROBE_OPTIONS.len() * 2 + 5);
+    argv.extend(["-G", "-F", "/dev/null"]);
+    for option in STRICT_SSH_PROBE_OPTIONS {
+        argv.extend(["-o", option]);
+    }
+    argv.extend(["--", "ttygate-capability.invalid"]);
+    argv
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum SshPreparationError {
@@ -208,9 +225,10 @@ where
 }
 
 pub async fn probe_capabilities(executable: &Path) -> Result<(), SshPreparationError> {
+    let argv = capability_probe_argv();
     let mut command = Command::new(executable);
     command
-        .args(CAPABILITY_PROBE_ARGV)
+        .args(argv)
         .env_clear()
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -271,7 +289,22 @@ pub async fn probe_capabilities(executable: &Path) -> Result<(), SshPreparationE
         ("identityagent", &["none"][..]),
         ("passwordauthentication", &["no", "false"][..]),
         ("kbdinteractiveauthentication", &["no", "false"][..]),
+        ("updatehostkeys", &["no", "false"][..]),
+        ("checkhostip", &["yes", "true"][..]),
+        ("identityfile", &["/dev/null"][..]),
+        ("addkeystoagent", &["no", "false"][..]),
+        ("preferredauthentications", &["publickey"][..]),
         ("pubkeyauthentication", &["yes", "true"][..]),
+        ("hostbasedauthentication", &["no", "false"][..]),
+        ("gssapiauthentication", &["no", "false"][..]),
+        ("forwardagent", &["no", "false"][..]),
+        ("forwardx11", &["no", "false"][..]),
+        ("forwardx11trusted", &["no", "false"][..]),
+        ("permitlocalcommand", &["no", "false"][..]),
+        ("enableescapecommandline", &["no", "false"][..]),
+        ("escapechar", &["none"][..]),
+        ("canonicalizehostname", &["no", "false"][..]),
+        ("requesttty", &["force"][..]),
         ("stricthostkeychecking", &["yes", "true"][..]),
         ("userknownhostsfile", &["/dev/null"][..]),
         ("globalknownhostsfile", &["/dev/null"][..]),
@@ -428,18 +461,44 @@ fn validate_identity(bytes: &[u8]) -> Result<(), SshPreparationError> {
     if take_u32(&mut remaining)? != 1 {
         return Err(SshPreparationError::IdentityUnsafe);
     }
-    let public_key = take_ssh_string(&mut remaining)?;
+    let mut public_blob = take_ssh_string(&mut remaining)?;
     let mut private_block = take_ssh_string(&mut remaining)?;
-    if public_key.is_empty() || !remaining.is_empty() {
+    if !remaining.is_empty() {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    let public_key_type = take_ssh_string(&mut public_blob)?;
+    let outer_public = take_ssh_string(&mut public_blob)?;
+    if public_key_type != b"ssh-ed25519" || outer_public.len() != 32 || !public_blob.is_empty() {
         return Err(SshPreparationError::IdentityUnsafe);
     }
     let first_check = take_u32(&mut private_block)?;
     let second_check = take_u32(&mut private_block)?;
     let key_type = take_ssh_string(&mut private_block)?;
-    if first_check != second_check || key_type.is_empty() || private_block.is_empty() {
+    let inner_public = take_ssh_string(&mut private_block)?;
+    let private_key = take_ssh_string(&mut private_block)?;
+    let comment = take_ssh_string(&mut private_block)?;
+    if first_check != second_check
+        || key_type != b"ssh-ed25519"
+        || inner_public.len() != 32
+        || private_key.len() != 64
+        || private_key.get(32..) != Some(inner_public)
+        || inner_public != outer_public
+        || comment.len() > MAX_IDENTITY_COMMENT_BYTES
+        || !canonical_padding(private_block)
+    {
         return Err(SshPreparationError::IdentityUnsafe);
     }
     Ok(())
+}
+
+fn canonical_padding(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.len() <= u8::MAX as usize
+        && bytes
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(index, byte)| byte == (index + 1) as u8)
 }
 
 fn take_ssh_string<'a>(remaining: &mut &'a [u8]) -> Result<&'a [u8], SshPreparationError> {
@@ -568,27 +627,41 @@ mod tests {
         path
     }
 
-    fn unencrypted_identity() -> Vec<u8> {
-        fn string(output: &mut Vec<u8>, value: &[u8]) {
-            output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-            output.extend_from_slice(value);
-        }
-        let mut binary = b"openssh-key-v1\0".to_vec();
-        string(&mut binary, b"none");
-        string(&mut binary, b"none");
-        string(&mut binary, b"");
-        binary.extend_from_slice(&1u32.to_be_bytes());
-        string(&mut binary, b"synthetic-public-key");
-        let mut private = 0x1234_5678u32.to_be_bytes().to_vec();
-        private.extend_from_slice(&0x1234_5678u32.to_be_bytes());
-        string(&mut private, b"ssh-ed25519");
-        private.extend_from_slice(b"synthetic-non-key-data");
-        string(&mut binary, &private);
+    fn string(output: &mut Vec<u8>, value: &[u8]) {
+        output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        output.extend_from_slice(value);
+    }
+
+    fn pem_identity(binary: &[u8]) -> Vec<u8> {
         let encoded = STANDARD.encode(binary);
         format!(
             "-----BEGIN OPENSSH PRIVATE KEY-----\n{encoded}\n-----END OPENSSH PRIVATE KEY-----\n"
         )
         .into_bytes()
+    }
+
+    fn unencrypted_identity() -> Vec<u8> {
+        let public = [0x42; 32];
+        let mut binary = b"openssh-key-v1\0".to_vec();
+        string(&mut binary, b"none");
+        string(&mut binary, b"none");
+        string(&mut binary, b"");
+        binary.extend_from_slice(&1u32.to_be_bytes());
+        let mut public_blob = Vec::new();
+        string(&mut public_blob, b"ssh-ed25519");
+        string(&mut public_blob, &public);
+        string(&mut binary, &public_blob);
+        let mut private = 0x1234_5678u32.to_be_bytes().to_vec();
+        private.extend_from_slice(&0x1234_5678u32.to_be_bytes());
+        string(&mut private, b"ssh-ed25519");
+        string(&mut private, &public);
+        let mut private_key = [0x24; 64];
+        private_key[32..].copy_from_slice(&public);
+        string(&mut private, &private_key);
+        string(&mut private, b"synthetic-non-secret");
+        private.extend_from_slice(&[1, 2, 3, 4]);
+        string(&mut binary, &private);
+        pem_identity(&binary)
     }
 
     fn incomplete_identity() -> Vec<u8> {
@@ -606,6 +679,34 @@ mod tests {
 
     async fn accept_probe(_: PathBuf) -> Result<(), SshPreparationError> {
         Ok(())
+    }
+
+    fn strict_probe_output() -> &'static str {
+        "stricthostkeychecking true\n\
+userknownhostsfile /dev/null\n\
+globalknownhostsfile /dev/null\n\
+updatehostkeys false\n\
+checkhostip yes\n\
+batchmode yes\n\
+identitiesonly yes\n\
+identityfile /dev/null\n\
+identityagent none\n\
+addkeystoagent false\n\
+preferredauthentications publickey\n\
+pubkeyauthentication true\n\
+passwordauthentication no\n\
+kbdinteractiveauthentication no\n\
+hostbasedauthentication no\n\
+gssapiauthentication no\n\
+forwardagent no\n\
+forwardx11 no\n\
+forwardx11trusted no\n\
+clearallforwardings yes\n\
+permitlocalcommand no\n\
+enableescapecommandline no\n\
+escapechar none\n\
+canonicalizehostname false\n\
+requesttty force\n"
     }
 
     #[tokio::test]
@@ -767,6 +868,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identity_parser_rejects_malformed_ed25519_structure() {
+        #[derive(Clone)]
+        struct IdentityParts {
+            outer_type: Vec<u8>,
+            outer_public: Vec<u8>,
+            checks: (u32, u32),
+            inner_type: Vec<u8>,
+            inner_public: Vec<u8>,
+            private_key: Vec<u8>,
+            comment: Option<Vec<u8>>,
+            padding: Vec<u8>,
+            outer_trailing: Vec<u8>,
+        }
+
+        fn identity(parts: &IdentityParts) -> Vec<u8> {
+            let mut binary = b"openssh-key-v1\0".to_vec();
+            string(&mut binary, b"none");
+            string(&mut binary, b"none");
+            string(&mut binary, b"");
+            binary.extend_from_slice(&1u32.to_be_bytes());
+            let mut public_blob = Vec::new();
+            string(&mut public_blob, &parts.outer_type);
+            string(&mut public_blob, &parts.outer_public);
+            string(&mut binary, &public_blob);
+            let mut private = parts.checks.0.to_be_bytes().to_vec();
+            private.extend_from_slice(&parts.checks.1.to_be_bytes());
+            string(&mut private, &parts.inner_type);
+            string(&mut private, &parts.inner_public);
+            string(&mut private, &parts.private_key);
+            if let Some(comment) = &parts.comment {
+                string(&mut private, comment);
+            }
+            private.extend_from_slice(&parts.padding);
+            string(&mut binary, &private);
+            binary.extend_from_slice(&parts.outer_trailing);
+            pem_identity(&binary)
+        }
+
+        let public = vec![0x42; 32];
+        let mut private_key = vec![0x24; 64];
+        private_key[32..].copy_from_slice(&public);
+        let valid = IdentityParts {
+            outer_type: b"ssh-ed25519".to_vec(),
+            outer_public: public.clone(),
+            checks: (7, 7),
+            inner_type: b"ssh-ed25519".to_vec(),
+            inner_public: public,
+            private_key,
+            comment: Some(b"comment".to_vec()),
+            padding: vec![1],
+            outer_trailing: Vec::new(),
+        };
+        let malformed = [
+            {
+                let mut parts = valid.clone();
+                parts.outer_type = b"ssh-rsa".to_vec();
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.outer_public.pop();
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.checks.1 += 1;
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.inner_type = b"ssh-rsa".to_vec();
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.inner_public.fill(0x43);
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.private_key.pop();
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.private_key[32..].fill(0x43);
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.comment = None;
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.comment = Some(vec![b'c'; super::MAX_IDENTITY_COMMENT_BYTES + 1]);
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.padding.clear();
+                identity(&parts)
+            },
+            {
+                let mut parts = valid.clone();
+                parts.padding = vec![1, 3];
+                identity(&parts)
+            },
+            {
+                let mut parts = valid;
+                parts.outer_trailing = b"trailing".to_vec();
+                identity(&parts)
+            },
+        ];
+        for bytes in malformed {
+            assert_eq!(
+                super::validate_identity(&bytes).unwrap_err(),
+                SshPreparationError::IdentityUnsafe
+            );
+        }
+        assert!(super::validate_identity(&unencrypted_identity()).is_ok());
+    }
+
     #[tokio::test]
     async fn ssh_material_paths_are_rechecked_before_spawn() {
         let material = Material::new();
@@ -801,21 +1026,92 @@ mod tests {
         let material = Material::new();
         let record_path = material.directory.path().join("probe-record");
         let script = format!(
-            "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; env; }} > '{}'\nprintf '%s\\n' \\\n 'batchmode yes' \\\n 'clearallforwardings yes' \\\n 'identitiesonly yes' \\\n 'identityagent none' \\\n 'passwordauthentication no' \\\n 'kbdinteractiveauthentication no' \\\n 'pubkeyauthentication true' \\\n 'stricthostkeychecking true' \\\n 'userknownhostsfile /dev/null' \\\n 'globalknownhostsfile /dev/null'\n",
-            record_path.display()
+            "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; env; }} > '{}'\nprintf '%s' '{}'\n",
+            record_path.display(),
+            strict_probe_output()
         );
         write(&material.executable, script.as_bytes(), 0o700);
         probe_capabilities(&material.executable).await.unwrap();
 
         let record = fs::read_to_string(record_path).unwrap();
         let lines = record.lines().map(OsString::from).collect::<Vec<_>>();
+        let expected_argv = super::capability_probe_argv();
         assert_eq!(
-            &lines[..super::CAPABILITY_PROBE_ARGV.len()],
-            super::CAPABILITY_PROBE_ARGV
+            &lines[..expected_argv.len()],
+            expected_argv.iter().map(OsString::from).collect::<Vec<_>>()
         );
         assert!(record.contains("LC_ALL=C"));
         assert!(record.contains("LANG=C"));
         assert!(!record.lines().any(|line| line.starts_with("PATH=")));
+    }
+
+    #[tokio::test]
+    async fn capability_probe_covers_and_validates_complete_strict_runtime_vocabulary() {
+        let expected = [
+            "StrictHostKeyChecking=yes",
+            "UserKnownHostsFile=/dev/null",
+            "GlobalKnownHostsFile=/dev/null",
+            "UpdateHostKeys=no",
+            "CheckHostIP=yes",
+            "BatchMode=yes",
+            "IdentitiesOnly=yes",
+            "IdentityFile=/dev/null",
+            "IdentityAgent=none",
+            "AddKeysToAgent=no",
+            "PreferredAuthentications=publickey",
+            "PubkeyAuthentication=yes",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "ChallengeResponseAuthentication=no",
+            "HostbasedAuthentication=no",
+            "GSSAPIAuthentication=no",
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ForwardX11Trusted=no",
+            "ClearAllForwardings=yes",
+            "PermitLocalCommand=no",
+            "ProxyCommand=none",
+            "ProxyJump=none",
+            "EnableEscapeCommandline=no",
+            "EscapeChar=none",
+            "CanonicalizeHostname=no",
+            "RequestTTY=force",
+        ];
+        let argv = super::capability_probe_argv();
+        assert_eq!(&argv[..3], ["-G", "-F", "/dev/null"]);
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            ["--", "ttygate-capability.invalid"]
+        );
+        let option_argv = &argv[3..argv.len() - 2];
+        assert_eq!(option_argv.len(), expected.len() * 2);
+        for (index, expected) in expected.iter().enumerate() {
+            assert_eq!(option_argv[index * 2], "-o");
+            assert_eq!(option_argv[index * 2 + 1], *expected);
+            assert_eq!(
+                option_argv
+                    .iter()
+                    .filter(|argument| *argument == expected)
+                    .count(),
+                1
+            );
+        }
+
+        let material = Material::new();
+        for omitted in strict_probe_output().lines() {
+            let bad_output = strict_probe_output()
+                .lines()
+                .filter(|line| *line != omitted)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let script = format!("#!/bin/sh\nprintf '%s\\n' '{bad_output}'\n");
+            write(&material.executable, script.as_bytes(), 0o700);
+            assert_eq!(
+                probe_capabilities(&material.executable).await.unwrap_err(),
+                SshPreparationError::CapabilityUnsupported,
+                "probe accepted output missing {omitted}"
+            );
+        }
     }
 
     #[tokio::test]
