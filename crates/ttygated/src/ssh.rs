@@ -466,7 +466,10 @@ fn classify_diagnostics(diagnostics: &str, expected_host: &str) -> Option<SshDia
                 .map(|line| line.strip_suffix('\r').unwrap_or(line))
         })
     };
-    if lines().any(|line| line == "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!") {
+    if lines().any(|line| {
+        line == "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"
+            || line == "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @"
+    }) {
         Some(SshDiagnosticClass::HostKeyMismatch)
     } else if lines().any(|line| {
         ["ED25519", "ECDSA", "RSA"].iter().any(|key_type| {
@@ -2163,6 +2166,14 @@ requesttty force\n"
         assert_eq!(precedence.classification(), Some(Authenticated));
         precedence.push(b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n");
         assert_eq!(precedence.classification(), Some(HostKeyMismatch));
+
+        let mut installed_openssh_mismatch = classifier_for_test("host.example");
+        installed_openssh_mismatch
+            .push(b"@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n");
+        assert_eq!(
+            installed_openssh_mismatch.classification(),
+            Some(HostKeyMismatch)
+        );
 
         let mut partial = classifier_for_test("host.example");
         partial.push(b"Authenticated to host.example using \"public");
