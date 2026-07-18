@@ -39,10 +39,10 @@ class ManualScheduler implements Scheduler {
 class FakeSocket implements SocketPort {
   binaryType = "";
   readyState = 0;
-  onopen: (() => void) | null = null;
-  onmessage: ((event: { data: unknown }) => void) | null = null;
-  onclose: (() => void) | null = null;
-  onerror: (() => void) | null = null;
+  onopen: ((event: Event) => void) | null = null;
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
   readonly sent: Array<string | Uint8Array> = [];
   closeCalls = 0;
 
@@ -63,16 +63,16 @@ class FakeSocket implements SocketPort {
 
   open(): void {
     this.readyState = 1;
-    this.onopen?.();
+    this.onopen?.({} as Event);
   }
 
   message(data: unknown): void {
-    this.onmessage?.({ data });
+    this.onmessage?.({ data } as MessageEvent<unknown>);
   }
 
   transportClose(): void {
     this.readyState = 3;
-    this.onclose?.();
+    this.onclose?.({} as CloseEvent);
   }
 }
 

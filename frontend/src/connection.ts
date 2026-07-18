@@ -48,10 +48,10 @@ export interface ConnectionSnapshot {
 export interface SocketPort {
   binaryType: string;
   readonly readyState: number;
-  onopen: (() => void) | null;
-  onmessage: ((event: { data: unknown }) => void) | null;
-  onclose: (() => void) | null;
-  onerror: (() => void) | null;
+  onopen: ((event: Event) => void) | null;
+  onmessage: ((event: MessageEvent<unknown>) => void) | null;
+  onclose: ((event: CloseEvent) => void) | null;
+  onerror: ((event: Event) => void) | null;
   send(data: string | ArrayBuffer | ArrayBufferView): void;
   close(): void;
 }
