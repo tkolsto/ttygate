@@ -662,6 +662,7 @@ mod tests {
     };
 
     const KNOWN_HOST: &[u8] = b"host.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA==\n";
+    static REAL_PROBE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct Material {
         directory: TempDir,
@@ -1123,6 +1124,7 @@ requesttty force\n"
 
     #[tokio::test]
     async fn ssh_capability_probe_uses_literal_executable_fixed_argv_and_cleared_environment() {
+        let _probe_guard = REAL_PROBE_TEST_LOCK.lock().await;
         let material = Material::new();
         let record_path = material.directory.path().join("probe-record");
         let script = format!(
@@ -1147,6 +1149,7 @@ requesttty force\n"
 
     #[tokio::test]
     async fn capability_probe_covers_and_validates_complete_strict_runtime_vocabulary() {
+        let _probe_guard = REAL_PROBE_TEST_LOCK.lock().await;
         let expected = [
             "StrictHostKeyChecking=yes",
             "UserKnownHostsFile=/dev/null",
@@ -1228,6 +1231,7 @@ requesttty force\n"
 
     #[tokio::test]
     async fn capability_probe_timeout_kills_and_reaps_child() {
+        let _probe_guard = REAL_PROBE_TEST_LOCK.lock().await;
         let material = Material::new();
         let pid_path = material.directory.path().join("hanging-probe.pid");
         let script = format!(
@@ -1251,6 +1255,7 @@ requesttty force\n"
 
     #[tokio::test]
     async fn capability_probe_output_limit_kills_and_reaps_flooding_child() {
+        let _probe_guard = REAL_PROBE_TEST_LOCK.lock().await;
         let material = Material::new();
         let pid_path = material.directory.path().join("flooding-probe.pid");
         let script = format!(
@@ -1301,6 +1306,7 @@ requesttty force\n"
 
     #[tokio::test]
     async fn capability_probe_rejects_duplicate_contradictory_and_unsafe_proxy_transcripts() {
+        let _probe_guard = REAL_PROBE_TEST_LOCK.lock().await;
         let material = Material::new();
         for suffix in [
             "batchmode no\n",
@@ -1319,6 +1325,7 @@ requesttty force\n"
 
     #[tokio::test]
     async fn installed_openssh_accepts_required_capability_policy_when_available() {
+        let _probe_guard = REAL_PROBE_TEST_LOCK.lock().await;
         let executable = Path::new("/usr/bin/ssh");
         match fs::metadata(executable) {
             Ok(metadata) if metadata.is_file() => probe_capabilities(executable).await.unwrap(),
