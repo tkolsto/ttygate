@@ -15,9 +15,14 @@ configuration before application construction or listener binding, and
 implements one direct rustls listener for HTTPS and WSS. Roadmap Chunk 2.2 is complete (Refs #9): production trusted-proxy authentication now verifies the actual
 socket peer against configured CIDRs, consumes one configured identity header,
 and binds that identity through the secure browser cookie, session ticket, WSS
-upgrade, and PTY session. Rate limiting, audit persistence, SSH, recording,
-reconnect, packaging, and release hardening remain future work, so the current
-build is still not production-safe.
+upgrade, and PTY session. Roadmap Chunk 2.3 is complete (Refs #24):
+authenticated session requests and authentication failures are rate-limited,
+and configured global/per-identity capacity is reserved when a ticket is issued
+and transferred exactly once to the live session. Audit persistence, SSH,
+recording, reconnect, packaging, and release hardening remain future work, so
+the current build is still not production-safe.
+Rate limiting is implemented; audit persistence, SSH, recording, packaging,
+and other release controls remain future work.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
 
@@ -128,11 +133,43 @@ peer; they never reread an identity header to replace the cookie-bound
 identity. Tickets remain short-lived, single-use, target-bound, and
 identity-bound.
 
+## Rate and concurrency limits
+
+Chunk 2.3 uses first-request-anchored fixed windows measured with monotonic time.
+Defaults are 10 session requests per 60 seconds for each authenticated identity
+and 20 authentication failures per 60 seconds for each listener-supplied peer
+IP. Development and production use the same defaults:
+
+```toml
+[limits]
+session_requests_per_window = 10
+session_request_window_seconds = 60
+authentication_failures_per_window = 20
+authentication_failure_window_seconds = 60
+```
+
+The first and last configured attempts are admitted; the next is rejected
+without consuming or extending the window, and capacity recovers at the exact
+window boundary. Authentication-failure keys use only the actual listener peer
+IP. Session-request keys use the authenticated cookie identity. `Forwarded`,
+`X-Forwarded-For`, `X-Real-IP`, Host, query parameters, and WebSocket
+subprotocols cannot select either key.
+
+Global and per-identity session capacity is reserved atomically before a ticket
+is returned. The opaque ticket owns that reservation until expiry or
+correct-identity redemption, which transfers rather than duplicates it into the
+live session. Expiry, abandonment, failed spawn, disconnect, close, timeout, and
+shutdown release the same reservation. Rate exhaustion returns HTTP 429 with a
+positive `Retry-After`; concurrency exhaustion returns HTTP 503 with
+`global-session-limit` or `identity-session-limit`. These application limits
+bound local state but do not prevent distributed denial of service or host,
+socket, proxy, or allowlisted-command exhaustion.
+
 ## Planned v0.1 posture
 
 The daemon defaults to `127.0.0.1`, but localhost-only binding is only one layer. Local development requires Origin validation, a real browser session cookie, and a short-lived single-use ticket presented as the first WebSocket message. The frontend lists only safe presentation metadata for server-configured targets; executable paths, arguments, SSH options, credentials, and tickets never become target-selection authority. Terminal output uses bounded server and browser queues, and a dropped WebSocket ends the session without automatic reconnect.
 
-The PTY session manager already enforces configured global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits and structured session-lifecycle audit persistence remain planned; see the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits are implemented; structured session-lifecycle audit persistence remains planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
 
 ## Security model and non-goals
 

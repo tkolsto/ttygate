@@ -12,6 +12,11 @@ use ipnet::IpNet;
 use serde::Deserialize;
 use thiserror::Error;
 
+pub const DEFAULT_SESSION_REQUESTS_PER_WINDOW: u32 = 10;
+pub const DEFAULT_SESSION_REQUEST_WINDOW: Duration = Duration::from_secs(60);
+pub const DEFAULT_AUTHENTICATION_FAILURES_PER_WINDOW: u32 = 20;
+pub const DEFAULT_AUTHENTICATION_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub server: ServerConfig,
@@ -79,6 +84,10 @@ pub struct Limits {
     pub max_sessions_per_user: usize,
     pub idle_timeout: Duration,
     pub absolute_timeout: Duration,
+    pub session_requests_per_window: u32,
+    pub session_request_window: Duration,
+    pub authentication_failures_per_window: u32,
+    pub authentication_failure_window: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +288,14 @@ struct RawLimits {
     max_sessions_per_user: usize,
     idle_timeout_seconds: u64,
     absolute_timeout_seconds: u64,
+    #[serde(default)]
+    session_requests_per_window: Option<u32>,
+    #[serde(default)]
+    session_request_window_seconds: Option<u64>,
+    #[serde(default)]
+    authentication_failures_per_window: Option<u32>,
+    #[serde(default)]
+    authentication_failure_window_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -354,6 +371,24 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
             max_sessions_per_user: raw.limits.max_sessions_per_user,
             idle_timeout: Duration::from_secs(raw.limits.idle_timeout_seconds),
             absolute_timeout: Duration::from_secs(raw.limits.absolute_timeout_seconds),
+            session_requests_per_window: raw
+                .limits
+                .session_requests_per_window
+                .unwrap_or(DEFAULT_SESSION_REQUESTS_PER_WINDOW),
+            session_request_window: Duration::from_secs(
+                raw.limits
+                    .session_request_window_seconds
+                    .unwrap_or(DEFAULT_SESSION_REQUEST_WINDOW.as_secs()),
+            ),
+            authentication_failures_per_window: raw
+                .limits
+                .authentication_failures_per_window
+                .unwrap_or(DEFAULT_AUTHENTICATION_FAILURES_PER_WINDOW),
+            authentication_failure_window: Duration::from_secs(
+                raw.limits
+                    .authentication_failure_window_seconds
+                    .unwrap_or(DEFAULT_AUTHENTICATION_FAILURE_WINDOW.as_secs()),
+            ),
         },
         targets,
     };
@@ -711,6 +746,7 @@ fn validate_literal_path(path: &Path, field: &str) -> Result<(), ConfigError> {
 
 fn validate_limits(raw: &RawLimits) -> Result<(), ConfigError> {
     const MAX_SESSIONS: usize = 1_000_000;
+    const MAX_RATE_ALLOWANCE: u32 = 1_000_000;
     const MAX_TIMEOUT_SECONDS: u64 = 366 * 24 * 60 * 60;
     for (field, value) in [
         ("limits.max_sessions", raw.max_sessions),
@@ -728,6 +764,44 @@ fn validate_limits(raw: &RawLimits) -> Result<(), ConfigError> {
         (
             "limits.absolute_timeout_seconds",
             raw.absolute_timeout_seconds,
+        ),
+    ] {
+        if value == 0 || value > MAX_TIMEOUT_SECONDS {
+            return Err(validation(
+                field.to_owned(),
+                "must be between 1 and 31622400 seconds",
+            ));
+        }
+    }
+    for (field, value) in [
+        (
+            "limits.session_requests_per_window",
+            raw.session_requests_per_window
+                .unwrap_or(DEFAULT_SESSION_REQUESTS_PER_WINDOW),
+        ),
+        (
+            "limits.authentication_failures_per_window",
+            raw.authentication_failures_per_window
+                .unwrap_or(DEFAULT_AUTHENTICATION_FAILURES_PER_WINDOW),
+        ),
+    ] {
+        if value == 0 || value > MAX_RATE_ALLOWANCE {
+            return Err(validation(
+                field.to_owned(),
+                "must be between 1 and 1000000",
+            ));
+        }
+    }
+    for (field, value) in [
+        (
+            "limits.session_request_window_seconds",
+            raw.session_request_window_seconds
+                .unwrap_or(DEFAULT_SESSION_REQUEST_WINDOW.as_secs()),
+        ),
+        (
+            "limits.authentication_failure_window_seconds",
+            raw.authentication_failure_window_seconds
+                .unwrap_or(DEFAULT_AUTHENTICATION_FAILURE_WINDOW.as_secs()),
         ),
     ] {
         if value == 0 || value > MAX_TIMEOUT_SECONDS {
@@ -929,6 +1003,143 @@ user_policy = "same-as-auth-user"
             Target::Ssh(target)
                 if target.user_policy == SshUserPolicy::SameAsAuthenticatedUser
         ));
+    }
+
+    #[test]
+    fn missing_rate_limit_fields_use_documented_mode_independent_defaults() {
+        let dev = parse(COMPLETE_CONFIG).unwrap();
+        assert_eq!(dev.limits.session_requests_per_window, 10);
+        assert_eq!(dev.limits.session_request_window, Duration::from_secs(60));
+        assert_eq!(dev.limits.authentication_failures_per_window, 20);
+        assert_eq!(
+            dev.limits.authentication_failure_window,
+            Duration::from_secs(60)
+        );
+
+        for source in [
+            COMPLETE_CONFIG.replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"",
+            ),
+            COMPLETE_CONFIG
+                .replace("mode = \"dev\"", "mode = \"production\"")
+                .replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
+                )
+                .replace(
+                    "provider = \"dev\"\nuser = \"local\"",
+                    "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"",
+                ),
+        ] {
+            let config = parse(&source).unwrap();
+            assert_eq!(config.limits, dev.limits);
+        }
+    }
+
+    #[test]
+    fn zero_rate_allowances_and_windows_fail_closed() {
+        for (field, value) in [
+            ("session_requests_per_window", "0"),
+            ("session_request_window_seconds", "0"),
+            ("authentication_failures_per_window", "0"),
+            ("authentication_failure_window_seconds", "0"),
+        ] {
+            let source = COMPLETE_CONFIG.replace(
+                "absolute_timeout_seconds = 14400",
+                &format!("absolute_timeout_seconds = 14400\n{field} = {value}"),
+            );
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("limits.{field}")),
+                "{error:?} did not contain {field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_rate_limit_configuration_is_typed() {
+        let source = COMPLETE_CONFIG.replace(
+            "absolute_timeout_seconds = 14400",
+            "absolute_timeout_seconds = 14400\nsession_requests_per_window = 7\nsession_request_window_seconds = 11\nauthentication_failures_per_window = 13\nauthentication_failure_window_seconds = 17",
+        );
+        let limits = parse(&source).unwrap().limits;
+        assert_eq!(limits.session_requests_per_window, 7);
+        assert_eq!(limits.session_request_window, Duration::from_secs(11));
+        assert_eq!(limits.authentication_failures_per_window, 13);
+        assert_eq!(
+            limits.authentication_failure_window,
+            Duration::from_secs(17)
+        );
+    }
+
+    #[test]
+    fn overflowing_rate_limit_values_fail_closed_without_reflection() {
+        for (field, value) in [
+            ("session_requests_per_window", "1000001"),
+            ("session_request_window_seconds", "31622401"),
+            ("authentication_failures_per_window", "1000001"),
+            ("authentication_failure_window_seconds", "31622401"),
+        ] {
+            let source = COMPLETE_CONFIG.replace(
+                "absolute_timeout_seconds = 14400",
+                &format!("absolute_timeout_seconds = 14400\n{field} = {value}"),
+            );
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains(&format!("limits.{field}")));
+            assert!(!error.contains(value));
+        }
+    }
+
+    #[test]
+    fn unknown_rate_limit_fields_remain_rejected() {
+        let source = COMPLETE_CONFIG.replace(
+            "absolute_timeout_seconds = 14400",
+            "absolute_timeout_seconds = 14400\nsession_request_burst_typo = 10",
+        );
+        let error = parse(&source).unwrap_err().to_string();
+        assert!(matches!(parse(&source), Err(ConfigError::Parse { .. })));
+        assert!(!error.contains("local-shell"));
+    }
+
+    #[test]
+    fn rate_limit_configuration_is_compatible_with_all_transport_modes() {
+        let explicit = "\nsession_requests_per_window = 7\nsession_request_window_seconds = 11\nauthentication_failures_per_window = 13\nauthentication_failure_window_seconds = 17";
+        let sources = [
+            COMPLETE_CONFIG.replace(
+                "absolute_timeout_seconds = 14400",
+                &format!("absolute_timeout_seconds = 14400{explicit}"),
+            ),
+            COMPLETE_CONFIG
+                .replace(
+                    "absolute_timeout_seconds = 14400",
+                    &format!("absolute_timeout_seconds = 14400{explicit}"),
+                )
+                .replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"",
+                ),
+            COMPLETE_CONFIG
+                .replace(
+                    "absolute_timeout_seconds = 14400",
+                    &format!("absolute_timeout_seconds = 14400{explicit}"),
+                )
+                .replace("mode = \"dev\"", "mode = \"production\"")
+                .replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
+                )
+                .replace(
+                    "provider = \"dev\"\nuser = \"local\"",
+                    "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"",
+                ),
+        ];
+
+        for source in sources {
+            let limits = parse(&source).unwrap().limits;
+            assert_eq!(limits.session_requests_per_window, 7);
+            assert_eq!(limits.authentication_failures_per_window, 13);
+        }
     }
 
     fn config_with_target(target: &str) -> String {

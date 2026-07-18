@@ -3,6 +3,7 @@ pub mod config;
 pub mod origin;
 pub mod protocol;
 mod pty_backend;
+pub mod rate_limit;
 pub mod server;
 pub mod session;
 pub mod startup;

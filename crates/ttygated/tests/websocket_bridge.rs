@@ -53,6 +53,10 @@ fn limits() -> Limits {
         max_sessions_per_user: 4,
         idle_timeout: Duration::from_secs(5),
         absolute_timeout: Duration::from_secs(10),
+        session_requests_per_window: 10,
+        session_request_window: Duration::from_secs(60),
+        authentication_failures_per_window: 20,
+        authentication_failure_window: Duration::from_secs(60),
     }
 }
 
@@ -106,6 +110,23 @@ fn state() -> AppState {
     state_with_target(target())
 }
 
+async fn issue_ticket(state: &AppState, identity: Identity, target: Target) -> String {
+    let reservation = state
+        .sessions()
+        .reserve(
+            &identity,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    state
+        .tickets()
+        .issue(identity, target, reservation)
+        .unwrap()
+        .as_str()
+        .to_owned()
+}
+
 async fn start_server_with_state(state: AppState) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -142,6 +163,43 @@ async fn provision_cookie(address: SocketAddr) -> String {
         .next()
         .unwrap()
         .to_owned()
+}
+
+async fn create_session_over_http(address: SocketAddr, cookie: &str) -> (StatusCode, String) {
+    let body = r#"{"target":"fixture"}"#;
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /api/sessions HTTP/1.1\r\nHost: {address}\r\nOrigin: {ORIGIN}\r\nCookie: {cookie}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .unwrap();
+    (status, response)
+}
+
+async fn issue_ticket_over_http(address: SocketAddr, cookie: &str) -> Option<String> {
+    let (status, response) = create_session_over_http(address, cookie).await;
+    if status != StatusCode::CREATED {
+        return None;
+    }
+    let body = response.split_once("\r\n\r\n")?.1;
+    serde_json::from_str::<serde_json::Value>(body).ok()?["ticket"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn websocket_request(
@@ -408,7 +466,8 @@ async fn websocket_rejects_query_and_subprotocol_authority_channels() {
 async fn missing_malformed_unknown_and_wrong_identity_handshakes_start_no_session() {
     let state = state();
     let mut events = state.sessions().subscribe_events();
-    let tickets = state.tickets();
+    let wrong_identity_ticket =
+        issue_ticket(&state, Identity::new("another-user").unwrap(), target()).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
 
@@ -421,13 +480,7 @@ async fn missing_malformed_unknown_and_wrong_identity_handshakes_start_no_sessio
     for handshake in [
         "not-json".to_owned(),
         format!(r#"{{"ticket":"{}"}}"#, "A".repeat(43)),
-        format!(
-            r#"{{"ticket":"{}"}}"#,
-            tickets
-                .issue(Identity::new("another-user").unwrap(), target())
-                .unwrap()
-                .as_str()
-        ),
+        format!(r#"{{"ticket":"{wrong_identity_ticket}"}}"#),
     ] {
         let mut socket = connect_websocket(server.address, &cookie).await;
         socket
@@ -450,12 +503,7 @@ async fn missing_malformed_unknown_and_wrong_identity_handshakes_start_no_sessio
 async fn valid_ticket_starts_once_and_reuse_starts_no_second_session() {
     let state = state();
     let mut events = state.sessions().subscribe_events();
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), target())
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), target()).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
 
@@ -498,6 +546,40 @@ async fn valid_ticket_starts_once_and_reuse_starts_no_second_session() {
 }
 
 #[tokio::test]
+async fn development_authority_path_recovers_ticket_capacity_after_real_pty_close() {
+    let configured = fixture_target(&[], false);
+    let mut configured_limits = limits();
+    configured_limits.max_sessions = 2;
+    configured_limits.max_sessions_per_user = 1;
+    let state = state_with_all(
+        configured,
+        TicketStore::new(Duration::from_secs(10), 32),
+        Arc::new(DevAuthProvider::new("developer").unwrap()),
+        configured_limits,
+    );
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let ticket = issue_ticket_over_http(server.address, &cookie)
+        .await
+        .expect("first ticket");
+    let rejected = create_session_over_http(server.address, &cookie).await;
+    assert_eq!(rejected.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(rejected.1.contains("identity-session-limit"));
+
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    collect_binary_until(&mut socket, b"READY").await;
+    socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        issue_ticket_over_http(server.address, &cookie)
+            .await
+            .is_some(),
+        "capacity did not recover after real development PTY close"
+    );
+}
+
+#[tokio::test]
 async fn wrong_identity_does_not_consume_the_ticket_through_websocket() {
     let configured = fixture_target(&[], false);
     let state = state_with_components(
@@ -505,12 +587,7 @@ async fn wrong_identity_does_not_consume_the_ticket_through_websocket() {
         TicketStore::new(Duration::from_secs(10), 32),
         Arc::new(CookieIdentityAuth),
     );
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("alice").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("alice").unwrap(), configured).await;
     let mut events = state.sessions().subscribe_events();
     let server = start_server_with_state(state).await;
 
@@ -537,12 +614,7 @@ async fn fragmented_transport_is_reassembled_before_handshake_parsing() {
     let configured = fixture_target(&[], false);
     let state = state_with_target(configured.clone());
     let mut events = state.sessions().subscribe_events();
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut socket = connect_websocket(server.address, &cookie).await;
@@ -580,12 +652,7 @@ async fn fragmented_transport_is_reassembled_before_handshake_parsing() {
 async fn ping_before_handshake_does_not_replace_or_extend_the_ticket_message() {
     let configured = fixture_target(&[], false);
     let state = state_with_target(configured.clone());
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut socket = connect_websocket(server.address, &cookie).await;
@@ -606,12 +673,12 @@ async fn expired_ssh_and_spawn_failure_tickets_are_safe_and_consumed() {
         TicketStore::new(Duration::from_millis(5), 32),
         Arc::new(DevAuthProvider::new("developer").unwrap()),
     );
-    let expired = expired_state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), expired_target)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let expired = issue_ticket(
+        &expired_state,
+        Identity::new("developer").unwrap(),
+        expired_target,
+    )
+    .await;
     let expired_server = start_server_with_state(expired_state).await;
     let expired_cookie = provision_cookie(expired_server.address).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -643,12 +710,7 @@ async fn expired_ssh_and_spawn_failure_tickets_are_safe_and_consumed() {
 
 async fn assert_consumed_start_failure(target: Target, expected_code: &str) {
     let state = state_with_target(target.clone());
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), target)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), target).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
 
@@ -672,12 +734,7 @@ async fn successful_ticket_bridges_real_pty_echo_resize_and_natural_exit() {
     let configured = fixture_target(&["natural-resistant", "/configured/path"], false);
     let state = state_with_target(configured.clone());
     let mut events = state.sessions().subscribe_events();
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut socket = connect_websocket(server.address, &cookie).await;
@@ -760,18 +817,13 @@ async fn reconnect_after_explicit_close_preserves_the_next_natural_exit_status()
     let configured = fixture_target(&[], false);
     let state = state_with_target(configured.clone());
     let mut events = state.sessions().subscribe_events();
-    let first_ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured.clone())
-        .unwrap()
-        .as_str()
-        .to_owned();
-    let second_ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let first_ticket = issue_ticket(
+        &state,
+        Identity::new("developer").unwrap(),
+        configured.clone(),
+    )
+    .await;
+    let second_ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
 
@@ -821,12 +873,7 @@ async fn explicit_close_is_orderly_and_malformed_control_closes_with_1008() {
     for malformed in [false, true] {
         let configured = fixture_target(&[], false);
         let state = state_with_target(configured.clone());
-        let ticket = state
-            .tickets()
-            .issue(Identity::new("developer").unwrap(), configured)
-            .unwrap()
-            .as_str()
-            .to_owned();
+        let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
         let server = start_server_with_state(state).await;
         let cookie = provision_cookie(server.address).await;
         let mut socket = connect_websocket(server.address, &cookie).await;
@@ -868,12 +915,7 @@ async fn explicit_close_is_orderly_and_malformed_control_closes_with_1008() {
 async fn read_only_input_is_rejected_before_the_real_pty() {
     let configured = fixture_target(&[], true);
     let state = state_with_target(configured.clone());
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut socket = connect_websocket(server.address, &cookie).await;
@@ -899,12 +941,7 @@ async fn read_only_input_is_rejected_before_the_real_pty() {
 async fn dropped_transport_reaps_real_leader_and_descendant() {
     let configured = fixture_target(&["ignore-hup"], false);
     let state = state_with_target(configured.clone());
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut socket = connect_websocket(server.address, &cookie).await;
@@ -960,12 +997,7 @@ async fn oversized_handshake_and_post_handshake_control_close_with_1009() {
 
     let configured = fixture_target(&[], false);
     let state = state_with_target(configured.clone());
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut protocol = connect_websocket(server.address, &cookie).await;
@@ -984,12 +1016,7 @@ async fn oversized_handshake_and_post_handshake_control_close_with_1009() {
 
     let configured = fixture_target(&[], false);
     let state = state_with_target(configured.clone());
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut binary = connect_websocket(server.address, &cookie).await;
@@ -1018,12 +1045,7 @@ async fn oversized_handshake_and_post_handshake_control_close_with_1009() {
 async fn non_reading_client_drop_during_output_flood_reaps_process_group() {
     let configured = fixture_target(&["flood"], false);
     let state = state_with_target(configured.clone());
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut socket = connect_websocket(server.address, &cookie).await;
@@ -1055,14 +1077,13 @@ async fn connected_non_reader_backpressures_the_real_producer_until_timeout_reap
             max_sessions_per_user: 4,
             idle_timeout: Duration::from_secs(5),
             absolute_timeout: Duration::from_secs(2),
+            session_requests_per_window: 10,
+            session_request_window: Duration::from_secs(60),
+            authentication_failures_per_window: 20,
+            authentication_failure_window: Duration::from_secs(60),
         },
     );
-    let ticket = state
-        .tickets()
-        .issue(Identity::new("developer").unwrap(), configured)
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), configured).await;
     let server = start_server_with_state(state).await;
     let cookie = provision_cookie(server.address).await;
     let mut socket = connect_websocket(server.address, &cookie).await;

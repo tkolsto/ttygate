@@ -110,6 +110,8 @@ pub enum SessionError {
     TargetUnavailable,
     #[error("The terminal session manager is shutting down.")]
     ManagerClosed,
+    #[error("The session reservation is unavailable.")]
+    ReservationUnavailable,
     #[error("The terminal backend is unavailable.")]
     BackendUnavailable,
     #[error("The terminal session is closed.")]
@@ -188,96 +190,242 @@ struct Capacity {
 struct CapacityInner {
     max_sessions: usize,
     max_sessions_per_identity: usize,
-    counts: Mutex<CapacityCounts>,
+    state: Mutex<CapacityState>,
+    clock: Arc<dyn CapacityClock>,
 }
 
 #[derive(Debug, Default)]
-struct CapacityCounts {
-    total: usize,
-    by_identity: HashMap<Identity, usize>,
+struct CapacityState {
+    next_id: u64,
+    closed: bool,
+    leases: HashMap<u64, Lease>,
+}
+
+#[derive(Debug)]
+struct Lease {
+    identity: Identity,
+    state: LeaseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseState {
+    Pending { expires_at: Instant },
+    Live,
+}
+
+trait CapacityClock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug)]
+struct SystemCapacityClock;
+
+impl CapacityClock for SystemCapacityClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 impl Capacity {
     fn new(limits: &Limits) -> Self {
+        Self::with_clock(limits, Arc::new(SystemCapacityClock))
+    }
+
+    fn with_clock(limits: &Limits, clock: Arc<dyn CapacityClock>) -> Self {
         Self {
             inner: Arc::new(CapacityInner {
                 max_sessions: limits.max_sessions,
                 max_sessions_per_identity: limits.max_sessions_per_user,
-                counts: Mutex::new(CapacityCounts::default()),
+                state: Mutex::new(CapacityState::default()),
+                clock,
             }),
         }
     }
 
     fn reserve(&self, identity: &Identity) -> Result<Reservation, SessionError> {
-        let mut counts = self
+        self.reserve_with_state(identity, LeaseState::Live)
+    }
+
+    fn reserve_pending(
+        &self,
+        identity: &Identity,
+        expires_at: Instant,
+    ) -> Result<Reservation, SessionError> {
+        if expires_at <= self.inner.clock.now() {
+            return Err(SessionError::ReservationUnavailable);
+        }
+        self.reserve_with_state(identity, LeaseState::Pending { expires_at })
+    }
+
+    fn reserve_with_state(
+        &self,
+        identity: &Identity,
+        lease_state: LeaseState,
+    ) -> Result<Reservation, SessionError> {
+        let mut state = self
             .inner
-            .counts
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if counts.total >= self.inner.max_sessions {
+        let now = self.inner.clock.now();
+        purge_expired_leases(&mut state, now);
+        if matches!(
+            lease_state,
+            LeaseState::Pending { expires_at } if expires_at <= now
+        ) {
+            return Err(SessionError::ReservationUnavailable);
+        }
+        if state.closed {
+            return Err(SessionError::ManagerClosed);
+        }
+        if state.leases.len() >= self.inner.max_sessions {
             return Err(SessionError::GlobalLimit);
         }
-        let identity_count = counts.by_identity.get(identity).copied().unwrap_or(0);
+        let identity_count = state
+            .leases
+            .values()
+            .filter(|lease| &lease.identity == identity)
+            .count();
         if identity_count >= self.inner.max_sessions_per_identity {
             return Err(SessionError::IdentityLimit);
         }
-        counts.total += 1;
-        counts
-            .by_identity
-            .insert(identity.clone(), identity_count + 1);
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.leases.insert(
+            id,
+            Lease {
+                identity: identity.clone(),
+                state: lease_state,
+            },
+        );
         Ok(Reservation {
             capacity: Arc::clone(&self.inner),
-            identity: Some(identity.clone()),
+            id: Some(id),
         })
     }
 
     #[cfg(test)]
     fn active(&self) -> (usize, usize) {
-        let counts = self
+        let mut state = self
             .inner
-            .counts
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        purge_expired_leases(&mut state, self.inner.clock.now());
+        let mut by_identity = HashMap::<Identity, usize>::new();
+        for lease in state.leases.values() {
+            *by_identity.entry(lease.identity.clone()).or_default() += 1;
+        }
         (
-            counts.total,
-            counts.by_identity.values().copied().max().unwrap_or(0),
+            state.leases.len(),
+            by_identity.values().copied().max().unwrap_or(0),
         )
     }
+
+    fn close_pending(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        state
+            .leases
+            .retain(|_, lease| lease.state == LeaseState::Live);
+    }
+}
+
+fn purge_expired_leases(state: &mut CapacityState, now: Instant) {
+    state.leases.retain(|_, lease| {
+        !matches!(
+            lease.state,
+            LeaseState::Pending { expires_at } if expires_at <= now
+        )
+    });
 }
 
 #[derive(Debug)]
 struct Reservation {
     capacity: Arc<CapacityInner>,
-    identity: Option<Identity>,
+    id: Option<u64>,
+}
+
+impl Reservation {
+    fn activate(self, identity: &Identity) -> Result<Self, SessionError> {
+        let Some(id) = self.id else {
+            return Err(SessionError::ReservationUnavailable);
+        };
+        let mut state = self
+            .capacity
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        purge_expired_leases(&mut state, self.capacity.clock.now());
+        if state.closed {
+            return Err(SessionError::ManagerClosed);
+        }
+        let lease = state
+            .leases
+            .get_mut(&id)
+            .ok_or(SessionError::ReservationUnavailable)?;
+        if &lease.identity != identity || lease.state == LeaseState::Live {
+            return Err(SessionError::ReservationUnavailable);
+        }
+        lease.state = LeaseState::Live;
+        drop(state);
+        Ok(self)
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let Some(identity) = self.identity.take() else {
+        let Some(id) = self.id.take() else {
             return;
         };
-        let mut counts = self
-            .capacity
-            .counts
+        self.capacity
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        counts.total = counts
-            .total
-            .checked_sub(1)
-            .expect("a live reservation contributes to total");
-        let remove_identity = {
-            let identity_count = counts
-                .by_identity
-                .get_mut(&identity)
-                .expect("a live reservation contributes to its identity");
-            *identity_count = identity_count
-                .checked_sub(1)
-                .expect("a live reservation has a positive identity count");
-            *identity_count == 0
-        };
-        if remove_identity {
-            counts.by_identity.remove(&identity);
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .leases
+            .remove(&id);
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionReservation {
+    inner: Reservation,
+}
+
+impl SessionReservation {
+    fn activate(self, identity: &Identity) -> Result<Reservation, SessionError> {
+        self.inner.activate(identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reservation(identity: &Identity) -> Self {
+        Capacity::new(&Limits {
+            max_sessions: 1,
+            max_sessions_per_user: 1,
+            idle_timeout: Duration::from_secs(60),
+            absolute_timeout: Duration::from_secs(600),
+            session_requests_per_window: 10,
+            session_request_window: Duration::from_secs(60),
+            authentication_failures_per_window: 20,
+            authentication_failure_window: Duration::from_secs(60),
+        })
+        .reserve_session(identity, Instant::now() + Duration::from_secs(60))
+        .expect("test capacity permits one reservation")
+    }
+}
+
+impl Capacity {
+    fn reserve_session(
+        &self,
+        identity: &Identity,
+        expires_at: Instant,
+    ) -> Result<SessionReservation, SessionError> {
+        self.reserve_pending(identity, expires_at)
+            .map(|inner| SessionReservation { inner })
     }
 }
 
@@ -385,8 +533,62 @@ impl SessionManager {
             Ok(Target::Ssh(_)) | Err(_) => return Err(SessionError::TargetUnavailable),
         };
         validate_resize(&initial_size)?;
-        let created_at = Instant::now();
         let reservation = self.capacity.reserve(&identity)?;
+        self.start_admitted(identity, target, initial_size, reservation)
+    }
+
+    pub async fn reserve(
+        &self,
+        identity: &Identity,
+        expires_at: Instant,
+    ) -> Result<SessionReservation, SessionError> {
+        let _admission = self.supervisors.admission.read().await;
+        if self
+            .supervisors
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutting_down
+        {
+            return Err(SessionError::ManagerClosed);
+        }
+        self.capacity.reserve_session(identity, expires_at)
+    }
+
+    pub async fn start_reserved(
+        &self,
+        reservation: SessionReservation,
+        identity: Identity,
+        target_name: &str,
+        initial_size: Resize,
+    ) -> Result<Session, SessionError> {
+        let _admission = self.supervisors.admission.read().await;
+        if self
+            .supervisors
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutting_down
+        {
+            return Err(SessionError::ManagerClosed);
+        }
+        let target = match self.targets.resolve(target_name) {
+            Ok(Target::Pty(configured)) => configured.clone(),
+            Ok(Target::Ssh(_)) | Err(_) => return Err(SessionError::TargetUnavailable),
+        };
+        validate_resize(&initial_size)?;
+        let reservation = reservation.activate(&identity)?;
+        self.start_admitted(identity, target, initial_size, reservation)
+    }
+
+    fn start_admitted(
+        &self,
+        identity: Identity,
+        target: PtyTarget,
+        initial_size: Resize,
+        reservation: Reservation,
+    ) -> Result<Session, SessionError> {
+        let created_at = Instant::now();
         let mut state = StateMachine::new();
         let (event_tx, event_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
 
@@ -495,6 +697,7 @@ impl SessionManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             registry.shutting_down = true;
+            self.capacity.close_pending();
             registry
                 .active
                 .values()
@@ -859,7 +1062,7 @@ async fn join_worker(mut worker: JoinHandle<()>) {
 mod tests {
     use std::{
         os::unix::process::ExitStatusExt,
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, Mutex as StdMutex},
         thread,
         time::{Duration, SystemTime},
     };
@@ -867,8 +1070,9 @@ mod tests {
     use crate::{
         config::{Limits, PtyTarget, Target, TargetAllowlist},
         protocol::{MAX_BINARY_BYTES, Resize},
-        ticket::Identity,
+        ticket::{Identity, TicketGrant, TicketStore},
     };
+    use tokio::time::Instant;
 
     use super::{
         Capacity, ChildOutcome, LifecycleEvent, LifecycleTransition, SessionCloseReason,
@@ -994,6 +1198,10 @@ mod tests {
             max_sessions_per_user: per_identity,
             idle_timeout: Duration::from_secs(60),
             absolute_timeout: Duration::from_secs(600),
+            session_requests_per_window: 10,
+            session_request_window: Duration::from_secs(60),
+            authentication_failures_per_window: 20,
+            authentication_failure_window: Duration::from_secs(60),
         }
     }
 
@@ -1019,6 +1227,166 @@ mod tests {
         let carol_reservation = capacity.reserve(&carol).unwrap();
         assert_eq!(capacity.active(), (2, 1));
         drop((bob_reservation, carol_reservation));
+        assert_eq!(capacity.active(), (0, 0));
+    }
+
+    #[test]
+    fn pending_lease_reserves_global_capacity_before_spawn() {
+        let capacity = Capacity::new(&limits(1, 1));
+        let alice = Identity::new("alice").unwrap();
+        let bob = Identity::new("bob").unwrap();
+        let pending = capacity
+            .reserve_pending(&alice, Instant::now() + Duration::from_secs(10))
+            .unwrap();
+
+        assert!(matches!(
+            capacity.reserve(&bob),
+            Err(SessionError::GlobalLimit)
+        ));
+        drop(pending);
+        assert!(capacity.reserve(&bob).is_ok());
+    }
+
+    #[derive(Debug)]
+    struct ManualCapacityClock(StdMutex<Instant>);
+
+    impl super::CapacityClock for ManualCapacityClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[derive(Debug)]
+    struct AdvancingCapacityClock {
+        start: Instant,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::CapacityClock for AdvancingCapacityClock {
+        fn now(&self) -> Instant {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.start
+            } else {
+                self.start + Duration::from_secs(10)
+            }
+        }
+    }
+
+    #[test]
+    fn pending_lease_expiry_uses_a_deterministic_exact_boundary_clock() {
+        let start = Instant::now();
+        let clock = Arc::new(ManualCapacityClock(StdMutex::new(start)));
+        let capacity = Capacity::with_clock(&limits(1, 1), clock.clone());
+        let alice = Identity::new("alice").unwrap();
+        let bob = Identity::new("bob").unwrap();
+        let pending = capacity
+            .reserve_pending(&alice, start + Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            capacity.reserve(&bob),
+            Err(SessionError::GlobalLimit)
+        ));
+
+        *clock.0.lock().unwrap() = start + Duration::from_secs(10);
+        let replacement = capacity
+            .reserve(&bob)
+            .expect("capacity must recover at the exact deadline");
+        drop((pending, replacement));
+        assert_eq!(capacity.active(), (0, 0));
+    }
+
+    #[test]
+    fn pending_deadline_is_rechecked_atomically_at_insertion() {
+        let start = Instant::now();
+        let capacity = Capacity::with_clock(
+            &limits(1, 1),
+            Arc::new(AdvancingCapacityClock {
+                start,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        let alice = Identity::new("alice").unwrap();
+
+        assert!(matches!(
+            capacity.reserve_pending(&alice, start + Duration::from_secs(10)),
+            Err(SessionError::ReservationUnavailable)
+        ));
+        assert_eq!(capacity.active(), (0, 0));
+    }
+
+    #[test]
+    fn pending_lease_reserves_per_identity_capacity_before_spawn() {
+        let capacity = Capacity::new(&limits(2, 1));
+        let alice = Identity::new("alice").unwrap();
+        let pending = capacity
+            .reserve_pending(&alice, Instant::now() + Duration::from_secs(10))
+            .unwrap();
+
+        assert!(matches!(
+            capacity.reserve_pending(&alice, Instant::now() + Duration::from_secs(10)),
+            Err(SessionError::IdentityLimit)
+        ));
+        assert_eq!(capacity.active(), (1, 1));
+        drop(pending);
+    }
+
+    #[test]
+    fn already_expired_pending_lease_is_rejected_without_consuming_capacity() {
+        let capacity = Capacity::new(&limits(1, 1));
+        let alice = Identity::new("alice").unwrap();
+        let bob = Identity::new("bob").unwrap();
+        assert!(matches!(
+            capacity.reserve_pending(&alice, Instant::now()),
+            Err(SessionError::ReservationUnavailable)
+        ));
+
+        let replacement = capacity
+            .reserve_pending(&bob, Instant::now() + Duration::from_secs(10))
+            .expect("a rejected expired lease must not retain capacity");
+        assert_eq!(capacity.active(), (1, 1));
+        drop(replacement);
+        assert_eq!(capacity.active(), (0, 0));
+    }
+
+    #[test]
+    fn concurrent_pending_leases_have_exactly_configured_winners() {
+        let capacity = Arc::new(Capacity::new(&limits(4, 2)));
+        let barrier = Arc::new(Barrier::new(17));
+        let handles: Vec<_> = (0..16)
+            .map(|index| {
+                let capacity = Arc::clone(&capacity);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let identity = Identity::new(format!("user-{}", index % 2)).unwrap();
+                    barrier.wait();
+                    capacity.reserve_pending(&identity, Instant::now() + Duration::from_secs(10))
+                })
+            })
+            .collect();
+        barrier.wait();
+        let reservations: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().ok())
+            .collect();
+        assert_eq!(reservations.len(), 4);
+        assert_eq!(capacity.active(), (4, 2));
+        drop(reservations);
+        assert_eq!(capacity.active(), (0, 0));
+    }
+
+    #[test]
+    fn wrong_identity_cannot_activate_a_pending_lease() {
+        let capacity = Capacity::new(&limits(1, 1));
+        let alice = Identity::new("alice").unwrap();
+        let bob = Identity::new("bob").unwrap();
+        let pending = capacity
+            .reserve_pending(&alice, Instant::now() + Duration::from_secs(10))
+            .unwrap();
+
+        assert!(matches!(
+            pending.activate(&bob),
+            Err(SessionError::ReservationUnavailable)
+        ));
         assert_eq!(capacity.active(), (0, 0));
     }
 
@@ -1258,6 +1626,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_capacity_transfers_to_live_session_without_duplication() {
+        let manager = manager(limits(1, 1), &[fixture_target(false)]);
+        let identity = Identity::new("alice").unwrap();
+        let reservation = manager
+            .reserve(&identity, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(manager.capacity.active(), (1, 1));
+
+        let mut session = manager
+            .start_reserved(
+                reservation,
+                identity,
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.capacity.active(), (1, 1));
+        session.close().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(manager.capacity.active(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_releases_outstanding_pending_reservations() {
+        let manager = manager(limits(1, 1), &[fixture_target(false)]);
+        let identity = Identity::new("alice").unwrap();
+        let reservation = manager
+            .reserve(&identity, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let tickets = TicketStore::new(Duration::from_secs(10), 1);
+        tickets
+            .issue(identity, Target::Pty(fixture_target(false)), reservation)
+            .unwrap();
+        assert_eq!(manager.capacity.active(), (1, 1));
+
+        manager.shutdown().await;
+        assert_eq!(manager.capacity.active(), (0, 0));
+        drop(tickets);
+        assert_eq!(manager.capacity.active(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn ticket_owned_pending_capacity_releases_during_unwind() {
+        let manager = manager(limits(1, 1), &[fixture_target(false)]);
+        let identity = Identity::new("alice").unwrap();
+        let reservation = manager
+            .reserve(&identity, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tickets = TicketStore::new(Duration::from_secs(10), 1);
+            tickets
+                .issue(
+                    identity.clone(),
+                    Target::Pty(fixture_target(false)),
+                    reservation,
+                )
+                .unwrap();
+            panic!("intentional ticket ownership unwind");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(manager.capacity.active(), (0, 0));
+        assert!(
+            manager
+                .reserve(&identity, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_start_and_shutdown_leave_no_unowned_supervisor() {
         let target = PtyTarget {
             name: "short".to_owned(),
@@ -1442,6 +1884,85 @@ mod tests {
             .await
             .expect("spawn failure must release reservation");
         session.close().await.unwrap();
+    }
+
+    async fn issue_reserved_ticket(
+        manager: &SessionManager,
+        identity: &Identity,
+        target: Target,
+    ) -> TicketGrant {
+        let tickets = TicketStore::new(Duration::from_secs(10), 8);
+        let reservation = manager
+            .reserve(identity, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let ticket = tickets
+            .issue(identity.clone(), target, reservation)
+            .unwrap();
+        tickets.redeem(ticket.as_str(), identity).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ticket_owned_capacity_recovers_after_real_spawn_failure_exactly_once() {
+        let identity = Identity::new("alice").unwrap();
+        let mut missing = fixture_target(false);
+        missing.name = "missing".to_owned();
+        missing.executable = "/definitely/not/a/ttygate-program".into();
+        let manager = manager(limits(1, 1), &[missing.clone(), fixture_target(false)]);
+        let grant = issue_reserved_ticket(&manager, &identity, Target::Pty(missing)).await;
+        let (target, reservation) = grant.into_parts();
+
+        assert!(matches!(
+            manager
+                .start_reserved(
+                    reservation,
+                    identity.clone(),
+                    target.name(),
+                    Resize::new(80, 24).unwrap(),
+                )
+                .await,
+            Err(SessionError::SpawnUnavailable)
+        ));
+        assert_eq!(manager.capacity.active(), (0, 0));
+        assert!(
+            manager
+                .reserve(&identity, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_owned_capacity_recovers_after_dropped_resistant_session() {
+        let identity = Identity::new("alice").unwrap();
+        let mut resistant = fixture_target(false);
+        resistant.argv = vec!["ignore-hup".to_owned()];
+        let manager = manager(limits(1, 1), std::slice::from_ref(&resistant));
+        let grant = issue_reserved_ticket(&manager, &identity, Target::Pty(resistant)).await;
+        let (target, reservation) = grant.into_parts();
+        let session = manager
+            .start_reserved(
+                reservation,
+                identity.clone(),
+                target.name(),
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while manager.capacity.active() != (0, 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped resistant session did not release ticket capacity");
+        assert!(
+            manager
+                .reserve(&identity, Instant::now() + Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
     }
 
     async fn closed_event(session: &mut super::Session) -> LifecycleTransition {

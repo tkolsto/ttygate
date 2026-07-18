@@ -114,9 +114,10 @@ The first running build already enforces Origin checks and ticket-bound WebSocke
 
 ### Chunk 2.3 — Rate and concurrency limits
 
+- **Status:** complete (Refs #24). Monotonic bounded fixed-window limiters protect authenticated session requests and listener-peer authentication failures; ticket issuance atomically reserves global/per-identity capacity and transfers it exactly once to the live session.
 - **Deliverables:** rate limiting on `POST /api/sessions` and on auth failures; enforcement of global and per-user concurrency limits at ticket issue time (limits themselves defined in 1.4).
 - **Consumes:** ticket path (1.3), session manager (1.4).
-- **Done when:** tests prove limits trigger, return distinguishable errors, and recover after the window passes.
+- **Done when:** complete. Unit, HTTP, direct-TLS, trusted-proxy, WebSocket, and real-PTY tests prove exact and concurrent limits, distinguishable non-reflecting errors, window/expiry recovery, wrong-identity/replay safety, and teardown recovery.
 
 ### Chunk 2.4 — Audit subsystem
 
