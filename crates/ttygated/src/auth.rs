@@ -69,6 +69,12 @@ pub enum AuthError {
     MissingPeer,
     #[error("connection peer is not trusted")]
     UntrustedPeer,
+    #[error("configured identity header is missing")]
+    MissingIdentityHeader,
+    #[error("configured identity header is duplicated")]
+    DuplicateIdentityHeader,
+    #[error("configured identity header is invalid")]
+    InvalidIdentityHeader,
 }
 
 #[derive(Debug)]
@@ -198,12 +204,30 @@ impl TrustedProxyAuthProvider {
             Err(AuthError::UntrustedPeer)
         }
     }
+
+    fn identity_from_header(&self, headers: &HeaderMap) -> Result<Identity, AuthError> {
+        let mut values = headers.get_all(&self.identity_header).iter();
+        let value = values.next().ok_or(AuthError::MissingIdentityHeader)?;
+        if values.next().is_some() {
+            return Err(AuthError::DuplicateIdentityHeader);
+        }
+        let value =
+            std::str::from_utf8(value.as_bytes()).map_err(|_| AuthError::InvalidIdentityHeader)?;
+        if value.is_empty()
+            || value.len() > 128
+            || value.chars().any(char::is_whitespace)
+            || value.chars().any(char::is_control)
+        {
+            return Err(AuthError::InvalidIdentityHeader);
+        }
+        Identity::new(value).map_err(|_| AuthError::InvalidIdentityHeader)
+    }
 }
 
 impl AuthProvider for TrustedProxyAuthProvider {
     fn establish(&self, context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
         self.trusted_peer(context)?;
-        let _ = &self.identity_header;
+        let _identity = self.identity_from_header(context.headers())?;
         Err(AuthError::Missing)
     }
 
@@ -454,5 +478,203 @@ mod tests {
             )),
             Err(AuthError::UntrustedPeer)
         );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_missing_identity_header() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            provider.identity_from_header(&headers),
+            Err(AuthError::MissingIdentityHeader)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_duplicate_identity_headers_even_when_equal() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-authenticated-user",
+            HeaderValue::from_static("alice"),
+        );
+        headers.append(
+            "x-authenticated-user",
+            HeaderValue::from_static("alice"),
+        );
+
+        assert_eq!(
+            provider.identity_from_header(&headers),
+            Err(AuthError::DuplicateIdentityHeader)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_empty_and_whitespace_only_identity() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        for value in ["", " ", "\t", "  \t  "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-authenticated-user",
+                HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+            );
+            assert_eq!(
+                provider.identity_from_header(&headers),
+                Err(AuthError::InvalidIdentityHeader),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_leading_trailing_and_embedded_whitespace() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        for value in [" alice", "alice ", "ali ce", "ali\tce", "ali\u{a0}ce"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-authenticated-user",
+                HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+            );
+            assert_eq!(
+                provider.identity_from_header(&headers),
+                Err(AuthError::InvalidIdentityHeader),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_non_utf8_identity_header() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-authenticated-user",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+
+        assert_eq!(
+            provider.identity_from_header(&headers),
+            Err(AuthError::InvalidIdentityHeader)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_ascii_and_unicode_control_characters() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        for value in ["ali\tce", "ali\u{85}ce"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-authenticated-user",
+                HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+            );
+            assert_eq!(
+                provider.identity_from_header(&headers),
+                Err(AuthError::InvalidIdentityHeader),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_exact_128_byte_identity() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let value = "a".repeat(128);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-authenticated-user",
+            HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+        );
+
+        assert_eq!(
+            provider
+                .identity_from_header(&headers)
+                .unwrap()
+                .as_str(),
+            value
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_129_byte_identity() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let value = "a".repeat(129);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-authenticated-user",
+            HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+        );
+
+        assert_eq!(
+            provider.identity_from_header(&headers),
+            Err(AuthError::InvalidIdentityHeader)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_preserves_case_and_valid_unicode_bytes_without_normalization() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let values = ["Alice", "alice", "\u{e9}", "e\u{301}"];
+
+        let parsed = values.map(|value| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-authenticated-user",
+                HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+            );
+            provider.identity_from_header(&headers).unwrap()
+        });
+
+        for (identity, expected) in parsed.iter().zip(values) {
+            assert_eq!(identity.as_str().as_bytes(), expected.as_bytes());
+        }
+        assert_ne!(parsed[0], parsed[1]);
+        assert_ne!(parsed[2], parsed[3]);
+    }
+
+    #[test]
+    fn trusted_proxy_reads_only_the_configured_identity_header() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-auth-user", "alice"),
+            ("x-forwarded-user", "alice"),
+            ("forwarded", "for=alice"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+
+        assert_eq!(
+            provider.identity_from_header(&headers),
+            Err(AuthError::MissingIdentityHeader)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_header_errors_never_reflect_identity_peer_or_parser_text() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-authenticated-user",
+            HeaderValue::from_static("hostile identity sentinel"),
+        );
+
+        let error = provider.identity_from_header(&headers).unwrap_err().to_string();
+        for sentinel in ["hostile", "identity sentinel", "127.0.0.1"] {
+            assert!(!error.contains(sentinel), "{error:?} reflected {sentinel:?}");
+        }
+    }
+
+    #[test]
+    fn untrusted_peer_with_valid_identity_is_rejected_before_header_parsing() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-authenticated-user",
+            HeaderValue::from_static("valid-looking"),
+        );
+        let context = peer_context(&headers, Ipv4Addr::new(127, 0, 0, 2).into());
+
+        assert_eq!(provider.establish(&context), Err(AuthError::UntrustedPeer));
     }
 }
