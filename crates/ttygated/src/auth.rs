@@ -1,7 +1,13 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Mutex, time::Instant};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Mutex,
+    time::Instant,
+};
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ipnet::IpNet;
 use thiserror::Error;
 
 use crate::ticket::{Identity, IdentityError};
@@ -59,6 +65,10 @@ pub enum AuthError {
     Generation,
     #[error("configured identity is invalid")]
     InvalidIdentity,
+    #[error("connection peer address is unavailable")]
+    MissingPeer,
+    #[error("connection peer is not trusted")]
+    UntrustedPeer,
 }
 
 #[derive(Debug)]
@@ -152,14 +162,72 @@ impl AuthProvider for DevAuthProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("trusted proxy authentication configuration is invalid")]
+pub struct AuthProviderBuildError;
+
+#[derive(Debug)]
+pub struct TrustedProxyAuthProvider {
+    identity_header: HeaderName,
+    trusted_sources: Vec<IpNet>,
+}
+
+impl TrustedProxyAuthProvider {
+    pub fn new(
+        identity_header: HeaderName,
+        trusted_sources: Vec<IpNet>,
+    ) -> Result<Self, AuthProviderBuildError> {
+        if trusted_sources.is_empty() {
+            return Err(AuthProviderBuildError);
+        }
+        Ok(Self {
+            identity_header,
+            trusted_sources,
+        })
+    }
+
+    fn trusted_peer(&self, context: &AuthContext<'_>) -> Result<IpAddr, AuthError> {
+        let peer = context.peer_addr().ok_or(AuthError::MissingPeer)?.ip();
+        if self
+            .trusted_sources
+            .iter()
+            .any(|network| network.contains(&peer))
+        {
+            Ok(peer)
+        } else {
+            Err(AuthError::UntrustedPeer)
+        }
+    }
+}
+
+impl AuthProvider for TrustedProxyAuthProvider {
+    fn establish(&self, context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
+        self.trusted_peer(context)?;
+        let _ = &self.identity_header;
+        Err(AuthError::Missing)
+    }
+
+    fn authenticate(
+        &self,
+        context: &AuthContext<'_>,
+        _cookie_header: Option<&str>,
+    ) -> Result<Identity, AuthError> {
+        self.trusted_peer(context)?;
+        Err(AuthError::Missing)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use axum::http::{HeaderMap, HeaderValue, header};
+    use http::HeaderName;
+    use ipnet::IpNet;
 
     use super::{
         AuthContext, AuthError, AuthProvider, DevAuthProvider, MAX_SESSIONS, SESSION_COOKIE_NAME,
+        TrustedProxyAuthProvider,
     };
 
     fn context(headers: &HeaderMap) -> AuthContext<'_> {
@@ -167,6 +235,21 @@ mod tests {
             headers,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43210)),
         )
+    }
+
+    fn proxy(sources: &[&str]) -> TrustedProxyAuthProvider {
+        TrustedProxyAuthProvider::new(
+            HeaderName::from_static("x-authenticated-user"),
+            sources
+                .iter()
+                .map(|source| source.parse::<IpNet>().unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn peer_context(headers: &HeaderMap, peer: IpAddr) -> AuthContext<'_> {
+        AuthContext::new(headers, Some(SocketAddr::new(peer, 43210)))
     }
 
     #[test]
@@ -251,5 +334,125 @@ mod tests {
             Err(AuthError::Unknown)
         );
         assert!(provider.establish(&context).is_ok());
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_ipv4_network_and_broadcast_boundaries() {
+        let provider = proxy(&["192.0.2.0/30"]);
+        let headers = HeaderMap::new();
+
+        for peer in [Ipv4Addr::new(192, 0, 2, 0), Ipv4Addr::new(192, 0, 2, 3)] {
+            assert_eq!(
+                provider.trusted_peer(&peer_context(&headers, peer.into())),
+                Ok(IpAddr::V4(peer))
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_ipv4_peer_immediately_outside_cidr() {
+        let provider = proxy(&["192.0.2.0/30"]);
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            provider.trusted_peer(&peer_context(
+                &headers,
+                Ipv4Addr::new(192, 0, 2, 4).into()
+            )),
+            Err(AuthError::UntrustedPeer)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_ipv6_last_inside_and_rejects_first_outside() {
+        let provider = proxy(&["2001:db8::/126"]);
+        let headers = HeaderMap::new();
+        let inside = "2001:db8::3".parse::<Ipv6Addr>().unwrap();
+        let outside = "2001:db8::4".parse::<Ipv6Addr>().unwrap();
+
+        assert_eq!(
+            provider.trusted_peer(&peer_context(&headers, inside.into())),
+            Ok(IpAddr::V6(inside))
+        );
+        assert_eq!(
+            provider.trusted_peer(&peer_context(&headers, outside.into())),
+            Err(AuthError::UntrustedPeer)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_any_of_multiple_canonical_cidrs() {
+        let provider = proxy(&["192.0.2.0/24", "2001:db8:1::/48"]);
+        let headers = HeaderMap::new();
+
+        for peer in [
+            "192.0.2.99".parse::<IpAddr>().unwrap(),
+            "2001:db8:1::99".parse::<IpAddr>().unwrap(),
+        ] {
+            assert_eq!(
+                provider.trusted_peer(&peer_context(&headers, peer)),
+                Ok(peer)
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_requires_listener_supplied_peer_address() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            provider.trusted_peer(&AuthContext::new(&headers, None)),
+            Err(AuthError::MissingPeer)
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_is_not_silently_matched_as_ipv4() {
+        let provider = proxy(&["192.0.2.0/24"]);
+        let headers = HeaderMap::new();
+        let mapped = "::ffff:192.0.2.1".parse::<IpAddr>().unwrap();
+
+        assert_eq!(
+            provider.trusted_peer(&peer_context(&headers, mapped)),
+            Err(AuthError::UntrustedPeer)
+        );
+    }
+
+    #[test]
+    fn forwarded_address_headers_never_change_peer_trust() {
+        let provider = proxy(&["192.0.2.0/24"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("forwarded", HeaderValue::from_static("for=192.0.2.1"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.1"));
+        headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.1"));
+
+        assert_eq!(
+            provider.trusted_peer(&peer_context(
+                &headers,
+                Ipv4Addr::new(198, 51, 100, 1).into()
+            )),
+            Err(AuthError::UntrustedPeer)
+        );
+    }
+
+    #[test]
+    fn loopback_proxy_contract_matches_only_the_configured_loopback_source() {
+        let provider = proxy(&["127.0.0.1/32", "::1/128"]);
+        let headers = HeaderMap::new();
+
+        for peer in [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)] {
+            assert_eq!(
+                provider.trusted_peer(&peer_context(&headers, peer)),
+                Ok(peer)
+            );
+        }
+        assert_eq!(
+            provider.trusted_peer(&peer_context(
+                &headers,
+                Ipv4Addr::new(127, 0, 0, 2).into()
+            )),
+            Err(AuthError::UntrustedPeer)
+        );
     }
 }
