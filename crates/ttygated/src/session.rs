@@ -267,7 +267,14 @@ impl Capacity {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        purge_expired_leases(&mut state, self.inner.clock.now());
+        let now = self.inner.clock.now();
+        purge_expired_leases(&mut state, now);
+        if matches!(
+            lease_state,
+            LeaseState::Pending { expires_at } if expires_at <= now
+        ) {
+            return Err(SessionError::ReservationUnavailable);
+        }
         if state.closed {
             return Err(SessionError::ManagerClosed);
         }
@@ -1249,6 +1256,22 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AdvancingCapacityClock {
+        start: Instant,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::CapacityClock for AdvancingCapacityClock {
+        fn now(&self) -> Instant {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.start
+            } else {
+                self.start + Duration::from_secs(10)
+            }
+        }
+    }
+
     #[test]
     fn pending_lease_expiry_uses_a_deterministic_exact_boundary_clock() {
         let start = Instant::now();
@@ -1269,6 +1292,25 @@ mod tests {
             .reserve(&bob)
             .expect("capacity must recover at the exact deadline");
         drop((pending, replacement));
+        assert_eq!(capacity.active(), (0, 0));
+    }
+
+    #[test]
+    fn pending_deadline_is_rechecked_atomically_at_insertion() {
+        let start = Instant::now();
+        let capacity = Capacity::with_clock(
+            &limits(1, 1),
+            Arc::new(AdvancingCapacityClock {
+                start,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        let alice = Identity::new("alice").unwrap();
+
+        assert!(matches!(
+            capacity.reserve_pending(&alice, start + Duration::from_secs(10)),
+            Err(SessionError::ReservationUnavailable)
+        ));
         assert_eq!(capacity.active(), (0, 0));
     }
 

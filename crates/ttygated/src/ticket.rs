@@ -185,6 +185,9 @@ impl TicketStore {
         }
         for _ in 0..4 {
             let bytes = self.generator.generate()?;
+            if expiry.instant() <= self.clock.now() {
+                return Err(TicketError::Expired);
+            }
             let token = URL_SAFE_NO_PAD.encode(bytes);
             if !entries.contains_key(&token) {
                 entries.insert(
@@ -277,6 +280,13 @@ mod tests {
             let mut bytes = [0_u8; 32];
             bytes[..8].copy_from_slice(&self.0.fetch_add(1, Ordering::SeqCst).to_le_bytes());
             Ok(bytes)
+        }
+    }
+    struct ExpiringGenerator(Arc<ManualClock>);
+    impl TicketGenerator for ExpiringGenerator {
+        fn generate(&self) -> Result<[u8; 32], TicketError> {
+            self.0.millis.store(10, Ordering::SeqCst);
+            Ok([9; 32])
         }
     }
 
@@ -491,6 +501,33 @@ mod tests {
         let identity = Identity::new("dev").unwrap();
         let expiry = store.next_expiry();
         clock.millis.store(10, Ordering::SeqCst);
+
+        assert!(matches!(
+            store.issue_at(
+                identity.clone(),
+                target("shell"),
+                reservation(&identity),
+                expiry,
+            ),
+            Err(TicketError::Expired)
+        ));
+        assert!(store.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deadline_expiring_during_generation_is_rejected_at_insertion() {
+        let clock = Arc::new(ManualClock {
+            base: Instant::now(),
+            millis: AtomicU64::new(0),
+        });
+        let store = TicketStore::with_sources(
+            Duration::from_millis(10),
+            1,
+            clock.clone(),
+            Arc::new(ExpiringGenerator(clock)),
+        );
+        let identity = Identity::new("dev").unwrap();
+        let expiry = store.next_expiry();
 
         assert!(matches!(
             store.issue_at(
