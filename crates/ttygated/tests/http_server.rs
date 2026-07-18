@@ -67,6 +67,10 @@ impl AuthProvider for PeerRecordingAuthProvider {
 }
 
 fn app() -> axum::Router {
+    app_with_limits(limits())
+}
+
+fn app_with_limits(limits: Limits) -> axum::Router {
     let target = Target::Pty(PtyTarget {
         name: "shell".into(),
         executable: "/bin/sh".into(),
@@ -79,11 +83,15 @@ fn app() -> axum::Router {
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
         TicketStore::new(std::time::Duration::from_secs(10), 32),
-        limits(),
+        limits,
     ))
 }
 
 fn trusted_proxy_app() -> axum::Router {
+    trusted_proxy_app_with_limits(limits())
+}
+
+fn trusted_proxy_app_with_limits(limits: Limits) -> axum::Router {
     let target = Target::Pty(PtyTarget {
         name: "shell".into(),
         executable: "/bin/sh".into(),
@@ -102,7 +110,7 @@ fn trusted_proxy_app() -> axum::Router {
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
         TicketStore::new(std::time::Duration::from_secs(10), 32),
-        limits(),
+        limits,
     ))
 }
 
@@ -178,6 +186,283 @@ async fn provision_cookie(app: &axum::Router) -> String {
         .next()
         .unwrap()
         .to_owned()
+}
+
+#[tokio::test]
+async fn successful_authentication_does_not_consume_failure_allowance() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 1;
+    let app = app_with_limits(configured);
+    let cookie = provision_cookie(&app).await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            response(
+                &app,
+                "POST",
+                "/api/targets",
+                Some(ORIGIN),
+                Some(&cookie),
+                "",
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/targets",
+            Some(ORIGIN),
+            Some("ttygate_session=invalid"),
+            "",
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let limited = response(
+        &app,
+        "POST",
+        "/api/targets",
+        Some(ORIGIN),
+        Some("ttygate_session=invalid"),
+        "",
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        json(limited).await["error"]["code"],
+        "authentication-rate-limited"
+    );
+}
+
+#[tokio::test]
+async fn missing_malformed_and_invalid_cookie_failures_share_the_peer_budget() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 3;
+    let app = app_with_limits(configured);
+
+    assert_eq!(
+        response(&app, "POST", "/api/targets", Some(ORIGIN), None, "")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/targets",
+            Some(ORIGIN),
+            Some("ttygate_session=invalid"),
+            "",
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let duplicate = Request::builder()
+        .method("POST")
+        .uri("/api/targets")
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, "one=invalid")
+        .header(header::COOKIE, "two=invalid")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(duplicate).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(&app, "POST", "/api/targets", Some(ORIGIN), None, "")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn trusted_proxy_untrusted_peer_failures_use_only_the_actual_peer_budget() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 1;
+    let app = trusted_proxy_app_with_limits(configured);
+    let peer = "127.0.0.2:41000".parse().unwrap();
+
+    for (forwarded_for, expected) in [
+        (Some("198.51.100.1"), StatusCode::SERVICE_UNAVAILABLE),
+        (Some("203.0.113.9"), StatusCode::TOO_MANY_REQUESTS),
+    ] {
+        assert_eq!(
+            proxy_response(
+                &app,
+                ProxyRequest {
+                    uri: "/api/identity",
+                    origin: Some(ORIGIN),
+                    cookie: None,
+                    identities: &[HeaderValue::from_static("alice")],
+                    peer,
+                    forwarded_for,
+                    body: "",
+                },
+            )
+            .await
+            .status(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn independent_listener_peers_have_independent_failure_budgets() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 1;
+    let app = trusted_proxy_app_with_limits(configured);
+    for peer in ["127.0.0.2:41000", "127.0.0.3:41000"] {
+        assert_eq!(
+            proxy_response(
+                &app,
+                ProxyRequest {
+                    uri: "/api/identity",
+                    origin: Some(ORIGIN),
+                    cookie: None,
+                    identities: &[HeaderValue::from_static("alice")],
+                    peer: peer.parse().unwrap(),
+                    forwarded_for: Some("127.0.0.1"),
+                    body: "",
+                },
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}
+
+#[tokio::test]
+async fn ipv4_ipv6_and_mapped_peers_keep_listener_reported_failure_keys() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 1;
+    let app = app_with_limits(configured);
+    for peer in ["127.0.0.1:41000", "[::1]:41000", "[::ffff:127.0.0.1]:41000"] {
+        assert_eq!(
+            proxy_response(
+                &app,
+                ProxyRequest {
+                    uri: "/api/targets",
+                    origin: Some(ORIGIN),
+                    cookie: None,
+                    identities: &[],
+                    peer: peer.parse().unwrap(),
+                    forwarded_for: Some("192.0.2.1"),
+                    body: "",
+                },
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_authentication_failures_cannot_exceed_allowance() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 8;
+    let app = app_with_limits(configured);
+    let tasks = (0..32)
+        .map(|_| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                response(&app, "POST", "/api/targets", Some(ORIGIN), None, "")
+                    .await
+                    .status()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut unauthorized = 0;
+    let mut limited = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::UNAUTHORIZED => unauthorized += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            status => panic!("unexpected authentication status {status}"),
+        }
+    }
+    assert_eq!((unauthorized, limited), (8, 24));
+}
+
+#[tokio::test]
+async fn authentication_rate_errors_are_stable_and_non_reflecting() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 1;
+    let app = app_with_limits(configured);
+    for _ in 0..1 {
+        let _ = response(
+            &app,
+            "POST",
+            "/api/targets",
+            Some(ORIGIN),
+            Some("ttygate_session=hostile-cookie-sentinel"),
+            "",
+        )
+        .await;
+    }
+    let limited = response(
+        &app,
+        "POST",
+        "/api/targets",
+        Some(ORIGIN),
+        Some("ttygate_session=hostile-cookie-sentinel"),
+        "",
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers()[header::RETRY_AFTER], "60");
+    let body = json(limited).await;
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::Value::String("authentication-rate-limited".into())
+    );
+    assert_eq!(
+        body["error"]["message"],
+        "Authentication is temporarily limited."
+    );
+    assert!(!body.to_string().contains("hostile-cookie-sentinel"));
+}
+
+#[tokio::test]
+async fn wrong_origin_rejects_before_authentication_rate_authority() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 1;
+    let app = app_with_limits(configured);
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/targets",
+            Some("https://attacker.test"),
+            None,
+            "",
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        response(&app, "POST", "/api/targets", Some(ORIGIN), None, "")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(&app, "POST", "/api/targets", Some(ORIGIN), None, "")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }
 
 #[tokio::test]

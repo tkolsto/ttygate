@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -18,6 +22,7 @@ use crate::{
     config::{AuthConfig, Config, Limits, ServerTransport, TargetAllowlist},
     origin::OriginPolicy,
     protocol::MAX_BINARY_BYTES,
+    rate_limit::{Attempt, FixedWindowLimiter, LimitError},
     session::SessionManager,
     ticket::{TicketError, TicketStore},
     websocket,
@@ -26,6 +31,19 @@ use crate::{
 const MAX_SESSION_BODY: usize = 1024;
 const TICKET_TTL: Duration = Duration::from_secs(10);
 const TICKET_CAPACITY: usize = 1024;
+const LIMITER_KEY_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PeerKey {
+    Address(IpAddr),
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthHttpError {
+    Required,
+    Limited(Duration),
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +52,7 @@ pub struct AppState {
     targets: Arc<TargetAllowlist>,
     tickets: Arc<TicketStore>,
     sessions: Arc<SessionManager>,
+    authentication_failures: Arc<FixedWindowLimiter<PeerKey>>,
 }
 
 impl AppState {
@@ -44,6 +63,11 @@ impl AppState {
         tickets: TicketStore,
         limits: Limits,
     ) -> Self {
+        let authentication_failures = Arc::new(FixedWindowLimiter::new(
+            limits.authentication_failures_per_window,
+            limits.authentication_failure_window,
+            LIMITER_KEY_CAPACITY,
+        ));
         let sessions = SessionManager::new(limits, targets.clone());
         Self {
             origin: Arc::new(origin),
@@ -51,6 +75,7 @@ impl AppState {
             targets: Arc::new(targets),
             tickets: Arc::new(tickets),
             sessions: Arc::new(sessions),
+            authentication_failures,
         }
     }
 
@@ -148,26 +173,11 @@ async fn upgrade_websocket(
         );
     }
     let context = auth_context(&request);
-    let cookie = match single_cookie_header(request.headers()) {
-        Ok(cookie) => cookie,
-        Err(()) => {
-            return api_error(
-                StatusCode::UNAUTHORIZED,
-                "identity-required",
-                "A valid identity session is required.",
-            );
-        }
-    };
-    let identity = match state.auth.authenticate(&context, cookie) {
-        Ok(identity) => identity,
-        Err(_) => {
-            return api_error(
-                StatusCode::UNAUTHORIZED,
-                "identity-required",
-                "A valid identity session is required.",
-            );
-        }
-    };
+    let identity =
+        match authenticate_limited(&state, &context, single_cookie_header(request.headers())) {
+            Ok(identity) => identity,
+            Err(error) => return auth_error_response(error),
+        };
     let tickets = Arc::clone(&state.tickets);
     let sessions = Arc::clone(&state.sessions);
     ws.max_message_size(MAX_BINARY_BYTES)
@@ -256,12 +266,18 @@ async fn frontend() -> impl IntoResponse {
 
 async fn establish_identity(State(state): State<AppState>, request: Request) -> Response {
     let context = auth_context(&request);
+    let attempt = match begin_authentication_attempt(&state, &context) {
+        Ok(attempt) => attempt,
+        Err(error) => return auth_error_response(error),
+    };
     match single_cookie_header(request.headers()) {
         Ok(cookie) if state.auth.authenticate(&context, cookie).is_ok() => {
+            attempt.rollback();
             return StatusCode::NO_CONTENT.into_response();
         }
         Ok(_) => {}
         Err(()) => {
+            attempt.commit();
             return api_error(
                 StatusCode::UNAUTHORIZED,
                 "identity-required",
@@ -270,8 +286,12 @@ async fn establish_identity(State(state): State<AppState>, request: Request) -> 
         }
     }
     let provisioned = match state.auth.establish(&context) {
-        Ok(provisioned) => provisioned,
+        Ok(provisioned) => {
+            attempt.rollback();
+            provisioned
+        }
         Err(_) => {
+            attempt.commit();
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "identity-unavailable",
@@ -320,22 +340,10 @@ struct TargetCatalog {
 
 async fn list_targets(State(state): State<AppState>, request: Request) -> Response {
     let context = auth_context(&request);
-    let cookie = match single_cookie_header(request.headers()) {
-        Ok(cookie) => cookie,
-        Err(()) => {
-            return api_error(
-                StatusCode::UNAUTHORIZED,
-                "identity-required",
-                "A valid identity session is required.",
-            );
-        }
-    };
-    if state.auth.authenticate(&context, cookie).is_err() {
-        return api_error(
-            StatusCode::UNAUTHORIZED,
-            "identity-required",
-            "A valid identity session is required.",
-        );
+    if let Err(error) =
+        authenticate_limited(&state, &context, single_cookie_header(request.headers()))
+    {
+        return auth_error_response(error);
     }
     if to_bytes(request.into_body(), 0).await.is_err() {
         return api_error(
@@ -358,26 +366,11 @@ struct TicketResponse<'a> {
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
     let context = auth_context(&request);
-    let cookie = match single_cookie_header(request.headers()) {
-        Ok(cookie) => cookie,
-        Err(()) => {
-            return api_error(
-                StatusCode::UNAUTHORIZED,
-                "identity-required",
-                "A valid identity session is required.",
-            );
-        }
-    };
-    let identity = match state.auth.authenticate(&context, cookie) {
-        Ok(identity) => identity,
-        Err(_) => {
-            return api_error(
-                StatusCode::UNAUTHORIZED,
-                "identity-required",
-                "A valid identity session is required.",
-            );
-        }
-    };
+    let identity =
+        match authenticate_limited(&state, &context, single_cookie_header(request.headers())) {
+            Ok(identity) => identity,
+            Err(error) => return auth_error_response(error),
+        };
     let is_json = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -457,6 +450,76 @@ fn auth_context(request: &Request) -> AuthContext<'_> {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
     AuthContext::new(request.headers(), peer_addr)
+}
+
+fn begin_authentication_attempt(
+    state: &AppState,
+    context: &AuthContext<'_>,
+) -> Result<Attempt<PeerKey>, AuthHttpError> {
+    let key = context
+        .peer_addr()
+        .map(|address| PeerKey::Address(address.ip()))
+        .unwrap_or(PeerKey::Missing);
+    state
+        .authentication_failures
+        .begin(key)
+        .map_err(|LimitError::Exhausted { retry_after }| AuthHttpError::Limited(retry_after))
+}
+
+fn authenticate_limited(
+    state: &AppState,
+    context: &AuthContext<'_>,
+    cookie: Result<Option<&str>, ()>,
+) -> Result<crate::ticket::Identity, AuthHttpError> {
+    let attempt = begin_authentication_attempt(state, context)?;
+    let cookie = match cookie {
+        Ok(cookie) => cookie,
+        Err(()) => {
+            attempt.commit();
+            return Err(AuthHttpError::Required);
+        }
+    };
+    match state.auth.authenticate(context, cookie) {
+        Ok(identity) => {
+            attempt.rollback();
+            Ok(identity)
+        }
+        Err(_) => {
+            attempt.commit();
+            Err(AuthHttpError::Required)
+        }
+    }
+}
+
+fn auth_error_response(error: AuthHttpError) -> Response {
+    match error {
+        AuthHttpError::Required => api_error(
+            StatusCode::UNAUTHORIZED,
+            "identity-required",
+            "A valid identity session is required.",
+        ),
+        AuthHttpError::Limited(retry_after) => rate_error(
+            "authentication-rate-limited",
+            "Authentication is temporarily limited.",
+            retry_after,
+        ),
+    }
+}
+
+fn rate_error(code: &'static str, message: &'static str, retry_after: Duration) -> Response {
+    let seconds = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+        .max(1);
+    let mut response = api_error(StatusCode::TOO_MANY_REQUESTS, code, message);
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        seconds
+            .to_string()
+            .parse()
+            .expect("integer retry-after is a valid header value"),
+    );
+    response
 }
 
 fn single_cookie_header(headers: &HeaderMap) -> Result<Option<&str>, ()> {
