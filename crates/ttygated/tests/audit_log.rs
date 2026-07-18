@@ -9,7 +9,7 @@ use std::{
 use ttygated::{
     audit::{
         AuditError, AuditEvent, AuditLog, AuditTimestamp, CorrelationId, DenialCategory,
-        DenialReason, SessionId,
+        DenialReason, ResolvedAuditTarget, SessionId,
     },
     config::{Limits, PtyTarget, Target, TargetAllowlist},
     protocol::Resize,
@@ -21,13 +21,37 @@ fn timestamp(seconds: u64) -> AuditTimestamp {
     AuditTimestamp::from_system_time(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)).unwrap()
 }
 
+fn resolved_target(name: &str) -> ResolvedAuditTarget {
+    let targets = TargetAllowlist::new(vec![Target::Pty(PtyTarget {
+        name: name.to_owned(),
+        executable: "/usr/bin/true".into(),
+        argv: Vec::new(),
+        read_only: false,
+    })])
+    .unwrap();
+    ResolvedAuditTarget::resolve(&targets, name).unwrap()
+}
+
+#[test]
+fn audit_target_fields_require_resolved_configured_target_type() {
+    let constructor: fn(
+        SessionId,
+        &Identity,
+        &ResolvedAuditTarget,
+        Option<SocketAddr>,
+        AuditTimestamp,
+    ) -> AuditEvent = AuditEvent::session_started;
+    let _ = constructor;
+}
+
 #[test]
 fn audit_v1_serialization_is_exact() {
     let identity = Identity::new("alice").unwrap();
+    let target = resolved_target("admin-shell");
     let event = AuditEvent::session_started(
         SessionId::from_bytes([7; 16]),
         &identity,
-        "admin-shell",
+        &target,
         Some("127.0.0.1:43123".parse::<SocketAddr>().unwrap()),
         timestamp(0),
     );
@@ -84,12 +108,13 @@ fn audit_schema_can_represent_future_host_key_denial() {
 #[test]
 fn audit_event_types_have_no_terminal_or_secret_fields() {
     let identity = Identity::new("alice").unwrap();
+    let target = resolved_target("shell");
     let events = [
         AuditEvent::authentication_succeeded(&identity, None, timestamp(3)),
         AuditEvent::session_started(
             SessionId::from_bytes([1; 16]),
             &identity,
-            "shell",
+            &target,
             None,
             timestamp(4),
         ),

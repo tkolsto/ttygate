@@ -434,6 +434,46 @@ async fn websocket_upgrade_requires_exact_origin_and_cookie_before_switching_pro
     socket.close(None).await.unwrap();
 }
 
+#[tokio::test]
+async fn websocket_authentication_failures_and_limit_are_audited() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let mut configured_limits = limits();
+    configured_limits.authentication_failures_per_window = 1;
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        target(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        configured_limits,
+        AuditLog::open(&audit_path).unwrap(),
+    );
+    let server = start_server_with_state(state).await;
+
+    for expected in [StatusCode::UNAUTHORIZED, StatusCode::TOO_MANY_REQUESTS] {
+        assert_eq!(
+            rejected_status(websocket_request(
+                server.address,
+                Some(ORIGIN),
+                Some("ttgate_session=invalid-sentinel"),
+            ))
+            .await,
+            expected
+        );
+    }
+
+    let reasons = std::fs::read_to_string(audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|event| event["reason"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        ["identity-required", "authentication-rate-limited"]
+    );
+}
+
 struct CookieIdentityAuth;
 
 impl AuthProvider for CookieIdentityAuth {
@@ -572,6 +612,64 @@ async fn ticket_denials_are_stable_and_never_include_ticket() {
 }
 
 #[tokio::test]
+async fn post_redemption_session_denials_are_audited() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let ssh = Target::Ssh(SshTarget {
+        name: "future-ssh".into(),
+        host: "ssh.example.test".into(),
+        port: 22,
+        known_hosts: "/non-secret/known-hosts".into(),
+        user_policy: SshUserPolicy::Fixed("remote-user".into()),
+        read_only: false,
+    });
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        ssh.clone(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        limits(),
+        AuditLog::open(&audit_path).unwrap(),
+    );
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), ssh).await;
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    assert!(matches!(
+        next_server_control(&mut socket).await,
+        ServerControl::Error(message) if message.code == "session-denied"
+    ));
+    let events = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(events.contains(r#""reason":"target-unavailable""#));
+    assert!(!events.contains(r#""event_type":"session-started""#));
+
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        target(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        limits(),
+        AuditLog::open(&audit_path).unwrap(),
+    );
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), target()).await;
+    state.sessions().shutdown().await;
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    assert!(matches!(
+        next_server_control(&mut socket).await,
+        ServerControl::Error(message) if message.code == "session-denied"
+    ));
+    let events = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(events.contains(r#""reason":"session-unavailable""#));
+    assert!(!events.contains(r#""event_type":"session-started""#));
+}
+
+#[tokio::test]
 async fn websocket_disconnect_has_exactly_one_audit_completion() {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     let audit_path = directory.path().join("audit.jsonl");
@@ -621,6 +719,52 @@ async fn websocket_disconnect_has_exactly_one_audit_completion() {
     assert_eq!(ended.len(), 1);
     assert_eq!(started[0]["session_id"], ended[0]["session_id"]);
     assert_eq!(ended[0]["close_reason"], "websocket-disconnect");
+}
+
+#[tokio::test]
+async fn malformed_control_frame_has_protocol_audit_completion() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        target(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        limits(),
+        AuditLog::open(&audit_path).unwrap(),
+    );
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), target()).await;
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    socket
+        .send(tungstenite::Message::Text(
+            r#"{"type":"resize","cols":0,"rows":0}"#.into(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_server_control(&mut socket).await,
+        ServerControl::Error(message) if message.code == "protocol-error"
+    ));
+
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = std::fs::read_to_string(&audit_path).unwrap();
+            if let Some(event) = events
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|event| event["event_type"] == "session-ended")
+            {
+                break event;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("protocol audit completion timed out");
+    assert_eq!(event["close_reason"], "protocol-violation");
 }
 
 #[tokio::test]

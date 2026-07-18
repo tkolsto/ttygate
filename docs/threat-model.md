@@ -141,9 +141,11 @@ headers.
 Lifecycle audit logs make it possible to reconstruct who attempted or opened
 which configured target, from which listener peer, when, and with what outcome.
 Chunk 2.4 writes bounded schema-versioned append JSONL records to the literal
-configured path. It rejects symlink parents/destinations, non-regular
-destinations, unsafe existing permissions, and incomplete existing tails; a new
-file is owner-only (`0600` on Unix). Authentication success, stable denials,
+configured path. An anchored non-following directory-descriptor walk prevents
+parent rename redirection, and nonblocking final open rejects raced special
+files. It rejects symlink parents/destinations, non-regular destinations,
+unsafe existing permissions, and incomplete existing tails; a new file is
+owner-only (`0600` on Unix). Authentication success, stable denials,
 and admitted-session starts and completions are closed event variants with
 opaque correlation identifiers.
 
@@ -159,8 +161,8 @@ event. Kernel, storage, or power failure can therefore lose recent records.
 ttygate does not implement rotation, retention, remote shipping, backup, or
 deletion; operators own those policies. The filesystem namespace and
 administrators able to mutate it remain a trust boundary. Path and permission
-validation do not protect against a privileged actor racing parent-directory
-renames or replacing storage outside the daemon's opened handle.
+validation cannot protect against a privileged actor writing or truncating the
+opened inode or replacing underlying storage outside the daemon's control.
 
 Optional asciinema-compatible recording is distinct from lifecycle audit. It is planned to capture terminal output, be disabled by default, and write files with restrictive permissions. Programs frequently echo typed input, display access tokens, or print private data; therefore recordings are sensitive regardless of an “output-only” label. Operators remain responsible for access control, retention, backups, deletion, and legal notice.
 

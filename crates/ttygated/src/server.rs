@@ -18,9 +18,12 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
-    audit::{AuditEvent, AuditLog, AuditTimestamp, CorrelationId, DenialCategory, DenialReason},
+    audit::{
+        AuditEvent, AuditLog, AuditTimestamp, CorrelationId, DenialCategory, DenialReason,
+        ResolvedAuditTarget,
+    },
     auth::{AuthContext, AuthProvider, DevAuthProvider, TrustedProxyAuthProvider},
-    config::{AuthConfig, Config, Limits, ServerTransport, TargetAllowlist},
+    config::{AuthConfig, Config, Limits, ServerTransport, Target, TargetAllowlist},
     origin::OriginPolicy,
     protocol::MAX_BINARY_BYTES,
     rate_limit::{Attempt, FixedWindowLimiter, LimitError},
@@ -204,7 +207,7 @@ async fn upgrade_websocket(
     let identity =
         match authenticate_limited(&state, &context, single_cookie_header(request.headers())) {
             Ok(identity) => identity,
-            Err(error) => return auth_error_response(error),
+            Err(error) => return audited_auth_error_response(&state, &context, error),
         };
     let tickets = Arc::clone(&state.tickets);
     let sessions = Arc::clone(&state.sessions);
@@ -338,12 +341,8 @@ async fn establish_identity(State(state): State<AppState>, request: Request) -> 
         Err(error) => return audited_auth_error_response(&state, &context, error),
     };
     match single_cookie_header(request.headers()) {
-        Ok(cookie) if state.auth.authenticate(&context, cookie).is_ok() => {
+        Ok(cookie) if let Ok(identity) = state.auth.authenticate(&context, cookie) => {
             attempt.rollback();
-            let identity = state
-                .auth
-                .authenticate(&context, cookie)
-                .expect("the identical authentication attempt already succeeded");
             if record_authentication_success(&state, &context, &identity).is_err() {
                 return audit_unavailable_response();
             }
@@ -564,7 +563,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                 DenialCategory::Capacity,
                 DenialReason::GlobalSessionLimit,
                 Some(&identity),
-                Some(target.name()),
+                Some(&target),
                 remote_address,
             ) {
                 return *response;
@@ -581,7 +580,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                 DenialCategory::Capacity,
                 DenialReason::IdentitySessionLimit,
                 Some(&identity),
-                Some(target.name()),
+                Some(&target),
                 remote_address,
             ) {
                 return *response;
@@ -600,10 +599,15 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             );
         }
     };
-    match state
-        .tickets
-        .issue_at(identity.clone(), target.clone(), reservation, expiry)
-    {
+    let issued = {
+        let Ok(_authority) = state.audit.authority_guard() else {
+            return audit_unavailable_response();
+        };
+        state
+            .tickets
+            .issue_at(identity.clone(), target.clone(), reservation, expiry)
+    };
+    match issued {
         Ok(ticket) => (
             StatusCode::CREATED,
             axum::Json(TicketResponse {
@@ -618,7 +622,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                 DenialCategory::Ticket,
                 DenialReason::TicketCapacity,
                 Some(&identity),
-                Some(target.name()),
+                Some(&target),
                 remote_address,
             ) {
                 return *response;
@@ -635,7 +639,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
                 DenialCategory::Ticket,
                 DenialReason::TicketGeneration,
                 Some(&identity),
-                Some(target.name()),
+                Some(&target),
                 remote_address,
             ) {
                 return *response;
@@ -754,12 +758,13 @@ fn audit_denial(
     category: DenialCategory,
     reason: DenialReason,
     identity: Option<&crate::ticket::Identity>,
-    target: Option<&str>,
+    target: Option<&Target>,
     remote_address: Option<SocketAddr>,
 ) -> Result<(), Box<Response>> {
     let correlation_id =
         CorrelationId::generate().map_err(|_| Box::new(audit_unavailable_response()))?;
     let occurred_at = AuditTimestamp::now().map_err(|_| Box::new(audit_unavailable_response()))?;
+    let target = target.map(|target| ResolvedAuditTarget::from_resolved_name(target.name()));
     state
         .audit
         .record(&AuditEvent::access_denied(
@@ -767,7 +772,7 @@ fn audit_denial(
             category,
             reason,
             identity,
-            target,
+            target.as_ref(),
             remote_address,
             occurred_at,
         ))

@@ -178,8 +178,11 @@ recording = false
 ```
 
 The path is literal: ttygate does not expand environment variables or `~`.
-Every existing parent must be a real directory rather than a symlink, and the
-destination must be a regular non-symlink file. A missing destination is
+Every existing parent must be a real directory rather than a symlink. ttygate
+walks those parents through anchored non-following directory descriptors, so a
+concurrent parent rename cannot redirect the final open; a raced special file
+is opened nonblocking and rejected. The destination must be a regular
+non-symlink file. A missing destination is
 created owner-only (`0600` on Unix); ttygate rejects an existing file with
 group/other permissions and never weakens it with an automatic `chmod`.
 Existing content must end at a complete newline-delimited record.
@@ -211,10 +214,9 @@ still be lost on kernel, storage, or power failure.
 ttygate does not rotate, retain, ship, back up, or delete audit files.
 Operators own rotation and retention and must coordinate them without replacing
 the live path behind the daemon. The containing filesystem is a trust boundary;
-administrators able to rename parent components remain trusted. Validation resists
-ordinary symlinks and unsafe permissions, but it is not a defense against a
-privileged actor concurrently mutating the filesystem namespace. Audit metadata
-is sensitive even though terminal contents and credentials are excluded.
+administrators able to write or truncate the opened inode or underlying storage
+remain trusted even though pathname redirects are resisted. Audit metadata is
+sensitive even though terminal contents and credentials are excluded.
 
 ## Planned v0.1 posture
 

@@ -19,7 +19,7 @@ use tokio::{
 use crate::{
     audit::{
         AuditCloseReason, AuditEvent, AuditLog, AuditOutcome, AuditTimestamp, CorrelationId,
-        DenialCategory, DenialReason, SessionId,
+        DenialCategory, DenialReason, ResolvedAuditTarget, SessionId,
     },
     config::{Limits, PtyTarget, Target, TargetAllowlist},
     protocol::{self, MAX_BINARY_BYTES, Resize},
@@ -53,6 +53,8 @@ pub enum SessionCloseReason {
     ChildExited,
     Explicit,
     TransportDropped,
+    ProtocolViolation,
+    InternalFailure,
     HandleDropped,
     SupervisorUnwind,
     ManagerShutdown,
@@ -678,16 +680,17 @@ impl SessionManager {
         state.start()?;
         debug_assert_eq!(state.state(), SessionState::Running);
         if let Some(audit) = &persistent_audit
-            && audit
-                .log
-                .record(&AuditEvent::session_started(
+            && {
+                let target = ResolvedAuditTarget::from_resolved_name(&target.name);
+                audit.log.record(&AuditEvent::session_started(
                     audit.session_id.clone(),
                     &identity,
-                    &target.name,
+                    &target,
                     remote_address,
                     audit.started_at.clone(),
                 ))
-                .is_err()
+            }
+            .is_err()
         {
             let (reader, writer, mut child) = running.into_parts();
             drop(reader);
@@ -798,13 +801,14 @@ impl SessionManager {
         };
         let correlation_id = CorrelationId::generate().map_err(|_| ())?;
         let occurred_at = AuditTimestamp::now().map_err(|_| ())?;
+        let target = ResolvedAuditTarget::from_resolved_name(&target.name);
         audit
             .record(&AuditEvent::access_denied(
                 correlation_id,
                 DenialCategory::Target,
                 DenialReason::SessionUnavailable,
                 Some(identity),
-                Some(&target.name),
+                Some(&target),
                 remote_address,
                 occurred_at,
             ))
@@ -928,6 +932,18 @@ impl Session {
 
     pub(crate) async fn transport_dropped(&mut self) -> Result<SessionClosed, SessionError> {
         request_close(&self.close_tx, SessionCloseReason::TransportDropped);
+        self.wait_closed().await
+    }
+
+    pub(crate) async fn close_from_bridge(
+        &mut self,
+        reason: SessionCloseReason,
+    ) -> Result<SessionClosed, SessionError> {
+        debug_assert!(matches!(
+            reason,
+            SessionCloseReason::ProtocolViolation | SessionCloseReason::InternalFailure
+        ));
+        request_close(&self.close_tx, reason);
         self.wait_closed().await
     }
 
@@ -1220,10 +1236,11 @@ fn complete_supervisor(
     if let Some(audit) = &supervisor.persistent_audit
         && let Ok(ended_at) = AuditTimestamp::now()
     {
+        let target = ResolvedAuditTarget::from_resolved_name(&supervisor.target_name);
         let _ = audit.log.record(&AuditEvent::session_ended(
             audit.session_id.clone(),
             &supervisor.identity,
-            &supervisor.target_name,
+            &target,
             audit.remote_address,
             audit.started_at.clone(),
             ended_at,
@@ -1248,6 +1265,8 @@ fn audit_close_reason(reason: SessionCloseReason) -> AuditCloseReason {
         SessionCloseReason::ChildExited => AuditCloseReason::ChildExited,
         SessionCloseReason::Explicit => AuditCloseReason::Explicit,
         SessionCloseReason::TransportDropped => AuditCloseReason::WebsocketDisconnect,
+        SessionCloseReason::ProtocolViolation => AuditCloseReason::ProtocolViolation,
+        SessionCloseReason::InternalFailure => AuditCloseReason::InternalFailure,
         SessionCloseReason::HandleDropped => AuditCloseReason::Cancellation,
         SessionCloseReason::SupervisorUnwind => AuditCloseReason::SupervisorUnwind,
         SessionCloseReason::ManagerShutdown => AuditCloseReason::ManagerShutdown,
@@ -1353,6 +1372,8 @@ mod tests {
         let reasons = [
             SessionCloseReason::Explicit,
             SessionCloseReason::TransportDropped,
+            SessionCloseReason::ProtocolViolation,
+            SessionCloseReason::InternalFailure,
             SessionCloseReason::HandleDropped,
             SessionCloseReason::SupervisorUnwind,
             SessionCloseReason::ManagerShutdown,
