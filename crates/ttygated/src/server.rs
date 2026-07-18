@@ -275,7 +275,7 @@ async fn establish_identity(State(state): State<AppState>, request: Request) -> 
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "identity-unavailable",
-                "Development identity is unavailable.",
+                "Identity is unavailable.",
             );
         }
     };
