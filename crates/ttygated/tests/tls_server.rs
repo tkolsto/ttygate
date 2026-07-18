@@ -43,13 +43,16 @@ struct TlsTestServer {
     connector: TlsConnector,
     untrusted_connector: TlsConnector,
     marker: PathBuf,
-    task: JoinHandle<Result<(), startup::StartupError>>,
+    task: Option<JoinHandle<Result<(), startup::StartupError>>>,
     _directory: TempDir,
 }
 
 impl Drop for TlsTestServer {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        kill_fixture_pids(&fixture_pids(&self.marker));
     }
 }
 
@@ -93,11 +96,11 @@ impl TlsTestServer {
             connector: trusted_connector,
             untrusted_connector,
             marker,
-            task,
+            task: Some(task),
             _directory: directory,
         };
         for _ in 0..100 {
-            if server.task.is_finished() {
+            if server.task.as_ref().unwrap().is_finished() {
                 panic!("TLS server exited during startup");
             }
             if let Ok(response) = server.request("GET", "/healthz", None, None, b"").await
@@ -108,6 +111,27 @@ impl TlsTestServer {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("TLS server did not become healthy");
+    }
+
+    async fn stop(mut self) -> Result<(), String> {
+        let pids = fixture_pids(&self.marker);
+        if let Some(task) = self.task.take() {
+            task.abort();
+            match task.await {
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(format!("TLS server join failed: {error}")),
+                Ok(Err(error)) => return Err(format!("TLS server failed: {error}")),
+                Ok(Ok(())) => {}
+            }
+        }
+        if wait_for_absence(&pids, Duration::from_millis(500))
+            .await
+            .is_err()
+        {
+            kill_fixture_pids(&pids);
+            wait_for_absence(&pids, Duration::from_secs(3)).await?;
+        }
+        Ok(())
     }
 
     async fn tls_stream(&self, name: &str) -> Result<TlsStream<TcpStream>, std::io::Error> {
@@ -465,4 +489,139 @@ async fn tls_handshake_failure_starts_no_session_or_pty() {
         .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!server.marker.exists());
+}
+
+fn fixture_pids(marker: &Path) -> Vec<i32> {
+    let Ok(contents) = fs::read_to_string(marker) else {
+        return Vec::new();
+    };
+    contents
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect()
+}
+
+fn process_exists(pid: i32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(Errno::ESRCH) => false,
+        Err(error) => panic!("failed to inspect PID {pid}: {error}"),
+    }
+}
+
+fn kill_fixture_pids(pids: &[i32]) {
+    use nix::{
+        errno::Errno,
+        sys::signal::{Signal, kill, killpg},
+        unistd::Pid,
+    };
+    for group in pids.chunks(2) {
+        if let Some(leader) = group.first().copied()
+            && let Err(error) = killpg(Pid::from_raw(leader), Signal::SIGKILL)
+            && error != Errno::ESRCH
+        {
+            panic!("failed to kill fixture process group {leader}: {error}");
+        }
+        for pid in group {
+            if let Err(error) = kill(Pid::from_raw(*pid), Signal::SIGKILL)
+                && error != Errno::ESRCH
+            {
+                panic!("failed to kill fixture PID {pid}: {error}");
+            }
+        }
+    }
+}
+
+async fn wait_for_absence(pids: &[i32], timeout: Duration) -> Result<(), String> {
+    tokio::time::timeout(timeout, async {
+        while pids.iter().copied().any(process_exists) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "fixture processes survived cleanup".to_owned())
+}
+
+async fn wait_until_absent(pids: &[i32]) {
+    wait_for_absence(pids, Duration::from_secs(3))
+        .await
+        .unwrap();
+}
+
+fn synthetic_test_body_failure() -> Result<(), &'static str> {
+    Err("synthetic test-body failure")
+}
+
+#[tokio::test]
+async fn repeated_tls_startup_shutdown_reaps_daemon_and_pty() {
+    for iteration in 1..=20 {
+        let server = TlsTestServer::start().await;
+        let cookie = server.provision_cookie().await;
+        let ticket = server.issue_ticket(&cookie).await;
+        let origin = server.origin.clone();
+        let mut socket = server.websocket(&origin, &cookie).await.unwrap();
+        socket
+            .send(tungstenite::Message::Text(
+                format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+            ))
+            .await
+            .unwrap();
+        let _ = collect_binary_until(&mut socket, b"READY").await;
+        let pids = fixture_pids(&server.marker);
+        assert_eq!(
+            pids.len(),
+            2,
+            "iteration {iteration} did not record PTY PIDs"
+        );
+        socket.close(None).await.unwrap();
+        server.stop().await.unwrap();
+        wait_until_absent(&pids).await;
+    }
+}
+
+#[tokio::test]
+async fn repeated_failed_tls_handshakes_leave_no_application_work() {
+    for iteration in 1..=20 {
+        let server = TlsTestServer::start().await;
+        let tcp = TcpStream::connect(server.address).await.unwrap();
+        assert!(
+            server
+                .untrusted_connector
+                .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+                .await
+                .is_err(),
+            "iteration {iteration} unexpectedly completed an untrusted handshake"
+        );
+        assert!(
+            fixture_pids(&server.marker).is_empty(),
+            "iteration {iteration} started a PTY after a failed handshake"
+        );
+        server.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn tls_fixture_cleanup_runs_after_test_body_failure() {
+    let server = TlsTestServer::start().await;
+    let cookie = server.provision_cookie().await;
+    let ticket = server.issue_ticket(&cookie).await;
+    let origin = server.origin.clone();
+    let mut socket = server.websocket(&origin, &cookie).await.unwrap();
+    socket
+        .send(tungstenite::Message::Text(
+            format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    let _ = collect_binary_until(&mut socket, b"READY").await;
+    let pids = fixture_pids(&server.marker);
+    assert_eq!(pids.len(), 2);
+
+    drop(socket);
+    let body_result = synthetic_test_body_failure();
+    let cleanup_result = server.stop().await;
+    assert_eq!(body_result, Err("synthetic test-body failure"));
+    cleanup_result.unwrap();
+    wait_until_absent(&pids).await;
 }
