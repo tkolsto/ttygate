@@ -14,7 +14,11 @@ use tokio::{
     process::{Child, ChildStderr},
 };
 
-use crate::{config::PtyTarget, protocol::Resize, ssh::SshSpawnSpec};
+use crate::{
+    config::PtyTarget,
+    protocol::Resize,
+    ssh::{SshClientLog, SshSpawnSpec},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum BackendError {
@@ -50,7 +54,7 @@ impl PtyProcessBackend {
     }
 
     #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
-    pub(crate) fn spawn_ssh(spec: &SshSpawnSpec, size: Resize) -> Result<RunningSsh, BackendError> {
+    pub(crate) fn spawn_ssh(spec: SshSpawnSpec, size: Resize) -> Result<RunningSsh, BackendError> {
         let (pty, pts) = pty_process::open().map_err(|_| BackendError::Unavailable)?;
         pty.resize(pty_process::Size::new(size.rows, size.cols))
             .map_err(|_| BackendError::Unavailable)?;
@@ -61,12 +65,15 @@ impl PtyProcessBackend {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn(pts).map_err(|_| BackendError::Unavailable)?;
-        let diagnostics = child.stderr.take().ok_or(BackendError::Unavailable)?;
-        let pid = child
-            .id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .map(Pid::from_raw)
-            .ok_or(BackendError::Unavailable)?;
+        let raw_stderr = child
+            .stderr
+            .take()
+            .expect("piped stderr is a Tokio child invariant");
+        let pid = Pid::from_raw(
+            i32::try_from(child.id().expect("spawned child has a process id"))
+                .expect("Unix process ids fit in i32"),
+        );
+        let client_log = spec.into_client_log();
         let (reader, writer) = pty.into_split();
         Ok(RunningSsh {
             reader: PtyReader(reader),
@@ -75,7 +82,8 @@ impl PtyProcessBackend {
                 inner: child,
                 process_group: pid,
             },
-            diagnostics,
+            raw_stderr,
+            client_log,
         })
     }
 }
@@ -85,7 +93,8 @@ pub(crate) struct RunningSsh {
     reader: PtyReader,
     writer: PtyWriter,
     child: PtyChild,
-    diagnostics: ChildStderr,
+    raw_stderr: ChildStderr,
+    client_log: SshClientLog,
 }
 
 impl std::fmt::Debug for RunningSsh {
@@ -99,8 +108,14 @@ impl std::fmt::Debug for RunningSsh {
 
 impl RunningSsh {
     #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
-    pub(crate) fn into_parts(self) -> (PtyReader, PtyWriter, PtyChild, ChildStderr) {
-        (self.reader, self.writer, self.child, self.diagnostics)
+    pub(crate) fn into_parts(self) -> (PtyReader, PtyWriter, PtyChild, ChildStderr, SshClientLog) {
+        (
+            self.reader,
+            self.writer,
+            self.child,
+            self.raw_stderr,
+            self.client_log,
+        )
     }
 }
 
