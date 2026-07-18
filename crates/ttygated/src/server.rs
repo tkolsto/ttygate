@@ -205,6 +205,16 @@ pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()
     .await
 }
 
+pub async fn serve_tls(
+    address: SocketAddr,
+    state: AppState,
+    tls: axum_server::tls_rustls::RustlsConfig,
+) -> std::io::Result<()> {
+    axum_server::bind_rustls(address, tls)
+        .serve(build_router(state).into_make_service_with_connect_info::<SocketAddr>())
+        .await
+}
+
 async fn enforce_origin(
     State(policy): State<Arc<OriginPolicy>>,
     request: Request,
