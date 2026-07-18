@@ -17,13 +17,22 @@ use ttygated::{
         AuthContext, AuthError, AuthProvider, DevAuthProvider, ProvisionedIdentity,
         SESSION_COOKIE_NAME,
     },
-    config::{PtyTarget, Target, TargetAllowlist},
+    config::{Limits, PtyTarget, Target, TargetAllowlist},
     origin::OriginPolicy,
     server::{AppState, build_router, serve},
     ticket::{Identity, TicketStore},
 };
 
 const ORIGIN: &str = "https://ttygate.local:7681";
+
+fn limits() -> Limits {
+    Limits {
+        max_sessions: 8,
+        max_sessions_per_user: 4,
+        idle_timeout: std::time::Duration::from_secs(5),
+        absolute_timeout: std::time::Duration::from_secs(10),
+    }
+}
 
 struct PeerRecordingAuthProvider {
     peer_addr: Mutex<Option<SocketAddr>>,
@@ -63,6 +72,7 @@ fn app() -> axum::Router {
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
         TicketStore::new(std::time::Duration::from_secs(10), 32),
+        limits(),
     ))
 }
 
@@ -385,6 +395,7 @@ async fn listener_injects_the_actual_peer_into_authentication_context() {
             auth.clone(),
             TargetAllowlist::new(vec![target]).unwrap(),
             TicketStore::new(std::time::Duration::from_secs(10), 32),
+            limits(),
         ),
     ));
 

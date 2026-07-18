@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     Router,
     body::to_bytes,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Request, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -15,9 +15,12 @@ use tokio::net::TcpListener;
 
 use crate::{
     auth::{AuthContext, AuthProvider, DevAuthProvider},
-    config::{Config, TargetAllowlist},
+    config::{Config, Limits, TargetAllowlist},
     origin::OriginPolicy,
+    protocol::MAX_BINARY_BYTES,
+    session::SessionManager,
     ticket::{TicketError, TicketStore},
+    websocket,
 };
 
 const MAX_SESSION_BODY: usize = 1024;
@@ -30,6 +33,7 @@ pub struct AppState {
     auth: Arc<dyn AuthProvider>,
     targets: Arc<TargetAllowlist>,
     tickets: Arc<TicketStore>,
+    sessions: Arc<SessionManager>,
 }
 
 impl AppState {
@@ -38,12 +42,15 @@ impl AppState {
         auth: Arc<dyn AuthProvider>,
         targets: TargetAllowlist,
         tickets: TicketStore,
+        limits: Limits,
     ) -> Self {
+        let sessions = SessionManager::new(limits, targets.clone());
         Self {
             origin: Arc::new(origin),
             auth,
             targets: Arc::new(targets),
             tickets: Arc::new(tickets),
+            sessions: Arc::new(sessions),
         }
     }
 
@@ -61,11 +68,16 @@ impl AppState {
             auth,
             targets,
             TicketStore::new(TICKET_TTL, TICKET_CAPACITY),
+            config.limits.clone(),
         ))
     }
 
     pub fn tickets(&self) -> Arc<TicketStore> {
         Arc::clone(&self.tickets)
+    }
+
+    pub fn sessions(&self) -> Arc<SessionManager> {
+        Arc::clone(&self.sessions)
     }
 }
 
@@ -91,6 +103,7 @@ pub fn build_router(state: AppState) -> Router {
     let authority_api = Router::new()
         .route("/api/identity", post(establish_identity))
         .route("/api/sessions", post(create_session))
+        .route("/api/ws", get(upgrade_websocket))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state.origin),
             enforce_origin,
@@ -100,6 +113,50 @@ pub fn build_router(state: AppState) -> Router {
         .merge(static_routes)
         .merge(authority_api)
         .with_state(state)
+}
+
+async fn upgrade_websocket(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    request: Request,
+) -> Response {
+    if request.uri().query().is_some()
+        || request
+            .headers()
+            .contains_key(header::SEC_WEBSOCKET_PROTOCOL)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid-websocket-request",
+            "The WebSocket request is invalid.",
+        );
+    }
+    let context = auth_context(&request);
+    let cookie = match single_cookie_header(request.headers()) {
+        Ok(cookie) => cookie,
+        Err(()) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "identity-required",
+                "A valid identity session is required.",
+            );
+        }
+    };
+    let identity = match state.auth.authenticate(&context, cookie) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "identity-required",
+                "A valid identity session is required.",
+            );
+        }
+    };
+    let tickets = Arc::clone(&state.tickets);
+    let sessions = Arc::clone(&state.sessions);
+    ws.max_message_size(MAX_BINARY_BYTES)
+        .max_frame_size(MAX_BINARY_BYTES)
+        .on_upgrade(move |socket| websocket::accept_upgrade(socket, identity, tickets, sessions))
 }
 
 async fn enforce_origin_if_present(
