@@ -1,13 +1,33 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
+use axum::http::{HeaderValue, StatusCode, header};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpSocket},
-    task::JoinHandle,
+    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    net::{TcpListener, TcpSocket, TcpStream},
+    task::{JoinHandle, JoinSet},
+};
+use futures_util::{SinkExt, StreamExt};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
+use tokio_rustls::{
+    TlsAcceptor, TlsConnector,
+    client::TlsStream,
+    rustls::{
+        ClientConfig, RootCertStore, ServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName},
+    },
+};
+use tokio_tungstenite::{
+    WebSocketStream, client_async,
+    tungstenite::{self, client::IntoClientRequest},
 };
 use ttygated::{
     config::parse,
     server::{AppState, serve},
+    ticket::{Identity, TicketError},
 };
 
 const ORIGIN: &str = "https://terminal.example.test";
@@ -31,6 +51,241 @@ struct TestServer {
     address: SocketAddr,
     state: AppState,
     task: JoinHandle<()>,
+}
+
+struct TlsProxy {
+    address: SocketAddr,
+    origin: String,
+    connector: TlsConnector,
+    task: JoinHandle<()>,
+}
+
+impl TlsProxy {
+    async fn start(backend: SocketAddr, identity: &str) -> Self {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = identity.to_owned();
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else {
+                            break;
+                        };
+                        let acceptor = acceptor.clone();
+                        let identity = identity.clone();
+                        connections.spawn(async move {
+                            let _ = proxy_connection(acceptor, stream, backend, &identity).await;
+                        });
+                    }
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = completed {
+                            assert!(error.is_cancelled(), "proxy connection task failed: {error}");
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(cert.der().to_vec()))
+            .unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        Self {
+            address,
+            origin: ORIGIN.to_owned(),
+            connector,
+            task,
+        }
+    }
+
+    async fn tls_stream(&self) -> TlsStream<TcpStream> {
+        let stream = TcpStream::connect(self.address).await.unwrap();
+        self.connector
+            .connect(ServerName::try_from("localhost").unwrap().to_owned(), stream)
+            .await
+            .unwrap()
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        origin: Option<&str>,
+        cookie: Option<&str>,
+        extra_headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> RawResponse {
+        let mut stream = self.tls_stream().await;
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\nContent-Length: {}",
+            self.address.port(),
+            body.len()
+        );
+        if let Some(origin) = origin {
+            request.push_str(&format!("\r\nOrigin: {origin}"));
+        }
+        if let Some(cookie) = cookie {
+            request.push_str(&format!("\r\nCookie: {cookie}"));
+        }
+        for (name, value) in extra_headers {
+            request.push_str(&format!("\r\n{name}: {value}"));
+        }
+        if !body.is_empty() {
+            request.push_str("\r\nContent-Type: application/json");
+        }
+        request.push_str("\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = Vec::new();
+        if let Err(error) = stream.read_to_end(&mut response).await {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "TLS proxy response read failed: {error}"
+            );
+        }
+        parse_response(&response)
+    }
+
+    async fn provision_cookie(&self) -> String {
+        let response = self
+            .request(
+                "POST",
+                "/api/identity",
+                Some(&self.origin),
+                None,
+                &[],
+                b"",
+            )
+            .await;
+        assert_eq!(response.status, 204);
+        std::str::from_utf8(response.header("set-cookie").unwrap())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn issue_ticket(&self, cookie: &str) -> String {
+        let response = self
+            .request(
+                "POST",
+                "/api/sessions",
+                Some(&self.origin),
+                Some(cookie),
+                &[],
+                br#"{"target":"shell"}"#,
+            )
+            .await;
+        assert_eq!(response.status, 201);
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["ticket"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn websocket(
+        &self,
+        origin: &str,
+        cookie: &str,
+    ) -> Result<WebSocketStream<TlsStream<TcpStream>>, tungstenite::Error> {
+        let stream = self.tls_stream().await;
+        let mut request = format!("wss://localhost:{}/api/ws", self.address.port())
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        request
+            .headers_mut()
+            .insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+        client_async(request, stream)
+            .await
+            .map(|(socket, _)| socket)
+    }
+
+    async fn stop(self) {
+        self.task.abort();
+        let error = self.task.await.unwrap_err();
+        assert!(error.is_cancelled());
+    }
+}
+
+async fn proxy_connection(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    backend: SocketAddr,
+    identity: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut client = acceptor.accept(stream).await?;
+    let mut request = Vec::new();
+    let head_end = loop {
+        if request.len() > 16 * 1024 {
+            return Err("proxy request headers are too large".into());
+        }
+        if let Some(position) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+        {
+            break position;
+        }
+        let read = client.read_buf(&mut request).await?;
+        if read == 0 {
+            return Err("proxy client closed before request headers".into());
+        }
+    };
+    let rewritten = rewrite_identity_header(&request, head_end, identity)?;
+    let destination = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), backend.port());
+    let mut upstream = TcpStream::connect(destination).await?;
+    upstream.write_all(&rewritten).await?;
+    let _ = copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+fn rewrite_identity_header(
+    request: &[u8],
+    head_end: usize,
+    identity: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let head = std::str::from_utf8(&request[..head_end])?;
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().ok_or("proxy request line is missing")?;
+    let mut rewritten = Vec::with_capacity(request.len() + identity.len() + 32);
+    rewritten.extend_from_slice(request_line.as_bytes());
+    rewritten.extend_from_slice(b"\r\n");
+    for line in lines {
+        let Some((name, _)) = line.split_once(':') else {
+            return Err("proxy request header is malformed".into());
+        };
+        if !name.eq_ignore_ascii_case("x-authenticated-user") {
+            rewritten.extend_from_slice(line.as_bytes());
+            rewritten.extend_from_slice(b"\r\n");
+        }
+    }
+    rewritten.extend_from_slice(b"X-Authenticated-User: ");
+    rewritten.extend_from_slice(identity.as_bytes());
+    rewritten.extend_from_slice(b"\r\n\r\n");
+    rewritten.extend_from_slice(&request[head_end + 4..]);
+    Ok(rewritten)
 }
 
 impl TestServer {
@@ -183,7 +438,7 @@ async fn real_listener_accepts_configured_loopback_peer_identity() {
 }
 
 #[tokio::test]
-async fn real_listener_rejects_untrusted_ipv4_loopback_with_spoofed_forwarding_headers() {
+async fn direct_backend_client_cannot_gain_trust_with_forwarded_headers() {
     let server = TestServer::start().await;
 
     let response = server
@@ -266,4 +521,219 @@ async fn failed_proxy_authentication_starts_no_session_or_pty() {
     assert_eq!(session.status, 401);
     assert!(events.try_recv().is_err());
     server.stop().await;
+}
+
+#[tokio::test]
+async fn trusted_proxy_https_cookie_ticket_wss_reaches_real_pty_echo() {
+    let backend = TestServer::start().await;
+    let proxy = TlsProxy::start(backend.address, "alice").await;
+    let cookie = proxy.provision_cookie().await;
+    let ticket = proxy.issue_ticket(&cookie).await;
+    let mut socket = proxy.websocket(&proxy.origin, &cookie).await.unwrap();
+    socket
+        .send(tungstenite::Message::Text(
+            format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(tungstenite::Message::Binary(
+            b"printf 'ECHO:proxy-flow\\n'\r".to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !output
+            .windows(b"ECHO:proxy-flow".len())
+            .any(|window| window == b"ECHO:proxy-flow")
+        {
+            if let tungstenite::Message::Binary(bytes) =
+                socket.next().await.unwrap().unwrap()
+            {
+                output.extend_from_slice(&bytes);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    socket.close(None).await.unwrap();
+    proxy.stop().await;
+    backend.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_strips_spoofed_identity_before_injecting_authenticated_identity() {
+    let backend = TestServer::start().await;
+    let proxy = TlsProxy::start(backend.address, "alice").await;
+    let identity = proxy
+        .request(
+            "POST",
+            "/api/identity",
+            Some(&proxy.origin),
+            None,
+            &[
+                ("X-Authenticated-User", "mallory"),
+                ("X-Authenticated-User", "mallory-again"),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(identity.status, 204);
+    let cookie = std::str::from_utf8(identity.header("set-cookie").unwrap())
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let ticket = proxy.issue_ticket(&cookie).await;
+    let mallory = Identity::new("mallory").unwrap();
+    assert_eq!(
+        backend.state.tickets().redeem(&ticket, &mallory),
+        Err(TicketError::WrongIdentity)
+    );
+    let alice = Identity::new("alice").unwrap();
+    assert_eq!(
+        backend
+            .state
+            .tickets()
+            .redeem(&ticket, &alice)
+            .unwrap()
+            .name(),
+        "shell"
+    );
+    proxy.stop().await;
+    backend.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_cookie_identity_binds_ticket_and_wrong_identity_cannot_redeem() {
+    let backend = TestServer::start().await;
+    let alice_proxy = TlsProxy::start(backend.address, "alice").await;
+    let bob_proxy = TlsProxy::start(backend.address, "bob").await;
+    let alice_cookie = alice_proxy.provision_cookie().await;
+    let alice_ticket = alice_proxy.issue_ticket(&alice_cookie).await;
+    let bob_cookie = bob_proxy.provision_cookie().await;
+    let mut events = backend.state.sessions().subscribe_events();
+
+    let mut bob = bob_proxy
+        .websocket(&bob_proxy.origin, &bob_cookie)
+        .await
+        .unwrap();
+    bob.send(tungstenite::Message::Text(
+        format!(r#"{{"ticket":"{alice_ticket}"}}"#).into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = bob.next().await {
+            if matches!(message.unwrap(), tungstenite::Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(events.try_recv().is_err());
+
+    let mut alice = alice_proxy
+        .websocket(&alice_proxy.origin, &alice_cookie)
+        .await
+        .unwrap();
+    alice
+        .send(tungstenite::Message::Text(
+            format!(r#"{{"ticket":"{alice_ticket}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    alice
+        .send(tungstenite::Message::Binary(
+            b"printf 'ECHO:alice-only\\n'\r".to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !output
+            .windows(b"ECHO:alice-only".len())
+            .any(|window| window == b"ECHO:alice-only")
+        {
+            if let tungstenite::Message::Binary(bytes) =
+                alice.next().await.unwrap().unwrap()
+            {
+                output.extend_from_slice(&bytes);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    alice.close(None).await.unwrap();
+    bob_proxy.stop().await;
+    alice_proxy.stop().await;
+    backend.stop().await;
+}
+
+#[tokio::test]
+async fn trusted_proxy_wrong_origin_rejects_http_session_creation() {
+    let backend = TestServer::start().await;
+    let proxy = TlsProxy::start(backend.address, "alice").await;
+    let cookie = proxy.provision_cookie().await;
+
+    let response = proxy
+        .request(
+            "POST",
+            "/api/sessions",
+            Some("https://attacker.invalid"),
+            Some(&cookie),
+            &[],
+            br#"{"target":"shell"}"#,
+        )
+        .await;
+
+    assert_eq!(response.status, 403);
+    proxy.stop().await;
+    backend.stop().await;
+}
+
+#[tokio::test]
+async fn trusted_proxy_wrong_origin_rejects_websocket_upgrade() {
+    let backend = TestServer::start().await;
+    let proxy = TlsProxy::start(backend.address, "alice").await;
+    let cookie = proxy.provision_cookie().await;
+
+    let error = proxy
+        .websocket("https://attacker.invalid", &cookie)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        tungstenite::Error::Http(ref response) if response.status() == StatusCode::FORBIDDEN
+    ));
+    proxy.stop().await;
+    backend.stop().await;
+}
+
+#[tokio::test]
+async fn failed_proxy_auth_leaves_no_cookie_ticket_session_or_pty() {
+    let backend = TestServer::start().await;
+    let proxy = TlsProxy::start(backend.address, "invalid identity").await;
+    let mut events = backend.state.sessions().subscribe_events();
+
+    let response = proxy
+        .request(
+            "POST",
+            "/api/identity",
+            Some(&proxy.origin),
+            None,
+            &[],
+            b"",
+        )
+        .await;
+
+    assert_eq!(response.status, 503);
+    assert!(response.header("set-cookie").is_none());
+    assert!(events.try_recv().is_err());
+    proxy.stop().await;
+    backend.stop().await;
 }
