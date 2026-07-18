@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -9,6 +9,10 @@ use tokio::{
 };
 
 use crate::{
+    audit::{
+        AuditEvent, AuditLog, AuditTimestamp, CorrelationId, DenialCategory, DenialReason,
+        ResolvedAuditTarget,
+    },
     config::Target,
     protocol::{
         self, ClientControl, ClientFrame, CloseReason, ProtocolError, ProtocolErrorMessage, Resize,
@@ -100,6 +104,7 @@ fn safe_session_error(error: SessionError) -> BridgeFailure {
         },
         SessionError::SpawnUnavailable
         | SessionError::BackendUnavailable
+        | SessionError::AuditUnavailable
         | SessionError::Closed
         | SessionError::InvalidTransition => BridgeFailure {
             error: error_control(
@@ -125,9 +130,32 @@ fn terminal_controls(closed: SessionClosed) -> Vec<ServerControl> {
         SessionCloseReason::Explicit => {
             vec![ServerControl::Close(CloseReason::ClientRequest)]
         }
+        SessionCloseReason::TransportDropped => {
+            vec![ServerControl::Close(CloseReason::TransportError)]
+        }
+        SessionCloseReason::ProtocolViolation => {
+            vec![ServerControl::Close(CloseReason::ProtocolError)]
+        }
+        SessionCloseReason::PolicyViolation => {
+            vec![ServerControl::Close(CloseReason::Policy)]
+        }
+        SessionCloseReason::InternalFailure => vec![
+            error_control(
+                "session-unavailable",
+                "The terminal session is unavailable.",
+            ),
+            ServerControl::Close(CloseReason::InternalError),
+        ],
         SessionCloseReason::HandleDropped => {
             vec![ServerControl::Close(CloseReason::TransportError)]
         }
+        SessionCloseReason::SupervisorUnwind => vec![
+            error_control(
+                "session-unavailable",
+                "The terminal session is unavailable.",
+            ),
+            ServerControl::Close(CloseReason::InternalError),
+        ],
         SessionCloseReason::ManagerShutdown => {
             vec![ServerControl::Close(CloseReason::Policy)]
         }
@@ -149,13 +177,27 @@ pub async fn accept_upgrade(
     identity: Identity,
     tickets: Arc<TicketStore>,
     sessions: Arc<SessionManager>,
+    audit: Arc<AuditLog>,
+    remote_address: Option<SocketAddr>,
 ) {
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     let message = loop {
         match tokio::time::timeout_at(handshake_deadline, socket.recv()).await {
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
             Ok(Some(Err(error))) if is_message_too_large(&error) => {
-                send_failure(&mut socket, protocol_failure(ProtocolError::BinaryTooLarge)).await;
+                let failure = if record_ticket_denial(
+                    &audit,
+                    &identity,
+                    remote_address,
+                    TicketError::Malformed,
+                )
+                .is_ok()
+                {
+                    protocol_failure(ProtocolError::BinaryTooLarge)
+                } else {
+                    safe_session_error(SessionError::AuditUnavailable)
+                };
+                send_failure(&mut socket, failure).await;
                 return;
             }
             Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
@@ -163,7 +205,14 @@ pub async fn accept_upgrade(
             }
             Ok(Some(Ok(message))) => break message,
             Err(_) => {
-                send_failure(&mut socket, safe_ticket_error(TicketError::Malformed)).await;
+                deny_ticket(
+                    &mut socket,
+                    &audit,
+                    &identity,
+                    remote_address,
+                    TicketError::Malformed,
+                )
+                .await;
                 return;
             }
         }
@@ -171,6 +220,16 @@ pub async fn accept_upgrade(
     let ticket = match parse_handshake(&message) {
         Ok(ticket) => ticket,
         Err(HandshakeError::TooLarge) => {
+            if record_ticket_denial(&audit, &identity, remote_address, TicketError::Malformed)
+                .is_err()
+            {
+                send_failure(
+                    &mut socket,
+                    safe_session_error(SessionError::AuditUnavailable),
+                )
+                .await;
+                return;
+            }
             send_failure(
                 &mut socket,
                 protocol_failure(ProtocolError::ControlTooLarge),
@@ -179,19 +238,42 @@ pub async fn accept_upgrade(
             return;
         }
         Err(_) => {
-            send_failure(&mut socket, safe_ticket_error(TicketError::Malformed)).await;
+            deny_ticket(
+                &mut socket,
+                &audit,
+                &identity,
+                remote_address,
+                TicketError::Malformed,
+            )
+            .await;
             return;
         }
     };
     let grant = match tickets.redeem(&ticket, &identity) {
         Ok(grant) => grant,
         Err(error) => {
-            send_failure(&mut socket, safe_ticket_error(error)).await;
+            deny_ticket(&mut socket, &audit, &identity, remote_address, error).await;
             return;
         }
     };
     let (target, reservation) = grant.into_parts();
     if !matches!(target, Target::Pty(_)) {
+        if record_session_denial(
+            &audit,
+            &identity,
+            &target,
+            remote_address,
+            SessionError::TargetUnavailable,
+        )
+        .is_err()
+        {
+            send_failure(
+                &mut socket,
+                safe_session_error(SessionError::AuditUnavailable),
+            )
+            .await;
+            return;
+        }
         send_failure(
             &mut socket,
             safe_session_error(SessionError::TargetUnavailable),
@@ -202,17 +284,128 @@ pub async fn accept_upgrade(
     let size =
         Resize::new(INITIAL_COLS, INITIAL_ROWS).expect("the fixed initial terminal size is valid");
     let session = match sessions
-        .start_reserved(reservation, identity, target.name(), size)
+        .start_reserved_with_remote(
+            reservation,
+            identity.clone(),
+            target.name(),
+            size,
+            remote_address,
+        )
         .await
     {
         Ok(session) => session,
         Err(error) => {
+            if !matches!(
+                error,
+                SessionError::SpawnUnavailable | SessionError::AuditUnavailable
+            ) && record_session_denial(&audit, &identity, &target, remote_address, error)
+                .is_err()
+            {
+                send_failure(
+                    &mut socket,
+                    safe_session_error(SessionError::AuditUnavailable),
+                )
+                .await;
+                return;
+            }
             send_failure(&mut socket, safe_session_error(error)).await;
             return;
         }
     };
 
     bridge(socket, session).await;
+}
+
+fn record_ticket_denial(
+    audit: &AuditLog,
+    identity: &Identity,
+    remote_address: Option<SocketAddr>,
+    error: TicketError,
+) -> Result<(), ()> {
+    let reason = match error {
+        TicketError::Malformed => DenialReason::TicketMalformed,
+        TicketError::Unknown => DenialReason::TicketUnknown,
+        TicketError::Expired => DenialReason::TicketExpired,
+        TicketError::WrongIdentity => DenialReason::TicketWrongIdentity,
+        TicketError::AtCapacity => DenialReason::TicketCapacity,
+        TicketError::Generation => DenialReason::TicketGeneration,
+    };
+    let correlation_id = CorrelationId::generate().map_err(|_| ())?;
+    let occurred_at = AuditTimestamp::now().map_err(|_| ())?;
+    audit
+        .record(&AuditEvent::access_denied(
+            correlation_id,
+            DenialCategory::Ticket,
+            reason,
+            Some(identity),
+            None,
+            remote_address,
+            occurred_at,
+        ))
+        .map_err(|_| ())
+}
+
+async fn deny_ticket(
+    socket: &mut WebSocket,
+    audit: &AuditLog,
+    identity: &Identity,
+    remote_address: Option<SocketAddr>,
+    error: TicketError,
+) {
+    let failure = if record_ticket_denial(audit, identity, remote_address, error).is_ok() {
+        safe_ticket_error(error)
+    } else {
+        safe_session_error(SessionError::AuditUnavailable)
+    };
+    send_failure(socket, failure).await;
+}
+
+fn record_session_denial(
+    audit: &AuditLog,
+    identity: &Identity,
+    target: &Target,
+    remote_address: Option<SocketAddr>,
+    error: SessionError,
+) -> Result<(), ()> {
+    let (category, reason) = match error {
+        SessionError::GlobalLimit => (DenialCategory::Capacity, DenialReason::GlobalSessionLimit),
+        SessionError::IdentityLimit => {
+            (DenialCategory::Capacity, DenialReason::IdentitySessionLimit)
+        }
+        SessionError::TargetUnavailable => {
+            (DenialCategory::Target, DenialReason::TargetUnavailable)
+        }
+        SessionError::ReservationUnavailable => {
+            (DenialCategory::Ticket, DenialReason::TicketExpired)
+        }
+        SessionError::SpawnUnavailable
+        | SessionError::ManagerClosed
+        | SessionError::BackendUnavailable
+        | SessionError::Closed
+        | SessionError::InvalidTransition => {
+            (DenialCategory::Target, DenialReason::SessionUnavailable)
+        }
+        SessionError::AuditUnavailable => {
+            return Err(());
+        }
+        SessionError::ReadOnly | SessionError::InputTooLarge | SessionError::InvalidResize => {
+            (DenialCategory::Target, DenialReason::TargetUnavailable)
+        }
+    };
+    let correlation_id = CorrelationId::generate().map_err(|_| ())?;
+    let occurred_at = AuditTimestamp::now().map_err(|_| ())?;
+    let resolved_target = ResolvedAuditTarget::from_resolved_name(target.name());
+    audit
+        .record(&AuditEvent::access_denied(
+            correlation_id,
+            category,
+            reason,
+            Some(identity),
+            Some(&resolved_target),
+            remote_address,
+            occurred_at,
+        ))
+        .map_err(|_| ())
 }
 
 async fn send_control(socket: &mut WebSocket, control: &ServerControl) -> Result<(), ()> {
@@ -630,7 +823,17 @@ async fn finish_bridge(
     let (controls, websocket_code) = match termination {
         Termination::Terminal(closed) => (terminal_controls(closed), 1000),
         Termination::Failure(failure) => {
-            let _ = session.close().await;
+            let reason = match failure.close_reason {
+                CloseReason::ProtocolError => SessionCloseReason::ProtocolViolation,
+                CloseReason::TransportError => SessionCloseReason::TransportDropped,
+                CloseReason::Policy => SessionCloseReason::PolicyViolation,
+                _ => SessionCloseReason::InternalFailure,
+            };
+            if reason == SessionCloseReason::TransportDropped {
+                let _ = session.transport_dropped().await;
+            } else {
+                let _ = session.close_from_bridge(reason).await;
+            }
             (
                 vec![failure.error, ServerControl::Close(failure.close_reason)],
                 failure.websocket_code,
@@ -643,7 +846,7 @@ async fn finish_bridge(
             return;
         }
         Termination::Transport => {
-            let _ = session.close().await;
+            let _ = session.transport_dropped().await;
             cancel_tx.send_replace(true);
             join_task(reader).await;
             join_task(writer).await;

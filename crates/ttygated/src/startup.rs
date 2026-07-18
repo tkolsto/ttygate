@@ -2,6 +2,7 @@ use std::{
     future::Future,
     io,
     net::{SocketAddr, TcpListener as StdTcpListener},
+    path::Path,
 };
 
 use axum_server::tls_rustls::RustlsConfig;
@@ -9,6 +10,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
+    audit::{AuditError, AuditLog},
     config::{Config, ConfigError, ServerTransport, TlsConfig, validate_startup_contract},
     server::{self, AppState, ServerBuildError},
     tls::{self, TlsError},
@@ -32,6 +34,8 @@ pub enum StartupError {
     #[error(transparent)]
     Tls(#[from] TlsError),
     #[error(transparent)]
+    Audit(#[from] AuditError),
+    #[error(transparent)]
     Application(#[from] ServerBuildError),
     #[error("listener could not be bound")]
     Bind(#[source] io::Error),
@@ -40,35 +44,46 @@ pub enum StartupError {
 }
 
 pub async fn start(config: &Config) -> Result<(), StartupError> {
-    start_with(config, tls::load, AppState::from_config, bind_and_serve).await
+    start_with(
+        config,
+        tls::load,
+        AuditLog::open,
+        AppState::from_config_with_audit,
+        bind_and_serve,
+    )
+    .await
 }
 
-pub async fn start_with<'a, TlsLoader, TlsFuture, AppBuilder, Binder, BindFuture>(
+pub async fn start_with<'a, TlsLoader, TlsFuture, AuditLoader, AppBuilder, Binder, BindFuture>(
     config: &'a Config,
     tls_loader: TlsLoader,
+    audit_loader: AuditLoader,
     app_builder: AppBuilder,
     binder: Binder,
 ) -> Result<(), StartupError>
 where
     TlsLoader: FnOnce(&'a TlsConfig) -> TlsFuture,
     TlsFuture: Future<Output = Result<RustlsConfig, TlsError>>,
-    AppBuilder: FnOnce(&Config) -> Result<AppState, ServerBuildError>,
+    AuditLoader: FnOnce(&Path) -> Result<AuditLog, AuditError>,
+    AppBuilder: FnOnce(&Config, AuditLog) -> Result<AppState, ServerBuildError>,
     Binder: FnOnce(PreparedServer) -> BindFuture,
     BindFuture: Future<Output = Result<(), StartupError>>,
 {
-    let prepared = prepare_with(config, tls_loader, app_builder).await?;
+    let prepared = prepare_with(config, tls_loader, audit_loader, app_builder).await?;
     binder(prepared).await
 }
 
-pub async fn prepare_with<'a, TlsLoader, TlsFuture, AppBuilder>(
+pub async fn prepare_with<'a, TlsLoader, TlsFuture, AuditLoader, AppBuilder>(
     config: &'a Config,
     tls_loader: TlsLoader,
+    audit_loader: AuditLoader,
     app_builder: AppBuilder,
 ) -> Result<PreparedServer, StartupError>
 where
     TlsLoader: FnOnce(&'a TlsConfig) -> TlsFuture,
     TlsFuture: Future<Output = Result<RustlsConfig, TlsError>>,
-    AppBuilder: FnOnce(&Config) -> Result<AppState, ServerBuildError>,
+    AuditLoader: FnOnce(&Path) -> Result<AuditLog, AuditError>,
+    AppBuilder: FnOnce(&Config, AuditLog) -> Result<AppState, ServerBuildError>,
 {
     validate_startup_contract(config)?;
     let transport = match &config.server.transport {
@@ -78,7 +93,8 @@ where
         }
         ServerTransport::TrustedProxy(_) => Some(PreparedTransport::Plaintext),
     };
-    let state = app_builder(config)?;
+    let audit = audit_loader(&config.audit.path)?;
+    let state = app_builder(config, audit)?;
     Ok(PreparedServer {
         bind: config.server.bind,
         state,
@@ -117,6 +133,7 @@ mod tests {
     use rcgen::{CertifiedKey, generate_simple_self_signed};
 
     use crate::{
+        audit::{AuditError, AuditLog},
         config::{AuthConfig, ServerMode, ServerTransport, TlsConfig, parse},
         server::{AppState, ServerBuildError},
         tls::TlsError,
@@ -169,6 +186,11 @@ command = ["/bin/sh"]
         (Arc::clone(&phases), phases)
     }
 
+    fn test_audit() -> AuditLog {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        AuditLog::open(&directory.path().join("audit.jsonl")).unwrap()
+    }
+
     async fn rustls_config() -> RustlsConfig {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(["localhost".to_owned()]).unwrap();
@@ -204,7 +226,8 @@ command = ["/bin/sh"]
                 tls_record.lock().unwrap().push("tls");
                 async { unreachable!("invalid config must not load TLS") }
             },
-            move |_| {
+            |_| unreachable!("invalid config must not open audit"),
+            move |_, _| {
                 app_record.lock().unwrap().push("app");
                 unreachable!("invalid config must not build app")
             },
@@ -221,10 +244,45 @@ command = ["/bin/sh"]
     }
 
     #[tokio::test]
+    async fn audit_sink_failure_reaches_neither_application_nor_bind_phase() {
+        let config = parse(source()).unwrap();
+        let (record, observed) = phases();
+        let tls_record = Arc::clone(&record);
+        let audit_record = Arc::clone(&record);
+        let app_record = Arc::clone(&record);
+        let bind_record = Arc::clone(&record);
+
+        let error = start_with(
+            &config,
+            move |_| {
+                tls_record.lock().unwrap().push("tls");
+                async { unreachable!("plaintext config must not load TLS") }
+            },
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                Err(AuditError::DestinationUnavailable)
+            },
+            move |_, _| {
+                app_record.lock().unwrap().push("app");
+                unreachable!("failed audit must not build app")
+            },
+            move |_: PreparedServer| {
+                bind_record.lock().unwrap().push("bind");
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, StartupError::Audit(_)));
+        assert_eq!(*observed.lock().unwrap(), ["audit"]);
+    }
+
+    #[tokio::test]
     async fn occupied_direct_tls_address_reports_bind_error() {
         let occupied = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let address = occupied.local_addr().unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let certificate_path = directory.path().join("certificate.pem");
         let private_key_path = directory.path().join("private-key.pem");
         let CertifiedKey { cert, signing_key } =
@@ -234,6 +292,10 @@ command = ["/bin/sh"]
         set_mode(&private_key_path, 0o600);
         let source = source()
             .replace("127.0.0.1:7681", &address.to_string())
+            .replace(
+                "path = \"./audit.jsonl\"",
+                &format!("path = {:?}", directory.path().join("audit.jsonl")),
+            )
             .replace(
                 &format!("public_url = \"http://{address}\""),
                 &format!(
@@ -267,7 +329,8 @@ command = ["/bin/sh"]
                 tls_record.lock().unwrap().push("tls");
                 async { Err(TlsError::CertificateMalformed) }
             },
-            move |_| {
+            |_| unreachable!("invalid TLS must not open audit"),
+            move |_, _| {
                 app_record.lock().unwrap().push("app");
                 unreachable!("invalid TLS must not build app")
             },
@@ -288,15 +351,20 @@ command = ["/bin/sh"]
         let config = parse(&trusted_proxy_source()).unwrap();
         assert!(matches!(config.auth, AuthConfig::TrustedProxy { .. }));
         let (record, observed) = phases();
+        let audit_record = Arc::clone(&record);
         let app_record = Arc::clone(&record);
         let bind_record = Arc::clone(&record);
 
         start_with(
             &config,
             |_| async { unreachable!("proxy transport does not load direct TLS") },
-            move |config| {
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                Ok(test_audit())
+            },
+            move |config, audit| {
                 app_record.lock().unwrap().push("app");
-                AppState::from_config(config)
+                AppState::from_config_with_audit(config, audit)
             },
             move |_: PreparedServer| {
                 bind_record.lock().unwrap().push("bind");
@@ -306,14 +374,14 @@ command = ["/bin/sh"]
         .await
         .unwrap();
 
-        assert_eq!(*observed.lock().unwrap(), ["app", "bind"]);
+        assert_eq!(*observed.lock().unwrap(), ["audit", "app", "bind"]);
     }
 
     #[test]
     fn trusted_proxy_config_constructs_real_provider() {
         let config = parse(&trusted_proxy_source()).unwrap();
 
-        assert!(AppState::from_config(&config).is_ok());
+        assert!(AppState::from_config_with_audit(&config, test_audit()).is_ok());
     }
 
     #[tokio::test]
@@ -326,7 +394,8 @@ command = ["/bin/sh"]
         let error = start_with(
             &config,
             |_| async { unreachable!("proxy transport does not load direct TLS") },
-            move |_| {
+            |_| Ok(test_audit()),
+            move |_, _| {
                 app_record.lock().unwrap().push("app");
                 Err(ServerBuildError::Authentication)
             },
@@ -349,15 +418,20 @@ command = ["/bin/sh"]
     async fn valid_plaintext_dev_runs_each_startup_phase_once_in_order() {
         let config = parse(source()).unwrap();
         let (record, observed) = phases();
+        let audit_record = Arc::clone(&record);
         let app_record = Arc::clone(&record);
         let bind_record = Arc::clone(&record);
 
         start_with(
             &config,
             |_| async { unreachable!("plaintext does not load TLS") },
-            move |config| {
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                Ok(test_audit())
+            },
+            move |config, audit| {
                 app_record.lock().unwrap().push("app");
-                AppState::from_config(config)
+                AppState::from_config_with_audit(config, audit)
             },
             move |prepared: PreparedServer| {
                 assert!(matches!(prepared.transport, PreparedTransport::Plaintext));
@@ -368,7 +442,7 @@ command = ["/bin/sh"]
         .await
         .unwrap();
 
-        assert_eq!(*observed.lock().unwrap(), ["app", "bind"]);
+        assert_eq!(*observed.lock().unwrap(), ["audit", "app", "bind"]);
     }
 
     #[tokio::test]
@@ -381,6 +455,7 @@ command = ["/bin/sh"]
         });
         let (record, observed) = phases();
         let tls_record = Arc::clone(&record);
+        let audit_record = Arc::clone(&record);
         let app_record = Arc::clone(&record);
         let bind_record = Arc::clone(&record);
 
@@ -390,9 +465,13 @@ command = ["/bin/sh"]
                 tls_record.lock().unwrap().push("tls");
                 async { Ok(rustls_config().await) }
             },
-            move |config| {
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                Ok(test_audit())
+            },
+            move |config, audit| {
                 app_record.lock().unwrap().push("app");
-                AppState::from_config(config)
+                AppState::from_config_with_audit(config, audit)
             },
             move |prepared: PreparedServer| {
                 assert!(matches!(
@@ -406,7 +485,7 @@ command = ["/bin/sh"]
         .await
         .unwrap();
 
-        assert_eq!(*observed.lock().unwrap(), ["tls", "app", "bind"]);
+        assert_eq!(*observed.lock().unwrap(), ["tls", "audit", "app", "bind"]);
     }
 
     #[tokio::test]
@@ -417,6 +496,7 @@ command = ["/bin/sh"]
             &config,
             |_| async { unreachable!() },
             |_| unreachable!(),
+            |_, _| unreachable!(),
             |_: PreparedServer| async { Ok(()) },
         )
         .await

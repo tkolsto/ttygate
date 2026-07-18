@@ -4,7 +4,7 @@
 
 This document describes the intended security boundaries for ttygate v0.1, a browser gateway to allowlisted local PTY commands and SSH targets. It covers the browser frontend, HTTP and WebSocket service, authentication boundary, session manager, child processes, reverse-proxy integration, configuration, audit logs, and optional recordings.
 
-ttygate is currently pre-release. Milestone M1, completed through the frontend work tracked in issue #7, implements the localhost HTTP foundation, explicit browser Origin policy, development identity cookie, bounded single-use session tickets, authenticated first-message WebSocket bridge, allowlisted PTY execution, bounded session and bridge I/O, concurrency/deadline enforcement, process-group teardown, and an xterm.js frontend with bounded input/output handling and stale-connection cleanup. Chunk 2.1 (Refs #8) implements mode/transport gating, loopback-only development identity, fail-before-bind startup phases, secret-safe TLS material validation, and a direct rustls HTTPS/WSS listener with no HTTP fallback. Chunk 2.2 (Refs #9) implements trusted reverse-proxy production authentication; the remaining mitigations below are still planned. This model is a design contract for later chunks, not a claim that the current binary is safe to deploy. The [roadmap](roadmap.md) identifies when each control is expected to land.
+ttygate is currently pre-release. Milestone M1, completed through the frontend work tracked in issue #7, implements the localhost HTTP foundation, explicit browser Origin policy, development identity cookie, bounded single-use session tickets, authenticated first-message WebSocket bridge, allowlisted PTY execution, bounded session and bridge I/O, concurrency/deadline enforcement, process-group teardown, and an xterm.js frontend with bounded input/output handling and stale-connection cleanup. Chunk 2.1 (Refs #8) implements mode/transport gating, loopback-only development identity, fail-before-bind startup phases, secret-safe TLS material validation, and a direct rustls HTTPS/WSS listener with no HTTP fallback. Chunk 2.2 (Refs #9) implements trusted reverse-proxy production authentication; Chunk 2.3 (Refs #24) implements bounded rate and ticket-time concurrency enforcement; and Chunk 2.4 (Refs #10) implements required fail-closed structured audit persistence. Milestone M2 is complete, while SSH, recording, reconnect, packaging, deployment examples, and release work remain planned. This model is not a claim that the current binary is safe to deploy. The [roadmap](roadmap.md) identifies when each remaining control is expected to land.
 
 The model assumes the host operating system, browser, configured identity provider, and administrators are not already fully compromised. Protecting a compromised endpoint, making untrusted commands safe to run, defending third-party infrastructure, and providing per-user OS isolation for local PTY targets are out of scope. Those limitations are non-goals, not security properties.
 
@@ -117,8 +117,8 @@ Production mode must additionally:
 - reject public binding without the required transport and authentication boundary (implemented in Chunk 2.1);
 - rate-limit authentication failures and session creation (implemented in Chunk 2.3);
 - enforce global and per-user concurrency limits at ticket issuance (implemented in Chunk 2.3);
-- produce structured lifecycle events containing user, target, source, start, end, outcome, and denial reason; and
-- avoid terminal input and output in lifecycle logs unless an administrator separately enables sensitive recording.
+- produce structured lifecycle events containing user, target, source, start, end, outcome, and denial reason (implemented in Chunk 2.4); and
+- exclude terminal input and output from lifecycle logs (implemented in Chunk 2.4; sensitive recording remains a separate planned feature).
 
 Chunk 2.1 enforces its configuration and TLS errors before application
 construction or listener binding. A warning followed by insecure operation, or
@@ -131,10 +131,39 @@ optional whitespace is removed by the parser and is not part of that semantic
 value; the proxy must reject or normalize ambiguous upstream surrounding
 whitespace, strip every client instance, and inject exactly one canonical
 header. ttygate does no trimming, case folding, or Unicode normalization.
+Chunk 2.4 opens the configured audit sink before application construction or
+listener binding and permanently denies new authority after a runtime audit
+failure. Audit attribution uses the actual socket peer, never forwarding
+headers.
 
 ## Audit and recording rules
 
-Lifecycle audit logs should make it possible to reconstruct who attempted or opened which target, from where, when, and with what outcome. They must not contain passwords, session cookies, tickets, private keys, raw terminal input, or routine terminal output. Log files remain sensitive because identity, address, target, timing, and denial metadata can reveal operational details.
+Lifecycle audit logs make it possible to reconstruct who attempted or opened
+which configured target, from which listener peer, when, and with what outcome.
+Chunk 2.4 writes bounded schema-versioned append JSONL records to the literal
+configured path. An anchored non-following directory-descriptor walk prevents
+parent rename redirection, and nonblocking final open rejects raced special
+files. It rejects symlink parents/destinations, non-regular destinations,
+unsafe existing permissions, and incomplete existing tails; a new file is
+owner-only (`0600` on Unix), and an existing file must be owned by the daemon's
+effective Unix user. Authentication success, stable denials,
+and admitted-session starts and completions are closed event variants with
+opaque correlation identifiers.
+
+Lifecycle events must not contain passwords, session cookies, tickets, private
+keys, request-supplied target strings, executable paths, arguments,
+environment, raw terminal input, or routine terminal output. Tests scan a
+complete direct-TLS lifecycle log for all of those sentinel classes. Log files
+remain sensitive because identity, address, configured target, timing, and
+denial metadata reveal operational details.
+
+The append sink flushes each complete record but does not `fsync` on every
+event. Kernel, storage, or power failure can therefore lose recent records.
+ttygate does not implement rotation, retention, remote shipping, backup, or
+deletion; operators own those policies. The filesystem namespace and
+administrators able to mutate it remain a trust boundary. Path and permission
+validation cannot protect against a privileged actor writing or truncating the
+opened inode or replacing underlying storage outside the daemon's control.
 
 Optional asciinema-compatible recording is distinct from lifecycle audit. It is planned to capture terminal output, be disabled by default, and write files with restrictive permissions. Programs frequently echo typed input, display access tokens, or print private data; therefore recordings are sensitive regardless of an “output-only” label. Operators remain responsible for access control, retention, backups, deletion, and legal notice.
 
@@ -153,7 +182,7 @@ The following are intentionally prohibited for v0.1:
 
 ## Validation strategy
 
-Security claims require rejection-path evidence. Unit tests cover configuration rejection, TLS path/permission/PEM validation, fail-before-bind startup ordering, allowlist resolution, ticket expiry/reuse/identity binding, trusted-proxy CIDR and semantic identity grammar, protocol parsing, frontend stale-event and ticket lifecycle, bounded UTF-8 input chunking, state transitions, read-only input handling, and bounded atomic rate/concurrency enforcement. Integration tests cover verified direct HTTPS/WSS, wrong-Origin requests, plaintext and invalid-certificate rejection, unticketed WebSockets, real-browser identity/ticket/WebSocket/PTY flow, secret-free URLs, PTY lifecycle and resize, child teardown, bounded output, trusted and untrusted real proxy peers, cookie and ticket identity binding, proxy WSS-to-PTY propagation, rate floods, ticket-time capacity, expiry, abandonment, wrong-identity redemption, and recovery. Audit persistence, SSH, recording, reconnect, packaging, and release hardening remain future work with their own negative tests.
+Security claims require rejection-path evidence. Unit tests cover configuration rejection, TLS path/permission/PEM validation, fail-before-bind startup ordering, allowlist resolution, ticket expiry/reuse/identity binding, trusted-proxy CIDR and semantic identity grammar, protocol parsing, frontend stale-event and ticket lifecycle, bounded UTF-8 input chunking, state transitions, read-only input handling, bounded atomic rate/concurrency enforcement, exact audit serialization, and injected audit/supervisor failures. Integration tests cover verified direct HTTPS/WSS, wrong-Origin requests, plaintext and invalid-certificate rejection, unticketed WebSockets, real-browser identity/ticket/WebSocket/PTY flow, secret-free URLs, PTY lifecycle and resize, child teardown, bounded output, trusted and untrusted real proxy peers, cookie and ticket identity binding, proxy WSS-to-PTY propagation, rate floods, ticket-time capacity, expiry, abandonment, wrong-identity redemption, recovery, restrictive append behavior, exactly-once lifecycle completion, listener-peer audit provenance, and complete-log secret/terminal exclusion. SSH, recording, reconnect, packaging, deployment examples, and release hardening remain future work with their own negative tests.
 
 CI runs formatting, warning-free linting, tests, dependency policy, frontend checks, CodeQL, and dependency review. Manual release checks cover localhost-only defaults, reverse-proxy examples, fail-closed unsafe configurations, logs, packaging, and rendered public documentation. Passing one layer does not substitute for testing the others.
 
@@ -168,7 +197,8 @@ Even after the planned controls are implemented, v0.1 retains important risks:
 - **Endpoint or host compromise.** Malware in the browser, a vulnerable terminal emulator, or compromise of the daemon host can bypass application-level controls.
 - **Denial of service.** Limits and backpressure bound individual paths but cannot guarantee availability under host exhaustion, distributed traffic, or expensive allowlisted commands.
 - **Audit metadata.** Lifecycle logs exclude terminal contents by default but still reveal identities, targets, addresses, timing, and outcomes.
-- **Pre-release immaturity.** Interfaces and assumptions may change. M1's local terminal controls, Chunk 2.1's transport/startup gating, Chunk 2.2's trusted-proxy authentication, and Chunk 2.3's rate/concurrency enforcement are implemented, but audit persistence, SSH execution, recording, reconnect, packaging, and deployment hardening remain incomplete. The current build must not be deployed as a terminal gateway.
+- **Audit durability and filesystem trust.** Per-event `fsync`, rotation, retention, and remote shipping are not implemented. Recent records can be lost on abrupt storage failure, and a privileged actor controlling the filesystem namespace can subvert local persistence.
+- **Pre-release immaturity.** Interfaces and assumptions may change. M1's local terminal controls and M2's transport, authentication, rate/concurrency, and audit controls are implemented, but SSH execution, recording, reconnect, packaging, deployment examples, and release hardening remain incomplete. The current build must not be deployed as a terminal gateway.
 
 ## Maintaining this model
 

@@ -267,8 +267,23 @@ character. HTTP field-line optional whitespace is parser framing rather than
 part of that semantic value; the proxy must reject or normalize ambiguous
 upstream surrounding whitespace, strip all client instances, and inject exactly
 one canonical header. ttygate performs no further trimming, case folding, or
-Unicode normalization. Rate limiting, audit persistence, SSH, recording,
-reconnect, packaging, and release hardening are future phases.
+Unicode normalization. Chunk 2.3 implements rate and concurrency limits.
+
+Chunk 2.4 (Refs #10) implements `[audit]` for both modes. `path` is literal and
+must resolve through existing non-symlink directories to a regular,
+non-symlink destination; a new file is created owner-only (`0600` on Unix).
+The process appends bounded schema-versioned JSONL records for authentication,
+stable denials, and one correlated start/end pair per admitted session. Only
+the actual listener socket peer supplies source attribution. Cookies, tickets,
+request values, executable paths, arguments, environment, and terminal input
+or output are excluded. Audit opening precedes application construction and
+binding, and runtime sink failure permanently denies new authority.
+
+This is append persistence, not a transactional journal: the writer flushes but
+does not `fsync` each record. Operators own rotation, retention, shipping,
+backup, and deletion. The containing filesystem remains trusted against
+privileged or concurrent namespace mutation. SSH, recording, reconnect,
+packaging, deployment examples, and release hardening remain future phases.
 
 ## Implementation Phases
 
@@ -320,13 +335,20 @@ Exit criteria (tests):
 - **Implemented in Chunk 2.1 (Refs #8):** dev vs production startup checks; rejection of development identity outside loopback and in production; rejection of public production plaintext and contradictory/incomplete transport contracts; fail-before-build/bind ordering; and one direct TLS listener with no HTTP fallback.
 - **Implemented in Chunk 2.2 (Refs #9):** trusted reverse-proxy authentication enforces actual socket-peer CIDRs, the single-header identity grammar, opaque secure browser sessions, ticket binding, and WSS-to-PTY identity propagation. The proxy remains responsible for upstream authentication, client-header stripping, canonical injection, TLS termination, and exclusive backend reachability.
 - **Implemented in Chunk 2.3 (Refs #24):** bounded monotonic fixed-window rate limits protect session creation by authenticated identity and authentication failures by actual listener peer IP. Ticket issuance atomically reserves global/per-user concurrency, and ticket redemption transfers the reservation exactly once to the live session. HTTP 503 responses distinguish `global-session-limit` from `identity-session-limit`; HTTP 429 responses include a positive `Retry-After`.
-- Structured JSON audit logs for session lifecycle.
+- **Implemented in Chunk 2.4 (Refs #10):** restrictive append-only
+  schema-versioned JSONL audit records cover authentication, access denials, and
+  exactly-once correlated session lifecycle outcomes. Audit availability gates
+  startup and subsequent authority; listener-peer provenance and whole-file
+  secret/terminal exclusion are integration-tested.
 
 Exit criteria (tests):
 
 - Unit tests: unsafe production config rejection (table-driven over bad configs), identity header validation (missing/spoofed/untrusted source), rate and concurrency limit enforcement, audit event serialization.
 - Integration tests: requests from outside trusted CIDRs cannot inject identity headers; audit log reconstructs who opened which target and when.
 - Security docs describe remaining limitations (shared-OS-user model, recording sensitivity).
+
+**Status:** Phase 2 / M2 complete. The remaining roadmap begins with the SSH
+backend; completion does not make this pre-release build production-safe.
 
 ### Phase 3: SSH Backend
 

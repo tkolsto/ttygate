@@ -60,6 +60,7 @@ struct TestServer {
     state: AppState,
     task: JoinHandle<()>,
     marker: PathBuf,
+    audit_path: PathBuf,
     _directory: TempDir,
 }
 
@@ -376,8 +377,9 @@ impl TestServer {
     }
 
     async fn start_with_capacity(max_sessions: usize, max_sessions_per_user: usize) -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let marker = directory.path().join("proxy-fixture-pids");
+        let audit_path = directory.path().join("audit.jsonl");
         let listener = TcpListener::bind("[::]:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let source = format!(
@@ -393,7 +395,7 @@ provider = "trusted-proxy"
 identity_header = "x-authenticated-user"
 [audit]
 format = "json"
-path = "./audit.jsonl"
+path = {audit_path:?}
 recording = false
 [limits]
 max_sessions = {max_sessions}
@@ -416,6 +418,7 @@ command = [{PTY_FIXTURE:?}, "browser-track", {marker:?}]
             state,
             task,
             marker,
+            audit_path,
             _directory: directory,
         }
     }
@@ -566,6 +569,47 @@ async fn real_listener_accepts_configured_loopback_peer_identity() {
         );
     }
     server.stop().await;
+}
+
+#[tokio::test]
+async fn trusted_proxy_audit_uses_backend_socket_peer_not_forwarding_headers() {
+    with_proxy_test("alice", |stack| {
+        Box::pin(async move {
+            let forwarding_sentinel = "198.51.100.77";
+            let response = stack
+                .proxy
+                .request(
+                    "POST",
+                    "/api/identity",
+                    Some(&stack.proxy.origin),
+                    None,
+                    &[
+                        ("X-Forwarded-For", forwarding_sentinel),
+                        ("Forwarded", "for=203.0.113.88"),
+                    ],
+                    b"",
+                )
+                .await;
+            assert_eq!(response.status, 204);
+
+            let contents = fs::read_to_string(&stack.backend.audit_path).unwrap();
+            assert!(!contents.contains(forwarding_sentinel));
+            assert!(!contents.contains("203.0.113.88"));
+            let event = contents
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|event| event["event_type"] == "authentication-succeeded")
+                .unwrap();
+            assert_eq!(event["identity"], "alice");
+            assert!(
+                event["remote_address"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("[::1]:")
+            );
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
