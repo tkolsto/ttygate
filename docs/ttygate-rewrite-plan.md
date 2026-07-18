@@ -256,12 +256,19 @@ key permissions, PEM shape, and certificate/key agreement. Its stable
 diagnostics do not expose paths or PEM contents, and a TLS failure never falls
 back to HTTP.
 
-The `[server.trusted_proxy] trusted_sources = [...]` and
-`auth.provider = "trusted-proxy"`/`identity_header` fields are currently a
-contract-only shape. Chunk 2.2 must validate the connection peer and propagate
-identity before the application can start in production; no identity header is
-trusted yet. Rate limiting, audit persistence, SSH, recording, reconnect,
-packaging, and release hardening are also future phases.
+Chunk 2.2 (Refs #9) implements `[server.trusted_proxy] trusted_sources = [...]`
+with `auth.provider = "trusted-proxy"` and `identity_header`. The listener's
+actual socket peer is authoritative and must match a configured CIDR before
+exactly one configured identity header is considered. Forwarded address headers
+are ignored, and IPv4-mapped IPv6 peers are not converted across address
+families. The semantic HTTP field value exposed by the HTTP parser must be valid
+UTF-8, contain 1 through 128 bytes, and contain no Unicode whitespace or control
+character. HTTP field-line optional whitespace is parser framing rather than
+part of that semantic value; the proxy must reject or normalize ambiguous
+upstream surrounding whitespace, strip all client instances, and inject exactly
+one canonical header. ttygate performs no further trimming, case folding, or
+Unicode normalization. Rate limiting, audit persistence, SSH, recording,
+reconnect, packaging, and release hardening are future phases.
 
 ## Implementation Phases
 
@@ -311,7 +318,7 @@ Exit criteria (tests):
 ### Phase 2: Production Gating and Audit
 
 - **Implemented in Chunk 2.1 (Refs #8):** dev vs production startup checks; rejection of development identity outside loopback and in production; rejection of public production plaintext and contradictory/incomplete transport contracts; fail-before-build/bind ordering; and one direct TLS listener with no HTTP fallback.
-- **Future in Chunk 2.2:** trusted reverse-proxy auth header provider with enforced source CIDR restrictions. Chunk 2.1 parses and validates only its configuration contract.
+- **Implemented in Chunk 2.2 (Refs #9):** trusted reverse-proxy authentication enforces actual socket-peer CIDRs, the single-header identity grammar, opaque secure browser sessions, ticket binding, and WSS-to-PTY identity propagation. The proxy remains responsible for upstream authentication, client-header stripping, canonical injection, TLS termination, and exclusive backend reachability.
 - Rate limits on session creation and auth failures; per-user/global concurrency limits.
 - Structured JSON audit logs for session lifecycle.
 

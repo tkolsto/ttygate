@@ -21,6 +21,8 @@ require_text() {
 README=README.md
 SECURITY=SECURITY.md
 THREAT_MODEL=docs/threat-model.md
+ROADMAP=docs/roadmap.md
+REWRITE_PLAN=docs/ttygate-rewrite-plan.md
 PROTOCOL=docs/protocol.md
 ISSUE_CONFIG=.github/ISSUE_TEMPLATE/config.yml
 BUG_FORM=.github/ISSUE_TEMPLATE/bug-report.yml
@@ -39,7 +41,13 @@ require_text "$README" 'direct TLS|rustls' 'implemented direct TLS listener'
 require_text "$README" 'no (plaintext|HTTP) fallback|never falls back.*(plaintext|HTTP)' 'no plaintext fallback'
 require_text "$README" 'certificate.*private.key|private.key.*certificate' 'direct TLS certificate and key configuration'
 require_text "$README" 'stable.*(secret|path)|secret.safe.*(error|diagnostic)|diagnostic.*(not|never).*path' 'secret-safe TLS startup diagnostics'
-require_text "$README" 'contract.only|does not yet trust.*identity header|Chunk 2\.2.*trusted.*proxy' 'contract-only trusted-proxy boundary'
+require_text "$README" 'Chunk 2\.2.*(complete|implemented).*Refs #9|Refs #9.*Chunk 2\.2' 'implemented Chunk 2.2 status'
+require_text "$README" 'actual socket peer|socket peer.*authoritative' 'authoritative socket-peer boundary'
+require_text "$README" 'requires exactly one occurrence|identity header.*exactly one' 'single identity-header contract'
+require_text "$README" 'semantic HTTP.*field value|HTTP parser.*optional whitespace' 'semantic HTTP optional-whitespace contract'
+require_text "$README" 'strip every|inject exactly one canonical identity header' 'trusted-proxy strip-and-inject responsibility'
+require_text "$README" 'IPv4.mapped|mapped IPv4' 'IPv4-mapped address policy'
+require_text "$README" 'session and WSS requests|cookie.*session ticket' 'proxy identity authority propagation'
 require_text "$README" 'rate limit.*audit.*SSH.*record|audit.*SSH.*record.*packag' 'future production controls'
 require_text "$README" 'Refs #8' 'Chunk 2.1 changelog reference'
 require_text "$README" 'cargo test --workspace' 'Rust verification command'
@@ -74,8 +82,25 @@ require_text "$THREAT_MODEL" 'DNS rebinding' 'DNS-rebinding threat'
 require_text "$THREAT_MODEL" 'out of scope|non-goals' 'out-of-scope assumptions'
 require_text "$THREAT_MODEL" 'pre-release|not yet implemented|planned' 'implementation-status distinction'
 require_text "$THREAT_MODEL" 'Chunk 2\.1.*(implemented|enforces)|implemented.*Chunk 2\.1' 'implemented Chunk 2.1 controls'
-require_text "$THREAT_MODEL" 'trusted.proxy.*(contract.only|Chunk 2\.2)|Chunk 2\.2.*trusted.proxy' 'future trusted-proxy identity enforcement'
+require_text "$THREAT_MODEL" 'Chunk 2\.2.*(implemented|enforces)|implemented.*Chunk 2\.2' 'implemented Chunk 2.2 controls'
+require_text "$THREAT_MODEL" 'actual socket peer|socket peer.*authoritative' 'authoritative proxy peer boundary'
+require_text "$THREAT_MODEL" 'semantic HTTP field' 'semantic HTTP field-value boundary'
+require_text "$THREAT_MODEL" 'optional whitespace.*(parser|removed)|parser.*optional whitespace' 'HTTP optional-whitespace boundary'
 require_text "$THREAT_MODEL" 'rate limit.*audit.*SSH.*record|audit.*SSH.*record.*packag' 'future control boundaries'
+
+require_file "$ROADMAP"
+require_text "$ROADMAP" 'Chunk 2\.2.*Trusted reverse-proxy auth provider' 'Chunk 2.2 heading'
+require_text "$ROADMAP" 'Status.*complete.*Refs #9' 'complete Chunk 2.2 roadmap status'
+
+require_file "$REWRITE_PLAN"
+require_text "$REWRITE_PLAN" 'Implemented in Chunk 2\.2.*Refs #9|Chunk 2\.2.*implemented.*Refs #9' 'implemented Chunk 2.2 rewrite-plan status'
+require_text "$REWRITE_PLAN" 'semantic HTTP field' 'rewrite-plan semantic HTTP field-value contract'
+require_text "$REWRITE_PLAN" 'optional whitespace.*(parser|framing)|parser.*optional whitespace' 'rewrite-plan HTTP optional-whitespace contract'
+
+if grep -Eini 'contract-only|does not yet trust( or consume)? the identity header|provider unavailable|trusted-proxy enforcement remains Chunk 2\.2|Future in Chunk 2\.2|production authentication (and|is|remains)[^.]*planned' \
+  "$README" "$THREAT_MODEL" "$ROADMAP" "$REWRITE_PLAN"; then
+  fail 'public docs still describe trusted-proxy authentication as unavailable'
+fi
 
 require_file "$PROTOCOL"
 for heading in 'Scope' 'Versioning and compatibility' 'WebSocket framing' 'Control messages' 'Validation and limits' 'Protocol errors and close semantics' 'Backpressure'; do

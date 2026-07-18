@@ -14,8 +14,8 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
-    auth::{AuthContext, AuthProvider, DevAuthProvider},
-    config::{AuthConfig, Config, Limits, TargetAllowlist},
+    auth::{AuthContext, AuthProvider, DevAuthProvider, TrustedProxyAuthProvider},
+    config::{AuthConfig, Config, Limits, ServerTransport, TargetAllowlist},
     origin::OriginPolicy,
     protocol::MAX_BINARY_BYTES,
     session::SessionManager,
@@ -61,8 +61,17 @@ impl AppState {
             AuthConfig::Dev { user } => Arc::new(
                 DevAuthProvider::new(user.clone()).map_err(|_| ServerBuildError::Identity)?,
             ) as Arc<dyn AuthProvider>,
-            AuthConfig::TrustedProxy { .. } => {
-                return Err(ServerBuildError::AuthenticationUnavailable);
+            AuthConfig::TrustedProxy { identity_header } => {
+                let ServerTransport::TrustedProxy(proxy) = &config.server.transport else {
+                    return Err(ServerBuildError::Authentication);
+                };
+                Arc::new(
+                    TrustedProxyAuthProvider::new(
+                        identity_header.clone(),
+                        proxy.trusted_sources.clone(),
+                    )
+                    .map_err(|_| ServerBuildError::Authentication)?,
+                ) as Arc<dyn AuthProvider>
             }
         };
         let targets =
@@ -93,8 +102,8 @@ pub enum ServerBuildError {
     Identity,
     #[error("configured target allowlist is invalid")]
     Targets,
-    #[error("configured authentication provider is not implemented")]
-    AuthenticationUnavailable,
+    #[error("configured authentication provider could not be constructed")]
+    Authentication,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -266,7 +275,7 @@ async fn establish_identity(State(state): State<AppState>, request: Request) -> 
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "identity-unavailable",
-                "Development identity is unavailable.",
+                "Identity is unavailable.",
             );
         }
     };

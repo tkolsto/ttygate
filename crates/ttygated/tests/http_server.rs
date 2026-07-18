@@ -7,15 +7,18 @@ use std::{
 
 use axum::{
     body::Body,
+    extract::ConnectInfo,
     http::{Request, StatusCode, header},
 };
+use http::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
+use ipnet::IpNet;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 use ttygated::{
     auth::{
         AuthContext, AuthError, AuthProvider, DevAuthProvider, ProvisionedIdentity,
-        SESSION_COOKIE_NAME,
+        SESSION_COOKIE_NAME, TrustedProxyAuthProvider,
     },
     config::{Limits, PtyTarget, Target, TargetAllowlist},
     origin::OriginPolicy,
@@ -76,6 +79,29 @@ fn app() -> axum::Router {
     ))
 }
 
+fn trusted_proxy_app() -> axum::Router {
+    let target = Target::Pty(PtyTarget {
+        name: "shell".into(),
+        executable: "/bin/sh".into(),
+        argv: Vec::new(),
+        read_only: false,
+    });
+    let auth: Arc<dyn AuthProvider> = Arc::new(
+        TrustedProxyAuthProvider::new(
+            HeaderName::from_static("x-authenticated-user"),
+            vec!["127.0.0.1/32".parse::<IpNet>().unwrap()],
+        )
+        .unwrap(),
+    );
+    build_router(AppState::new(
+        OriginPolicy::new(ORIGIN).unwrap(),
+        auth,
+        TargetAllowlist::new(vec![target]).unwrap(),
+        TicketStore::new(std::time::Duration::from_secs(10), 32),
+        limits(),
+    ))
+}
+
 async fn response(
     app: &axum::Router,
     method: &str,
@@ -98,6 +124,40 @@ async fn response(
         .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
         .await
         .unwrap()
+}
+
+struct ProxyRequest<'a> {
+    uri: &'a str,
+    origin: Option<&'a str>,
+    cookie: Option<&'a str>,
+    identities: &'a [HeaderValue],
+    peer: SocketAddr,
+    forwarded_for: Option<&'a str>,
+    body: &'a str,
+}
+
+async fn proxy_response(app: &axum::Router, request: ProxyRequest<'_>) -> axum::response::Response {
+    let mut builder = Request::builder().method("POST").uri(request.uri);
+    if let Some(origin) = request.origin {
+        builder = builder.header(header::ORIGIN, origin);
+    }
+    if let Some(cookie) = request.cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(forwarded_for) = request.forwarded_for {
+        builder = builder.header("x-forwarded-for", forwarded_for);
+    }
+    for identity in request.identities {
+        builder = builder.header("x-authenticated-user", identity);
+    }
+    if !request.body.is_empty() {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    let mut http_request = builder.body(Body::from(request.body.to_owned())).unwrap();
+    http_request
+        .extensions_mut()
+        .insert(ConnectInfo(request.peer));
+    app.clone().oneshot(http_request).await.unwrap()
 }
 
 async fn json(response: axum::response::Response) -> serde_json::Value {
@@ -513,4 +573,148 @@ async fn listener_injects_the_actual_peer_into_authentication_context() {
     assert!(response.starts_with(b"HTTP/1.1 204"));
     assert_eq!(*auth.peer_addr.lock().unwrap(), Some(client_addr));
     server.abort();
+}
+
+#[tokio::test]
+async fn trusted_proxy_auth_failures_return_stable_non_reflecting_errors() {
+    let app = trusted_proxy_app();
+    let hostile = HeaderValue::from_static("hostile identity sentinel");
+
+    let response = proxy_response(
+        &app,
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some(ORIGIN),
+            cookie: None,
+            identities: &[hostile],
+            peer: "127.0.0.1:41000".parse().unwrap(),
+            forwarded_for: None,
+            body: "",
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error = json(response).await;
+    assert_eq!(error["error"]["code"], "identity-unavailable");
+    assert_eq!(error["error"]["message"], "Identity is unavailable.");
+    let rendered = error.to_string();
+    for sentinel in ["hostile", "identity sentinel", "127.0.0.1"] {
+        assert!(!rendered.contains(sentinel));
+    }
+}
+
+#[tokio::test]
+async fn untrusted_or_malformed_identity_sets_no_cookie_or_ticket() {
+    let app = trusted_proxy_app();
+    for (peer, identity) in [
+        ("127.0.0.2:41001", HeaderValue::from_static("alice")),
+        (
+            "127.0.0.1:41002",
+            HeaderValue::from_static("malformed identity"),
+        ),
+    ] {
+        let response = proxy_response(
+            &app,
+            ProxyRequest {
+                uri: "/api/identity",
+                origin: Some(ORIGIN),
+                cookie: None,
+                identities: &[identity],
+                peer: peer.parse().unwrap(),
+                forwarded_for: None,
+                body: "",
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(
+            proxy_response(
+                &app,
+                ProxyRequest {
+                    uri: "/api/sessions",
+                    origin: Some(ORIGIN),
+                    cookie: None,
+                    identities: &[],
+                    peer: peer.parse().unwrap(),
+                    forwarded_for: None,
+                    body: r#"{"target":"shell"}"#,
+                },
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn forwarded_headers_cannot_authorize_session_creation() {
+    let app = trusted_proxy_app();
+
+    let response = proxy_response(
+        &app,
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some(ORIGIN),
+            cookie: None,
+            identities: &[HeaderValue::from_static("alice")],
+            peer: "127.0.0.2:41003".parse().unwrap(),
+            forwarded_for: Some("127.0.0.1"),
+            body: "",
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+}
+
+#[tokio::test]
+async fn wrong_origin_precedes_proxy_identity_establishment() {
+    let app = trusted_proxy_app();
+
+    let response = proxy_response(
+        &app,
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some("https://attacker.invalid"),
+            cookie: None,
+            identities: &[HeaderValue::from_static("alice")],
+            peer: "127.0.0.1:41004".parse().unwrap(),
+            forwarded_for: None,
+            body: "",
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+}
+
+#[tokio::test]
+async fn secure_cookie_attributes_are_provider_independent() {
+    let app = trusted_proxy_app();
+
+    let response = proxy_response(
+        &app,
+        ProxyRequest {
+            uri: "/api/identity",
+            origin: Some(ORIGIN),
+            cookie: None,
+            identities: &[HeaderValue::from_static("alice")],
+            peer: "127.0.0.1:41005".parse().unwrap(),
+            forwarded_for: None,
+            body: "",
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+    for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Path=/"] {
+        assert!(cookie.contains(attribute));
+    }
+    assert!(!cookie.contains("alice"));
 }

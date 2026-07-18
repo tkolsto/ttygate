@@ -33,8 +33,6 @@ pub enum StartupError {
     Tls(#[from] TlsError),
     #[error(transparent)]
     Application(#[from] ServerBuildError),
-    #[error("configured authentication provider is not implemented")]
-    AuthenticationUnavailable,
     #[error("listener could not be bound")]
     Bind(#[source] io::Error),
     #[error("server stopped because of a listener error")]
@@ -78,14 +76,13 @@ where
         ServerTransport::DirectTls(config) => {
             Some(PreparedTransport::DirectTls(tls_loader(config).await?))
         }
-        ServerTransport::TrustedProxy(_) => None,
+        ServerTransport::TrustedProxy(_) => Some(PreparedTransport::Plaintext),
     };
     let state = app_builder(config)?;
-    let transport = transport.ok_or(StartupError::AuthenticationUnavailable)?;
     Ok(PreparedServer {
         bind: config.server.bind,
         state,
-        transport,
+        transport: transport.expect("every validated transport has a serving mode"),
     })
 }
 
@@ -152,6 +149,19 @@ name = "shell"
 type = "pty"
 command = ["/bin/sh"]
 "#
+    }
+
+    fn trusted_proxy_source() -> String {
+        source()
+            .replace("mode = \"dev\"", "mode = \"production\"")
+            .replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
+            )
+            .replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"",
+            )
     }
 
     fn phases() -> (PhaseLog, PhaseLog) {
@@ -274,24 +284,14 @@ command = ["/bin/sh"]
     }
 
     #[tokio::test]
-    async fn unimplemented_trusted_proxy_authentication_fails_before_binding() {
-        let source = source()
-            .replace("mode = \"dev\"", "mode = \"production\"")
-            .replace(
-                "public_url = \"http://127.0.0.1:7681\"",
-                "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
-            )
-            .replace(
-                "provider = \"dev\"\nuser = \"local\"",
-                "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"",
-            );
-        let config = parse(&source).unwrap();
+    async fn production_trusted_proxy_startup_reaches_bind_only_with_real_provider() {
+        let config = parse(&trusted_proxy_source()).unwrap();
         assert!(matches!(config.auth, AuthConfig::TrustedProxy { .. }));
         let (record, observed) = phases();
         let app_record = Arc::clone(&record);
         let bind_record = Arc::clone(&record);
 
-        let error = start_with(
+        start_with(
             &config,
             |_| async { unreachable!("proxy transport does not load direct TLS") },
             move |config| {
@@ -304,11 +304,43 @@ command = ["/bin/sh"]
             },
         )
         .await
+        .unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), ["app", "bind"]);
+    }
+
+    #[test]
+    fn trusted_proxy_config_constructs_real_provider() {
+        let config = parse(&trusted_proxy_source()).unwrap();
+
+        assert!(AppState::from_config(&config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_provider_construction_failure_reaches_no_listener() {
+        let config = parse(&trusted_proxy_source()).unwrap();
+        let (record, observed) = phases();
+        let app_record = Arc::clone(&record);
+        let bind_record = Arc::clone(&record);
+
+        let error = start_with(
+            &config,
+            |_| async { unreachable!("proxy transport does not load direct TLS") },
+            move |_| {
+                app_record.lock().unwrap().push("app");
+                Err(ServerBuildError::Authentication)
+            },
+            move |_: PreparedServer| {
+                bind_record.lock().unwrap().push("bind");
+                async { Ok(()) }
+            },
+        )
+        .await
         .unwrap_err();
 
         assert!(matches!(
             error,
-            StartupError::Application(ServerBuildError::AuthenticationUnavailable)
+            StartupError::Application(ServerBuildError::Authentication)
         ));
         assert_eq!(*observed.lock().unwrap(), ["app"]);
     }
