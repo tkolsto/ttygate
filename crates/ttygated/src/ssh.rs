@@ -2367,16 +2367,18 @@ requesttty force\n"
         let mut trusted = vec![0; 256];
         let mut terminal_bytes = Vec::new();
         let mut terminal_buffer = [0_u8; 256];
-        while !terminal_bytes.windows(5).any(|window| window == b"READY") {
-            let count = tokio::time::timeout(
-                wait,
-                tokio::io::AsyncReadExt::read(&mut terminal, &mut terminal_buffer),
-            )
-            .await
-            .expect("terminal phase marker timed out")
-            .unwrap();
-            terminal_bytes.extend_from_slice(&terminal_buffer[..count]);
-        }
+        tokio::time::timeout(wait, async {
+            while !terminal_bytes.windows(5).any(|window| window == b"READY") {
+                let count =
+                    tokio::io::AsyncReadExt::read(&mut terminal, &mut terminal_buffer).await?;
+                assert_ne!(count, 0, "terminal closed before phase marker");
+                terminal_bytes.extend_from_slice(&terminal_buffer[..count]);
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .expect("terminal phase marker timed out")
+        .unwrap();
         let mut pending_read = Box::pin(client_log.read(&mut trusted));
         assert!(matches!(
             futures_util::poll!(&mut pending_read),
@@ -2399,16 +2401,17 @@ requesttty force\n"
         assert_eq!(classifier.classification(), None);
         let mut raw = Vec::new();
         let mut raw_buffer = [0_u8; 256];
-        while !raw.windows(17).any(|window| window == b"Authenticated to ") {
-            let count = tokio::time::timeout(
-                wait,
-                tokio::io::AsyncReadExt::read(&mut raw_stderr, &mut raw_buffer),
-            )
-            .await
-            .expect("raw stderr marker timed out")
-            .unwrap();
-            raw.extend_from_slice(&raw_buffer[..count]);
-        }
+        tokio::time::timeout(wait, async {
+            while !raw.windows(17).any(|window| window == b"Authenticated to ") {
+                let count = tokio::io::AsyncReadExt::read(&mut raw_stderr, &mut raw_buffer).await?;
+                assert_ne!(count, 0, "raw stderr closed before marker");
+                raw.extend_from_slice(&raw_buffer[..count]);
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .expect("raw stderr marker timed out")
+        .unwrap();
         assert!(raw.windows(17).any(|window| window == b"Authenticated to "));
         tokio::time::timeout(
             wait,
