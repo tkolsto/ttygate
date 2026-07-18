@@ -248,6 +248,21 @@ user_policy = "same-as-auth-user"
 
 Production config should fail startup if `auth.provider = "dev"` or if `bind` is public without explicit production controls.
 
+Chunk 2.1 (Refs #8) implements this configuration gate and direct TLS. A
+loopback development listener may add `[server.tls]` with absolute
+`certificate` and `private_key` paths and an `https://` `public_url`. TLS
+startup validates bounded regular non-symlink files, restrictive Unix private
+key permissions, PEM shape, and certificate/key agreement. Its stable
+diagnostics do not expose paths or PEM contents, and a TLS failure never falls
+back to HTTP.
+
+The `[server.trusted_proxy] trusted_sources = [...]` and
+`auth.provider = "trusted-proxy"`/`identity_header` fields are currently a
+contract-only shape. Chunk 2.2 must validate the connection peer and propagate
+identity before the application can start in production; no identity header is
+trusted yet. Rate limiting, audit persistence, SSH, recording, reconnect,
+packaging, and release hardening are also future phases.
+
 ## Implementation Phases
 
 Each phase's tests are part of its exit criteria — there is no separate testing phase. Continuous checks run in CI from Phase 0 onward: `cargo clippy --all-targets --all-features -- -D warnings`, `cargo deny` (or `cargo audit`), CodeQL, dependency review, `cargo fmt --check`, frontend build.
@@ -295,9 +310,8 @@ Exit criteria (tests):
 
 ### Phase 2: Production Gating and Audit
 
-- Dev vs production startup checks: production refuses `auth.provider = "dev"`, public bind without TLS/trusted-proxy config, and other unsafe combinations. Fail closed with actionable errors.
-- Direct TLS listener support.
-- Trusted reverse-proxy auth header provider with trusted source CIDR restrictions.
+- **Implemented in Chunk 2.1 (Refs #8):** dev vs production startup checks; rejection of development identity outside loopback and in production; rejection of public production plaintext and contradictory/incomplete transport contracts; fail-before-build/bind ordering; and one direct TLS listener with no HTTP fallback.
+- **Future in Chunk 2.2:** trusted reverse-proxy auth header provider with enforced source CIDR restrictions. Chunk 2.1 parses and validates only its configuration contract.
 - Rate limits on session creation and auth failures; per-user/global concurrency limits.
 - Structured JSON audit logs for session lifecycle.
 

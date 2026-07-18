@@ -99,9 +99,11 @@ The first running build already enforces Origin checks and ticket-bound WebSocke
 
 ### Chunk 2.1 — Mode gating and fail-closed startup
 
+- **Status:** complete (Refs #8). Production mode and transport contracts are typed; unsafe combinations fail before application construction or listener binding; direct rustls serves frontend, API, and WebSocket traffic without plaintext fallback.
 - **Deliverables:** `mode = "dev" | "production"`; production startup refuses `auth.provider = "dev"`, public bind without TLS or trusted-proxy config, and other unsafe combinations, with actionable error messages; direct TLS listener (rustls) with cert/key config.
 - **Consumes:** config (1.1), server (1.3).
-- **Done when:** table-driven tests over unsafe configs all fail closed; TLS listener serves the frontend in an integration test.
+- **Done when:** complete. A table-driven unsafe-config matrix fails closed, TLS material has stable secret-safe errors, and a verified real-TLS integration test serves the frontend and exercises HTTPS → cookie → ticket → WSS → PTY.
+- **Boundary:** this chunk defines the trusted-proxy contract but never trusts an identity header. Production application construction remains unavailable until Chunk 2.2 supplies the real provider.
 
 ### Chunk 2.2 — Trusted reverse-proxy auth provider
 

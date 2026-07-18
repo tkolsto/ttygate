@@ -1,11 +1,14 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
+use http::HeaderName;
+use ipnet::IpNet;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -23,6 +26,7 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub mode: ServerMode,
     pub public_url: String,
+    pub transport: ServerTransport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -33,15 +37,27 @@ pub enum ServerMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthConfig {
-    pub provider: AuthProvider,
-    pub user: String,
+pub enum ServerTransport {
+    Plaintext,
+    DirectTls(TlsConfig),
+    TrustedProxy(TrustedProxyConfig),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AuthProvider {
-    Dev,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedProxyConfig {
+    pub trusted_sources: Vec<IpNet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthConfig {
+    Dev { user: String },
+    TrustedProxy { identity_header: HeaderName },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,13 +225,43 @@ struct RawServer {
     bind: SocketAddr,
     mode: ServerMode,
     public_url: String,
+    #[serde(default)]
+    tls: Option<RawTls>,
+    #[serde(default)]
+    trusted_proxy: Option<RawTrustedProxy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    #[serde(default)]
+    certificate: Option<PathBuf>,
+    #[serde(default)]
+    private_key: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTrustedProxy {
+    #[serde(default)]
+    trusted_sources: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAuth {
-    provider: AuthProvider,
-    user: String,
+    provider: RawAuthProvider,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    identity_header: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawAuthProvider {
+    Dev,
+    TrustedProxy,
 }
 
 #[derive(Deserialize)]
@@ -272,6 +318,8 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
         toml::from_str(source).map_err(|error: toml::de::Error| ConfigError::Parse {
             message: error.message().to_owned(),
         })?;
+    let transport = convert_transport(raw.server.tls, raw.server.trusted_proxy)?;
+    let auth = convert_auth(raw.auth)?;
     let targets = raw
         .targets
         .into_iter()
@@ -280,7 +328,6 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
         .collect::<Result<Vec<_>, _>>()?;
 
     validate_literal_path(&raw.audit.path, "audit.path")?;
-    validate_nonempty(&raw.auth.user, "auth.user", "must not be empty")?;
     validate_nonempty(
         &raw.server.public_url,
         "server.public_url",
@@ -289,16 +336,14 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
     validate_limits(&raw.limits)?;
     TargetAllowlist::new(targets.clone())?;
 
-    Ok(Config {
+    let config = Config {
         server: ServerConfig {
             bind: raw.server.bind,
             mode: raw.server.mode,
             public_url: raw.server.public_url,
+            transport,
         },
-        auth: AuthConfig {
-            provider: raw.auth.provider,
-            user: raw.auth.user,
-        },
+        auth,
         audit: AuditConfig {
             format: raw.audit.format,
             path: raw.audit.path,
@@ -311,7 +356,200 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
             absolute_timeout: Duration::from_secs(raw.limits.absolute_timeout_seconds),
         },
         targets,
-    })
+    };
+    validate_startup_contract(&config)?;
+    Ok(config)
+}
+
+pub fn validate_startup_contract(config: &Config) -> Result<(), ConfigError> {
+    let public_url = url::Url::parse(&config.server.public_url).map_err(|_| {
+        validation(
+            "server.public_url".into(),
+            "must be an absolute HTTP or HTTPS origin URL",
+        )
+    })?;
+    if !public_url.username().is_empty()
+        || public_url.password().is_some()
+        || public_url.host().is_none()
+        || public_url.path() != "/"
+        || public_url.query().is_some()
+        || public_url.fragment().is_some()
+    {
+        return Err(validation(
+            "server.public_url".into(),
+            "must contain only an HTTP or HTTPS origin without credentials, path, query, or fragment",
+        ));
+    }
+
+    let expected_scheme = match config.server.transport {
+        ServerTransport::Plaintext => "http",
+        ServerTransport::DirectTls(_) | ServerTransport::TrustedProxy(_) => "https",
+    };
+    if public_url.scheme() != expected_scheme {
+        return Err(validation(
+            "server.public_url".into(),
+            "scheme must match the configured transport boundary",
+        ));
+    }
+
+    if matches!(config.auth, AuthConfig::Dev { .. }) && !config.server.bind.ip().is_loopback() {
+        return Err(validation(
+            "server.bind".into(),
+            "development authentication requires a loopback listener",
+        ));
+    }
+
+    if config.server.mode == ServerMode::Production
+        && !config.server.bind.ip().is_loopback()
+        && matches!(config.server.transport, ServerTransport::Plaintext)
+    {
+        return Err(validation(
+            "server.transport".into(),
+            "public production binding requires direct TLS or a complete trusted-proxy contract",
+        ));
+    }
+
+    if config.server.mode == ServerMode::Production && matches!(config.auth, AuthConfig::Dev { .. })
+    {
+        return Err(validation(
+            "auth.provider".into(),
+            "development authentication is not allowed in production",
+        ));
+    }
+
+    match (&config.auth, &config.server.transport) {
+        (AuthConfig::TrustedProxy { .. }, ServerTransport::TrustedProxy(_)) => {}
+        (AuthConfig::TrustedProxy { .. }, _) => {
+            return Err(validation(
+                "auth.provider".into(),
+                "trusted-proxy authentication requires the trusted-proxy transport contract",
+            ));
+        }
+        (AuthConfig::Dev { .. }, ServerTransport::TrustedProxy(_)) => {
+            return Err(validation(
+                "auth.provider".into(),
+                "trusted-proxy transport requires trusted-proxy authentication",
+            ));
+        }
+        (AuthConfig::Dev { .. }, _) => {}
+    }
+
+    Ok(())
+}
+
+fn convert_transport(
+    tls: Option<RawTls>,
+    trusted_proxy: Option<RawTrustedProxy>,
+) -> Result<ServerTransport, ConfigError> {
+    match (tls, trusted_proxy) {
+        (None, None) => Ok(ServerTransport::Plaintext),
+        (Some(_), Some(_)) => Err(validation(
+            "server.transport".into(),
+            "direct TLS and trusted proxy cannot both be configured",
+        )),
+        (Some(tls), None) => {
+            let certificate = tls.certificate.ok_or_else(|| {
+                validation(
+                    "server.tls.certificate".into(),
+                    "is required when direct TLS is configured",
+                )
+            })?;
+            let private_key = tls.private_key.ok_or_else(|| {
+                validation(
+                    "server.tls.private_key".into(),
+                    "is required when direct TLS is configured",
+                )
+            })?;
+            validate_literal_path(&certificate, "server.tls.certificate")?;
+            validate_literal_path(&private_key, "server.tls.private_key")?;
+            Ok(ServerTransport::DirectTls(TlsConfig {
+                certificate,
+                private_key,
+            }))
+        }
+        (None, Some(proxy)) => {
+            let sources = proxy.trusted_sources.ok_or_else(|| {
+                validation(
+                    "server.trusted_proxy.trusted_sources".into(),
+                    "is required when trusted proxy is configured",
+                )
+            })?;
+            if sources.is_empty() {
+                return Err(validation(
+                    "server.trusted_proxy.trusted_sources".into(),
+                    "must contain at least one trusted source CIDR",
+                ));
+            }
+            let mut canonical = BTreeSet::new();
+            let trusted_sources = sources
+                .iter()
+                .map(|source| {
+                    let network = IpNet::from_str(source).map_err(|_| {
+                        validation(
+                            "server.trusted_proxy.trusted_sources".into(),
+                            "contains an invalid CIDR",
+                        )
+                    })?;
+                    let network = network.trunc();
+                    if network.to_string() != *source {
+                        return Err(validation(
+                            "server.trusted_proxy.trusted_sources".into(),
+                            "must contain canonical CIDRs",
+                        ));
+                    }
+                    if !canonical.insert(network) {
+                        return Err(validation(
+                            "server.trusted_proxy.trusted_sources".into(),
+                            "must not contain duplicate CIDRs",
+                        ));
+                    }
+                    Ok(network)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ServerTransport::TrustedProxy(TrustedProxyConfig {
+                trusted_sources,
+            }))
+        }
+    }
+}
+
+fn convert_auth(raw: RawAuth) -> Result<AuthConfig, ConfigError> {
+    match raw.provider {
+        RawAuthProvider::Dev => {
+            if raw.identity_header.is_some() {
+                return Err(validation(
+                    "auth.identity_header".into(),
+                    "is only valid for trusted-proxy authentication",
+                ));
+            }
+            let user = raw.user.ok_or_else(|| {
+                validation("auth.user".into(), "is required for dev authentication")
+            })?;
+            validate_nonempty(&user, "auth.user", "must not be empty")?;
+            Ok(AuthConfig::Dev { user })
+        }
+        RawAuthProvider::TrustedProxy => {
+            if raw.user.is_some() {
+                return Err(validation(
+                    "auth.user".into(),
+                    "is only valid for dev authentication",
+                ));
+            }
+            let identity_header = raw.identity_header.ok_or_else(|| {
+                validation(
+                    "auth.identity_header".into(),
+                    "is required for trusted-proxy authentication",
+                )
+            })?;
+            let identity_header = HeaderName::from_str(&identity_header).map_err(|_| {
+                validation(
+                    "auth.identity_header".into(),
+                    "must be a valid HTTP header name",
+                )
+            })?;
+            Ok(AuthConfig::TrustedProxy { identity_header })
+        }
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -616,13 +854,18 @@ fn validate_typed_target(index: usize, target: &Target) -> Result<(), ConfigErro
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use tempfile::tempdir;
 
     use super::{
-        AuditFormat, AuthProvider, ConfigError, PtyTarget, ServerMode, SshTarget, SshUserPolicy,
-        Target, TargetAllowlist, load, parse,
+        AuditFormat, AuthConfig, ConfigError, PtyTarget, ServerMode, ServerTransport, SshTarget,
+        SshUserPolicy, Target, TargetAllowlist, load, parse,
     };
 
     const COMPLETE_CONFIG: &str = r#"
@@ -667,7 +910,11 @@ user_policy = "same-as-auth-user"
 
         assert_eq!(config.server.mode, ServerMode::Dev);
         assert_eq!(config.server.bind.to_string(), "127.0.0.1:7681");
-        assert_eq!(config.auth.provider, AuthProvider::Dev);
+        assert!(matches!(
+            config.auth,
+            AuthConfig::Dev { ref user } if user == "local"
+        ));
+        assert_eq!(config.server.transport, ServerTransport::Plaintext);
         assert_eq!(config.audit.format, AuditFormat::Json);
         assert_eq!(config.limits.max_sessions, 8);
         assert_eq!(config.targets.len(), 2);
@@ -1191,9 +1438,417 @@ user_mapping = { alice = "one", alice = "two" }"#,
     }
 
     #[test]
-    fn production_mode_parses_without_chunk_2_1_gating() {
-        let source = COMPLETE_CONFIG.replace("mode = \"dev\"", "mode = \"production\"");
-        assert_eq!(parse(&source).unwrap().server.mode, ServerMode::Production);
+    fn parses_typed_plaintext_direct_tls_and_trusted_proxy_contracts() {
+        let plaintext = parse(COMPLETE_CONFIG).unwrap();
+        assert_eq!(plaintext.server.transport, ServerTransport::Plaintext);
+
+        let direct_tls = COMPLETE_CONFIG.replace(
+            "public_url = \"http://127.0.0.1:7681\"",
+            r#"public_url = "https://127.0.0.1:7681"
+
+[server.tls]
+certificate = "/etc/ttygate/tls/certificate.pem"
+private_key = "/etc/ttygate/tls/private-key.pem""#,
+        );
+        let direct_tls = parse(&direct_tls).unwrap();
+        assert!(matches!(
+            direct_tls.server.transport,
+            ServerTransport::DirectTls(ref tls)
+                if tls.certificate == Path::new("/etc/ttygate/tls/certificate.pem")
+                    && tls.private_key == Path::new("/etc/ttygate/tls/private-key.pem")
+        ));
+
+        let trusted_proxy = COMPLETE_CONFIG
+            .replace("mode = \"dev\"", "mode = \"production\"")
+            .replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                r#"public_url = "https://terminal.example.test"
+
+[server.trusted_proxy]
+trusted_sources = ["127.0.0.1/32", "::1/128"]"#,
+            )
+            .replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"",
+            );
+        let trusted_proxy = parse(&trusted_proxy).unwrap();
+        assert!(matches!(
+            trusted_proxy.auth,
+            AuthConfig::TrustedProxy { ref identity_header }
+                if identity_header.as_str() == "x-authenticated-user"
+        ));
+        assert!(matches!(
+            trusted_proxy.server.transport,
+            ServerTransport::TrustedProxy(ref proxy)
+                if proxy.trusted_sources.iter().map(ToString::to_string).collect::<Vec<_>>()
+                    == ["127.0.0.1/32", "::1/128"]
+        ));
+    }
+
+    #[test]
+    fn provider_specific_missing_and_stray_fields_fail_closed() {
+        let cases = [
+            COMPLETE_CONFIG.replace("user = \"local\"\n", ""),
+            COMPLETE_CONFIG.replace(
+                "user = \"local\"",
+                "user = \"local\"\nidentity_header = \"x-user\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"x-user\"\nuser = \"stray\"",
+            ),
+        ];
+        for source in cases {
+            assert!(parse(&source).is_err(), "provider-specific fields accepted");
+        }
+    }
+
+    #[test]
+    fn partial_tls_and_proxy_sections_have_actionable_field_errors() {
+        let cases = [
+            (
+                COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"",
+                ),
+                "server.tls.private_key",
+            ),
+            (
+                COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.trusted_proxy]\ntrusted_sources = []",
+                ),
+                "server.trusted_proxy.trusted_sources",
+            ),
+        ];
+        for (source, field) in cases {
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains(field), "{error:?} did not contain {field:?}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_and_identity_header_are_typed_and_canonical() {
+        let source = COMPLETE_CONFIG
+            .replace("mode = \"dev\"", "mode = \"production\"")
+            .replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"10.0.0.0/8\"]",
+            )
+            .replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"X-Authenticated-User\"",
+            );
+        let config = parse(&source).unwrap();
+        assert!(matches!(
+            config.auth,
+            AuthConfig::TrustedProxy { ref identity_header }
+                if identity_header.as_str() == "x-authenticated-user"
+        ));
+        assert!(matches!(
+            config.server.transport,
+            ServerTransport::TrustedProxy(ref proxy)
+                if proxy.trusted_sources[0].to_string() == "10.0.0.0/8"
+        ));
+    }
+
+    #[test]
+    fn production_validation_matrix_fails_closed() {
+        struct Case {
+            name: &'static str,
+            source: String,
+            error_field: Option<&'static str>,
+        }
+
+        let tls_server = r#"public_url = "https://127.0.0.1:7681"
+
+[server.tls]
+certificate = "/etc/ttygate/tls/certificate.pem"
+private_key = "/etc/ttygate/tls/private-key.pem""#;
+        let proxy_server = r#"public_url = "https://terminal.example.test"
+
+[server.trusted_proxy]
+trusted_sources = ["127.0.0.1/32"]"#;
+        let proxy_auth = "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"";
+
+        let cases = [
+            Case {
+                name: "valid loopback plaintext development",
+                source: COMPLETE_CONFIG.to_owned(),
+                error_field: None,
+            },
+            Case {
+                name: "valid loopback direct TLS development",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    tls_server,
+                ),
+                error_field: None,
+            },
+            Case {
+                name: "valid production trusted proxy contract",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        proxy_server,
+                    )
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: None,
+            },
+            Case {
+                name: "production plaintext development identity",
+                source: COMPLETE_CONFIG.replace("mode = \"dev\"", "mode = \"production\""),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "production direct TLS development identity",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        tls_server,
+                    ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "production proxy development identity",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        proxy_server,
+                    ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "development identity on IPv4 wildcard",
+                source: COMPLETE_CONFIG.replace("127.0.0.1:7681", "0.0.0.0:7681"),
+                error_field: Some("server.bind"),
+            },
+            Case {
+                name: "development identity on IPv6 wildcard with TLS",
+                source: COMPLETE_CONFIG
+                    .replace("bind = \"127.0.0.1:7681\"", "bind = \"[::]:7681\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        tls_server,
+                    ),
+                error_field: Some("server.bind"),
+            },
+            Case {
+                name: "public production plaintext",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace("bind = \"127.0.0.1:7681\"", "bind = \"0.0.0.0:7681\"")
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: Some("server.transport"),
+            },
+            Case {
+                name: "plaintext with HTTPS public URL",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "https://127.0.0.1:7681",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "direct TLS with HTTP public URL",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"http://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "trusted proxy with HTTP public URL",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"http://127.0.0.1:7681\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "simultaneous direct TLS and trusted proxy transports",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://terminal.example.test\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
+                ),
+                error_field: Some("server.transport"),
+            },
+            Case {
+                name: "TLS section with certificate only",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"",
+                ),
+                error_field: Some("server.tls.private_key"),
+            },
+            Case {
+                name: "TLS section with private key only",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\nprivate_key = \"/key.pem\"",
+                ),
+                error_field: Some("server.tls.certificate"),
+            },
+            Case {
+                name: "trusted proxy auth without proxy transport",
+                source: COMPLETE_CONFIG.replace(
+                    "provider = \"dev\"\nuser = \"local\"",
+                    proxy_auth,
+                ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "proxy transport without trusted proxy auth",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    proxy_server,
+                ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "duplicate trusted proxy CIDRs",
+                source: COMPLETE_CONFIG
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\", \"127.0.0.1/32\"]",
+                    )
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: Some("server.trusted_proxy.trusted_sources"),
+            },
+            Case {
+                name: "noncanonical trusted proxy CIDR",
+                source: COMPLETE_CONFIG
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.42/8\"]",
+                    )
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: Some("server.trusted_proxy.trusted_sources"),
+            },
+            Case {
+                name: "public URL credentials",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://operator:secret@127.0.0.1:7681",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "public URL path",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://127.0.0.1:7681/terminal",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "public URL query",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://127.0.0.1:7681/?secret=value",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "public URL fragment",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://127.0.0.1:7681/#fragment",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "unsupported public URL scheme",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "ftp://127.0.0.1:7681",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "missing public URL host",
+                source: COMPLETE_CONFIG
+                    .replace("http://127.0.0.1:7681", "http://"),
+                error_field: Some("server.public_url"),
+            },
+        ];
+
+        for case in cases {
+            match case.error_field {
+                None => {
+                    parse(&case.source).unwrap_or_else(|error| panic!("{}: {error}", case.name));
+                }
+                Some(field) => {
+                    let error = match parse(&case.source) {
+                        Ok(_) => panic!("{} unexpectedly validated", case.name),
+                        Err(error) => error.to_string(),
+                    };
+                    assert!(
+                        error.contains(field),
+                        "{}: {error:?} did not contain {field:?}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn development_identity_never_validates_for_non_loopback_exposure_even_with_tls() {
+        for bind in ["0.0.0.0:7681", "192.0.2.10:7681", "[::]:7681"] {
+            let source = COMPLETE_CONFIG
+                .replace("bind = \"127.0.0.1:7681\"", &format!("bind = \"{bind}\""))
+                .replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://terminal.example.test\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"",
+                );
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains("server.bind"), "{bind}: {error}");
+        }
+    }
+
+    #[test]
+    fn startup_contract_errors_do_not_reflect_hostile_values() {
+        let sentinels = [
+            "operator-secret",
+            "private-path-sentinel",
+            "hostile-header-sentinel",
+            "cidr-sentinel",
+        ];
+        let cases = [
+            COMPLETE_CONFIG.replace(
+                "http://127.0.0.1:7681",
+                "http://operator-secret@127.0.0.1:7681",
+            ),
+            COMPLETE_CONFIG.replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/private-path-sentinel/cert.pem\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"hostile header sentinel\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"cidr-sentinel\"]",
+            ),
+        ];
+        for source in cases {
+            let message = parse(&source).unwrap_err().to_string();
+            for sentinel in sentinels {
+                assert!(
+                    !message.contains(sentinel),
+                    "{message:?} reflected {sentinel}"
+                );
+            }
+        }
     }
 
     #[test]
