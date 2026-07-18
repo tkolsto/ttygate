@@ -51,6 +51,8 @@ impl PtyProcessBackend {
                 process_group: pid,
                 #[cfg(test)]
                 reaped: None,
+                #[cfg(test)]
+                cleanup_failures: None,
             },
         })
     }
@@ -85,6 +87,8 @@ impl PtyProcessBackend {
                 process_group: pid,
                 #[cfg(test)]
                 reaped: None,
+                #[cfg(test)]
+                cleanup_failures: None,
             },
             raw_stderr,
             client_log,
@@ -147,6 +151,14 @@ impl RunningPty {
     pub(crate) fn observe_reap(&mut self, reaped: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.child.reaped = Some(reaped);
     }
+
+    #[cfg(test)]
+    pub(crate) fn inject_cleanup_failures(
+        &mut self,
+        failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.child.cleanup_failures = Some(failures);
+    }
 }
 
 pub(crate) struct PtyReader(pty_process::OwnedReadPty);
@@ -200,22 +212,16 @@ pub(crate) struct PtyChild {
     process_group: Pid,
     #[cfg(test)]
     reaped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    cleanup_failures: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl PtyChild {
     pub(crate) async fn wait(&mut self) -> Result<std::process::ExitStatus, BackendError> {
-        let result = self
-            .inner
+        self.inner
             .wait()
             .await
-            .map_err(|_| BackendError::Unavailable);
-        #[cfg(test)]
-        if result.is_ok()
-            && let Some(reaped) = &self.reaped
-        {
-            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        result
+            .map_err(|_| BackendError::Unavailable)
     }
 
     pub(crate) async fn terminate(
@@ -224,10 +230,8 @@ impl PtyChild {
     ) -> Result<std::process::ExitStatus, BackendError> {
         let result = self.terminate_with(grace, signal_group).await;
         #[cfg(test)]
-        if result.is_ok()
-            && let Some(reaped) = &self.reaped
-        {
-            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+        if result.is_ok() {
+            self.confirm_cleanup_for_test()?;
         }
         result
     }
@@ -267,7 +271,27 @@ impl PtyChild {
     ) -> Result<(), BackendError> {
         let _ = signal_group(self.process_group, Signal::SIGHUP);
         tokio::time::sleep(grace).await;
-        kill_group_if_present(self.process_group)
+        kill_group_if_present(self.process_group)?;
+        #[cfg(test)]
+        self.confirm_cleanup_for_test()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn confirm_cleanup_for_test(&self) -> Result<(), BackendError> {
+        if let Some(failures) = &self.cleanup_failures {
+            let remaining = failures.load(std::sync::atomic::Ordering::SeqCst);
+            if remaining != 0 {
+                if remaining != usize::MAX {
+                    failures.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                return Err(BackendError::Unavailable);
+            }
+        }
+        if let Some(reaped) = &self.reaped {
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
