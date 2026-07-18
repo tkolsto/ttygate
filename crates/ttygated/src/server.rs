@@ -205,12 +205,13 @@ pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()
     .await
 }
 
-pub async fn serve_tls(
-    address: SocketAddr,
+pub async fn serve_tls_on(
+    listener: std::net::TcpListener,
     state: AppState,
     tls: axum_server::tls_rustls::RustlsConfig,
 ) -> std::io::Result<()> {
-    axum_server::bind_rustls(address, tls)
+    listener.set_nonblocking(true)?;
+    axum_server::from_tcp_rustls(listener, tls)?
         .serve(build_router(state).into_make_service_with_connect_info::<SocketAddr>())
         .await
 }

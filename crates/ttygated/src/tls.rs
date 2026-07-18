@@ -1,4 +1,9 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::Path,
+    sync::Arc,
+};
 
 use axum_server::tls_rustls::RustlsConfig;
 use rustls::{
@@ -37,31 +42,48 @@ enum MaterialKind {
 }
 
 pub async fn load(config: &TlsConfig) -> Result<RustlsConfig, TlsError> {
-    inspect(
+    load_with_hook(config, || {})
+}
+
+#[cfg(test)]
+async fn load_with_certificate_open_hook(
+    config: &TlsConfig,
+    after_certificate_open: impl FnOnce(),
+) -> Result<RustlsConfig, TlsError> {
+    load_with_hook(config, after_certificate_open)
+}
+
+fn load_with_hook(
+    config: &TlsConfig,
+    after_certificate_open: impl FnOnce(),
+) -> Result<RustlsConfig, TlsError> {
+    let certificate = read_material(
         &config.certificate,
         MaterialKind::Certificate,
         MAX_CERTIFICATE_BYTES,
-    )
-    .await?;
-    inspect(
+        after_certificate_open,
+    )?;
+    let private_key = read_material(
         &config.private_key,
         MaterialKind::PrivateKey,
         MAX_PRIVATE_KEY_BYTES,
-    )
-    .await?;
+        || {},
+    )?;
 
-    let certificate = tokio::fs::read(&config.certificate)
-        .await
-        .map_err(|_| TlsError::CertificateUnreadable)?;
-    let private_key = tokio::fs::read(&config.private_key)
-        .await
-        .map_err(|_| TlsError::PrivateKeyUnreadable)?;
-
+    if !has_only_pem_sections(&certificate, &[b"CERTIFICATE"]) {
+        return Err(TlsError::CertificateMalformed);
+    }
     let certificates = CertificateDer::pem_slice_iter(&certificate)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| TlsError::CertificateMalformed)?;
     if certificates.is_empty() {
         return Err(TlsError::CertificateMalformed);
+    }
+    if !has_only_pem_sections(
+        &private_key,
+        &[b"PRIVATE KEY", b"RSA PRIVATE KEY", b"EC PRIVATE KEY"],
+    ) {
+        return Err(TlsError::PrivateKeyMalformed);
     }
     let mut private_keys = PrivateKeyDer::pem_slice_iter(&private_key);
     let private_key = private_keys
@@ -80,18 +102,100 @@ pub async fn load(config: &TlsConfig) -> Result<RustlsConfig, TlsError> {
     Ok(RustlsConfig::from_config(Arc::new(server)))
 }
 
-async fn inspect(path: &Path, kind: MaterialKind, maximum: u64) -> Result<(), TlsError> {
+fn has_only_pem_sections(bytes: &[u8], allowed_labels: &[&[u8]]) -> bool {
+    let mut active_label: Option<&[u8]> = None;
+    let mut sections = 0usize;
+
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        let line = raw_line.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        match active_label {
+            None => {
+                let Some(label) = line
+                    .strip_prefix(b"-----BEGIN ")
+                    .and_then(|line| line.strip_suffix(b"-----"))
+                else {
+                    return false;
+                };
+                if !allowed_labels.contains(&label) {
+                    return false;
+                }
+                active_label = Some(label);
+            }
+            Some(label) => {
+                let mut expected_end = Vec::with_capacity(label.len() + 14);
+                expected_end.extend_from_slice(b"-----END ");
+                expected_end.extend_from_slice(label);
+                expected_end.extend_from_slice(b"-----");
+                if line == expected_end {
+                    active_label = None;
+                    sections += 1;
+                } else if line.starts_with(b"-----") {
+                    return false;
+                }
+            }
+        }
+    }
+
+    active_label.is_none() && sections > 0
+}
+
+fn read_material(
+    path: &Path,
+    kind: MaterialKind,
+    maximum: u64,
+    after_open: impl FnOnce(),
+) -> Result<Vec<u8>, TlsError> {
     if !path.is_absolute() {
         return Err(path_error(kind));
     }
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(|_| unreadable_error(kind))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
-        || metadata.len() == 0
-        || metadata.len() > maximum
+
+    #[cfg(not(unix))]
+    if fs::symlink_metadata(path)
+        .map_err(|_| unreadable_error(kind))?
+        .file_type()
+        .is_symlink()
     {
+        return Err(path_error(kind));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(nix::libc::ELOOP) {
+            return path_error(kind);
+        }
+        unreadable_error(kind)
+    })?;
+
+    let metadata = file.metadata().map_err(|_| unreadable_error(kind))?;
+    validate_metadata(&metadata, kind, maximum)?;
+    after_open();
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::take(file, maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unreadable_error(kind))?;
+    if bytes.is_empty() || bytes.len() as u64 > maximum {
+        return Err(path_error(kind));
+    }
+    Ok(bytes)
+}
+
+fn validate_metadata(
+    metadata: &fs::Metadata,
+    kind: MaterialKind,
+    maximum: u64,
+) -> Result<(), TlsError> {
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
         return Err(path_error(kind));
     }
     #[cfg(unix)]
@@ -140,7 +244,7 @@ mod tests {
 
     use crate::config::TlsConfig;
 
-    use super::{TlsError, load};
+    use super::{TlsError, load, load_with_certificate_open_hook};
 
     struct Material {
         directory: TempDir,
@@ -324,6 +428,70 @@ mod tests {
         assert_eq!(
             load(&material.config()).await.unwrap_err(),
             TlsError::PrivateKeyMalformed
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_file_rejects_private_keys_and_trailing_material() {
+        let material = Material::new();
+        let mut mixed = fs::read(&material.certificate).unwrap();
+        mixed.extend_from_slice(&fs::read(&material.private_key).unwrap());
+        write(&material.certificate, &mixed, 0o644);
+        assert_eq!(
+            load(&material.config()).await.unwrap_err(),
+            TlsError::CertificateMalformed
+        );
+
+        let material = Material::new();
+        let mut trailing = fs::read(&material.certificate).unwrap();
+        trailing.extend_from_slice(b"\ncertificate-trailing-sentinel\n");
+        write(&material.certificate, &trailing, 0o644);
+        assert_eq!(
+            load(&material.config()).await.unwrap_err(),
+            TlsError::CertificateMalformed
+        );
+    }
+
+    #[tokio::test]
+    async fn private_key_file_rejects_certificates_and_trailing_material() {
+        let material = Material::new();
+        let mut mixed = fs::read(&material.certificate).unwrap();
+        mixed.extend_from_slice(&fs::read(&material.private_key).unwrap());
+        write(&material.private_key, &mixed, 0o600);
+        assert_eq!(
+            load(&material.config()).await.unwrap_err(),
+            TlsError::PrivateKeyMalformed
+        );
+
+        let material = Material::new();
+        let mut trailing = fs::read(&material.private_key).unwrap();
+        trailing.extend_from_slice(b"\nprivate-key-trailing-sentinel\n");
+        write(&material.private_key, &trailing, 0o600);
+        assert_eq!(
+            load(&material.config()).await.unwrap_err(),
+            TlsError::PrivateKeyMalformed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_swap_after_validation_cannot_change_opened_tls_material() {
+        let material = Material::new();
+        let replacement = material.directory.path().join("replacement.pem");
+        let opened = material.directory.path().join("opened-certificate.pem");
+        write(&replacement, b"replacement-path-sentinel", 0o644);
+
+        let certificate_path = material.certificate.clone();
+        let loaded = load_with_certificate_open_hook(&material.config(), move || {
+            fs::rename(&certificate_path, &opened).unwrap();
+            fs::rename(&replacement, &certificate_path).unwrap();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            loaded.get_inner().alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
     }
 }

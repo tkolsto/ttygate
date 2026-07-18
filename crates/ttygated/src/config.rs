@@ -1673,6 +1673,30 @@ trusted_sources = ["127.0.0.1/32"]"#;
                 error_field: Some("server.public_url"),
             },
             Case {
+                name: "simultaneous direct TLS and trusted proxy transports",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://terminal.example.test\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
+                ),
+                error_field: Some("server.transport"),
+            },
+            Case {
+                name: "TLS section with certificate only",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"",
+                ),
+                error_field: Some("server.tls.private_key"),
+            },
+            Case {
+                name: "TLS section with private key only",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\nprivate_key = \"/key.pem\"",
+                ),
+                error_field: Some("server.tls.certificate"),
+            },
+            Case {
                 name: "trusted proxy auth without proxy transport",
                 source: COMPLETE_CONFIG.replace(
                     "provider = \"dev\"\nuser = \"local\"",

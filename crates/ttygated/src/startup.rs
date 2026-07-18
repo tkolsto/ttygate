@@ -1,4 +1,8 @@
-use std::{future::Future, io, net::SocketAddr};
+use std::{
+    future::Future,
+    io,
+    net::{SocketAddr, TcpListener as StdTcpListener},
+};
 
 use axum_server::tls_rustls::RustlsConfig;
 use thiserror::Error;
@@ -95,15 +99,22 @@ async fn bind_and_serve(prepared: PreparedServer) -> Result<(), StartupError> {
                 .await
                 .map_err(StartupError::Serve)
         }
-        PreparedTransport::DirectTls(tls) => server::serve_tls(prepared.bind, prepared.state, tls)
-            .await
-            .map_err(StartupError::Serve),
+        PreparedTransport::DirectTls(tls) => {
+            let listener = StdTcpListener::bind(prepared.bind).map_err(StartupError::Bind)?;
+            server::serve_tls_on(listener, prepared.state, tls)
+                .await
+                .map_err(StartupError::Serve)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        net::TcpListener as StdTcpListener,
+        sync::{Arc, Mutex},
+    };
 
     use axum_server::tls_rustls::RustlsConfig;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -114,7 +125,7 @@ mod tests {
         tls::TlsError,
     };
 
-    use super::{PreparedServer, PreparedTransport, StartupError, start_with};
+    use super::{PreparedServer, PreparedTransport, StartupError, start, start_with};
 
     type PhaseLog = Arc<Mutex<Vec<&'static str>>>;
 
@@ -159,6 +170,15 @@ command = ["/bin/sh"]
         .unwrap()
     }
 
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(_path: &std::path::Path, _mode: u32) {}
+
     #[tokio::test]
     async fn invalid_configuration_reaches_neither_tls_app_nor_bind_phase() {
         let mut config = parse(source()).unwrap();
@@ -188,6 +208,34 @@ command = ["/bin/sh"]
 
         assert!(matches!(error, StartupError::Config(_)));
         assert!(observed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn occupied_direct_tls_address_reports_bind_error() {
+        let occupied = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let certificate_path = directory.path().join("certificate.pem");
+        let private_key_path = directory.path().join("private-key.pem");
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(["localhost".to_owned()]).unwrap();
+        fs::write(&certificate_path, cert.pem()).unwrap();
+        fs::write(&private_key_path, signing_key.serialize_pem()).unwrap();
+        set_mode(&private_key_path, 0o600);
+        let source = source()
+            .replace("127.0.0.1:7681", &address.to_string())
+            .replace(
+                &format!("public_url = \"http://{address}\""),
+                &format!(
+                    "public_url = \"https://localhost:{}\"\n[server.tls]\ncertificate = {certificate_path:?}\nprivate_key = {private_key_path:?}",
+                    address.port()
+                ),
+            );
+        let config = parse(&source).unwrap();
+
+        let error = start(&config).await.unwrap_err();
+
+        assert!(matches!(error, StartupError::Bind(_)), "{error}");
     }
 
     #[tokio::test]

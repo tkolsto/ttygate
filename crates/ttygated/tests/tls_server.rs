@@ -1,13 +1,16 @@
 use std::{
     fs,
+    future::Future,
     net::{SocketAddr, TcpListener as StdTcpListener},
+    panic::{AssertUnwindSafe, resume_unwind},
     path::{Path, PathBuf},
-    sync::Arc,
+    pin::Pin,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use axum::http::{HeaderValue, StatusCode, header};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tempfile::TempDir;
 use tokio::{
@@ -71,7 +74,8 @@ impl TlsTestServer {
             0o600,
         );
 
-        let address = available_address();
+        let listener = reserved_listener();
+        let address = listener.local_addr().unwrap();
         let origin = format!("https://localhost:{}", address.port());
         let source = configuration(
             address,
@@ -81,7 +85,22 @@ impl TlsTestServer {
             &marker,
         );
         let config = config::parse(&source).unwrap();
-        let task = tokio::spawn(async move { startup::start(&config).await });
+        let task = tokio::spawn(async move {
+            startup::start_with(
+                &config,
+                ttygated::tls::load,
+                ttygated::server::AppState::from_config,
+                move |prepared| async move {
+                    let startup::PreparedTransport::DirectTls(tls) = prepared.transport else {
+                        unreachable!("TLS fixture parsed a non-TLS transport")
+                    };
+                    ttygated::server::serve_tls_on(listener, prepared.state, tls)
+                        .await
+                        .map_err(startup::StartupError::Serve)
+                },
+            )
+            .await
+        });
 
         let mut roots = RootCertStore::empty();
         roots
@@ -115,12 +134,13 @@ impl TlsTestServer {
 
     async fn stop(mut self) -> Result<(), String> {
         let pids = fixture_pids(&self.marker);
+        let mut task_failure = None;
         if let Some(task) = self.task.take() {
             task.abort();
             match task.await {
                 Err(error) if error.is_cancelled() => {}
-                Err(error) => return Err(format!("TLS server join failed: {error}")),
-                Ok(Err(error)) => return Err(format!("TLS server failed: {error}")),
+                Err(error) => task_failure = Some(format!("TLS server join failed: {error}")),
+                Ok(Err(error)) => task_failure = Some(format!("TLS server failed: {error}")),
                 Ok(Ok(())) => {}
             }
         }
@@ -131,7 +151,7 @@ impl TlsTestServer {
             kill_fixture_pids(&pids);
             wait_for_absence(&pids, Duration::from_secs(3)).await?;
         }
-        Ok(())
+        task_failure.map_or(Ok(()), Err)
     }
 
     async fn tls_stream(&self, name: &str) -> Result<TlsStream<TcpStream>, std::io::Error> {
@@ -213,9 +233,38 @@ impl TlsTestServer {
     }
 }
 
-fn available_address() -> SocketAddr {
-    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+async fn with_tls_test<F>(body: F)
+where
+    F: for<'server> FnOnce(
+        &'server TlsTestServer,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'server>>,
+{
+    let server = TlsTestServer::start().await;
+    let outcome = AssertUnwindSafe(body(&server)).catch_unwind().await;
+    let cleanup = server.stop().await;
+    match outcome {
+        Ok(()) => cleanup.unwrap(),
+        Err(payload) => {
+            if let Err(error) = cleanup {
+                eprintln!("TLS fixture cleanup also failed during unwind: {error}");
+            }
+            resume_unwind(payload);
+        }
+    }
+}
+
+fn reserved_listener() -> StdTcpListener {
+    StdTcpListener::bind("127.0.0.1:0").unwrap()
+}
+
+#[test]
+fn tls_fixture_keeps_ephemeral_listener_reserved_until_handoff() {
+    let listener = reserved_listener();
+    let address = listener.local_addr().unwrap();
+    assert!(
+        StdTcpListener::bind(address).is_err(),
+        "reserved TLS fixture address was available before listener handoff"
+    );
 }
 
 fn configuration(
@@ -348,147 +397,176 @@ async fn collect_binary_until(
 
 #[tokio::test]
 async fn https_serves_frontend_health_and_required_cookie_attributes() {
-    let server = TlsTestServer::start().await;
-    let health = server
-        .request("GET", "/healthz", None, None, b"")
-        .await
-        .unwrap();
-    assert_eq!(health.status, 200);
-    assert_eq!(health.body, b"ok\n");
-    let frontend = server.request("GET", "/", None, None, b"").await.unwrap();
-    assert_eq!(frontend.status, 200);
-    assert!(
-        frontend
-            .body
-            .windows(15)
-            .any(|window| window == b"<!doctype html>")
-    );
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let health = server
+                .request("GET", "/healthz", None, None, b"")
+                .await
+                .unwrap();
+            assert_eq!(health.status, 200);
+            assert_eq!(health.body, b"ok\n");
+            let frontend = server.request("GET", "/", None, None, b"").await.unwrap();
+            assert_eq!(frontend.status, 200);
+            assert!(
+                frontend
+                    .body
+                    .windows(15)
+                    .any(|window| window == b"<!doctype html>")
+            );
 
-    let identity = server
-        .request("POST", "/api/identity", Some(&server.origin), None, b"")
-        .await
-        .unwrap();
-    assert_eq!(identity.status, 204);
-    let headers = identity.headers.to_ascii_lowercase();
-    for attribute in ["secure", "httponly", "samesite=strict", "path=/"] {
-        assert!(headers.contains(attribute), "{attribute} missing");
-    }
+            let identity = server
+                .request("POST", "/api/identity", Some(&server.origin), None, b"")
+                .await
+                .unwrap();
+            assert_eq!(identity.status, 204);
+            let headers = identity.headers.to_ascii_lowercase();
+            for attribute in ["secure", "httponly", "samesite=strict", "path=/"] {
+                assert!(headers.contains(attribute), "{attribute} missing");
+            }
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn https_exact_origin_creates_session_and_wss_ticket_reaches_real_pty() {
-    let server = TlsTestServer::start().await;
-    let cookie = server.provision_cookie().await;
-    let ticket = server.issue_ticket(&cookie).await;
-    let origin = server.origin.clone();
-    let mut socket = server.websocket(&origin, &cookie).await.unwrap();
-    socket
-        .send(tungstenite::Message::Text(
-            format!(r#"{{"ticket":"{ticket}"}}"#).into(),
-        ))
-        .await
-        .unwrap();
-    let ready = collect_binary_until(&mut socket, b"READY").await;
-    assert!(ready.windows(5).any(|window| window == b"READY"));
-    socket
-        .send(tungstenite::Message::Binary(b"tls-echo\r".to_vec().into()))
-        .await
-        .unwrap();
-    let echo = collect_binary_until(&mut socket, b"ECHO:tls-echo").await;
-    assert!(echo.windows(13).any(|window| window == b"ECHO:tls-echo"));
-    socket.close(None).await.unwrap();
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let cookie = server.provision_cookie().await;
+            let ticket = server.issue_ticket(&cookie).await;
+            let origin = server.origin.clone();
+            let mut socket = server.websocket(&origin, &cookie).await.unwrap();
+            socket
+                .send(tungstenite::Message::Text(
+                    format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+                ))
+                .await
+                .unwrap();
+            let ready = collect_binary_until(&mut socket, b"READY").await;
+            assert!(ready.windows(5).any(|window| window == b"READY"));
+            socket
+                .send(tungstenite::Message::Binary(b"tls-echo\r".to_vec().into()))
+                .await
+                .unwrap();
+            let echo = collect_binary_until(&mut socket, b"ECHO:tls-echo").await;
+            assert!(echo.windows(13).any(|window| window == b"ECHO:tls-echo"));
+            socket.close(None).await.unwrap();
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn plaintext_http_is_not_accepted_on_the_tls_listener() {
-    let server = TlsTestServer::start().await;
-    let mut stream = TcpStream::connect(server.address).await.unwrap();
-    stream
-        .write_all(
-            format!(
-                "GET /healthz HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                server.address
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut response = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await;
-    assert!(
-        !response.starts_with(b"HTTP/1.1 200"),
-        "TLS listener silently accepted plaintext HTTP"
-    );
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let mut stream = TcpStream::connect(server.address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "GET /healthz HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                        server.address
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await;
+            assert!(
+                !response.starts_with(b"HTTP/1.1 200"),
+                "TLS listener silently accepted plaintext HTTP"
+            );
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn wrong_origin_https_session_creation_is_rejected() {
-    let server = TlsTestServer::start().await;
-    let cookie = server.provision_cookie().await;
-    let response = server
-        .request(
-            "POST",
-            "/api/sessions",
-            Some("https://attacker.test"),
-            Some(&cookie),
-            br#"{"target":"shell"}"#,
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status, 403);
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let cookie = server.provision_cookie().await;
+            let response = server
+                .request(
+                    "POST",
+                    "/api/sessions",
+                    Some("https://attacker.test"),
+                    Some(&cookie),
+                    br#"{"target":"shell"}"#,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, 403);
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn wrong_origin_wss_upgrade_is_rejected_before_session_start() {
-    let server = TlsTestServer::start().await;
-    let cookie = server.provision_cookie().await;
-    let error = server
-        .websocket("https://attacker.test", &cookie)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        tungstenite::Error::Http(ref response) if response.status() == StatusCode::FORBIDDEN
-    ));
-    assert!(!server.marker.exists());
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let cookie = server.provision_cookie().await;
+            let error = server
+                .websocket("https://attacker.test", &cookie)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                tungstenite::Error::Http(ref response) if response.status() == StatusCode::FORBIDDEN
+            ));
+            assert!(!server.marker.exists());
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn untrusted_certificate_and_wrong_hostname_fail_the_tls_handshake() {
-    let server = TlsTestServer::start().await;
-    let tcp = TcpStream::connect(server.address).await.unwrap();
-    assert!(
-        server
-            .untrusted_connector
-            .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
-            .await
-            .is_err()
-    );
-    let tcp = TcpStream::connect(server.address).await.unwrap();
-    assert!(
-        server
-            .connector
-            .connect(
-                ServerName::try_from("wrong-host.example")
-                    .unwrap()
-                    .to_owned(),
-                tcp
-            )
-            .await
-            .is_err()
-    );
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let tcp = TcpStream::connect(server.address).await.unwrap();
+            assert!(
+                server
+                    .untrusted_connector
+                    .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+                    .await
+                    .is_err()
+            );
+            let tcp = TcpStream::connect(server.address).await.unwrap();
+            assert!(
+                server
+                    .connector
+                    .connect(
+                        ServerName::try_from("wrong-host.example")
+                            .unwrap()
+                            .to_owned(),
+                        tcp
+                    )
+                    .await
+                    .is_err()
+            );
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn tls_handshake_failure_starts_no_session_or_pty() {
-    let server = TlsTestServer::start().await;
-    let tcp = TcpStream::connect(server.address).await.unwrap();
-    let _ = server
-        .untrusted_connector
-        .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
-        .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!server.marker.exists());
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let tcp = TcpStream::connect(server.address).await.unwrap();
+            let _ = server
+                .untrusted_connector
+                .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!server.marker.exists());
+        })
+    })
+    .await;
 }
 
 fn fixture_pids(marker: &Path) -> Vec<i32> {
@@ -549,79 +627,88 @@ async fn wait_until_absent(pids: &[i32]) {
         .unwrap();
 }
 
-fn synthetic_test_body_failure() -> Result<(), &'static str> {
-    Err("synthetic test-body failure")
-}
-
 #[tokio::test]
 async fn repeated_tls_startup_shutdown_reaps_daemon_and_pty() {
     for iteration in 1..=20 {
-        let server = TlsTestServer::start().await;
-        let cookie = server.provision_cookie().await;
-        let ticket = server.issue_ticket(&cookie).await;
-        let origin = server.origin.clone();
-        let mut socket = server.websocket(&origin, &cookie).await.unwrap();
-        socket
-            .send(tungstenite::Message::Text(
-                format!(r#"{{"ticket":"{ticket}"}}"#).into(),
-            ))
-            .await
-            .unwrap();
-        let _ = collect_binary_until(&mut socket, b"READY").await;
-        let pids = fixture_pids(&server.marker);
-        assert_eq!(
-            pids.len(),
-            2,
-            "iteration {iteration} did not record PTY PIDs"
-        );
-        socket.close(None).await.unwrap();
-        server.stop().await.unwrap();
-        wait_until_absent(&pids).await;
+        with_tls_test(|server| {
+            Box::pin(async move {
+                let cookie = server.provision_cookie().await;
+                let ticket = server.issue_ticket(&cookie).await;
+                let origin = server.origin.clone();
+                let mut socket = server.websocket(&origin, &cookie).await.unwrap();
+                socket
+                    .send(tungstenite::Message::Text(
+                        format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+                    ))
+                    .await
+                    .unwrap();
+                let _ = collect_binary_until(&mut socket, b"READY").await;
+                let pids = fixture_pids(&server.marker);
+                assert_eq!(
+                    pids.len(),
+                    2,
+                    "iteration {iteration} did not record PTY PIDs"
+                );
+                socket.close(None).await.unwrap();
+            })
+        })
+        .await;
     }
 }
 
 #[tokio::test]
 async fn repeated_failed_tls_handshakes_leave_no_application_work() {
     for iteration in 1..=20 {
-        let server = TlsTestServer::start().await;
-        let tcp = TcpStream::connect(server.address).await.unwrap();
-        assert!(
-            server
-                .untrusted_connector
-                .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
-                .await
-                .is_err(),
-            "iteration {iteration} unexpectedly completed an untrusted handshake"
-        );
-        assert!(
-            fixture_pids(&server.marker).is_empty(),
-            "iteration {iteration} started a PTY after a failed handshake"
-        );
-        server.stop().await.unwrap();
+        with_tls_test(|server| {
+            Box::pin(async move {
+                let tcp = TcpStream::connect(server.address).await.unwrap();
+                assert!(
+                    server
+                        .untrusted_connector
+                        .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+                        .await
+                        .is_err(),
+                    "iteration {iteration} unexpectedly completed an untrusted handshake"
+                );
+                assert!(
+                    fixture_pids(&server.marker).is_empty(),
+                    "iteration {iteration} started a PTY after a failed handshake"
+                );
+            })
+        })
+        .await;
     }
 }
 
 #[tokio::test]
-async fn tls_fixture_cleanup_runs_after_test_body_failure() {
-    let server = TlsTestServer::start().await;
-    let cookie = server.provision_cookie().await;
-    let ticket = server.issue_ticket(&cookie).await;
-    let origin = server.origin.clone();
-    let mut socket = server.websocket(&origin, &cookie).await.unwrap();
-    socket
-        .send(tungstenite::Message::Text(
-            format!(r#"{{"ticket":"{ticket}"}}"#).into(),
-        ))
-        .await
-        .unwrap();
-    let _ = collect_binary_until(&mut socket, b"READY").await;
-    let pids = fixture_pids(&server.marker);
-    assert_eq!(pids.len(), 2);
+async fn tls_fixture_cleanup_awaits_shutdown_before_resuming_panic() {
+    let observed_pids = Arc::new(Mutex::new(Vec::new()));
+    let recorded_pids = Arc::clone(&observed_pids);
+    let task = tokio::spawn(async move {
+        with_tls_test(move |server| {
+            Box::pin(async move {
+                let cookie = server.provision_cookie().await;
+                let ticket = server.issue_ticket(&cookie).await;
+                let origin = server.origin.clone();
+                let mut socket = server.websocket(&origin, &cookie).await.unwrap();
+                socket
+                    .send(tungstenite::Message::Text(
+                        format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+                    ))
+                    .await
+                    .unwrap();
+                let _ = collect_binary_until(&mut socket, b"READY").await;
+                let pids = fixture_pids(&server.marker);
+                assert_eq!(pids.len(), 2);
+                *recorded_pids.lock().unwrap() = pids;
+                panic!("intentional TLS fixture unwind");
+            })
+        })
+        .await;
+    });
 
-    drop(socket);
-    let body_result = synthetic_test_body_failure();
-    let cleanup_result = server.stop().await;
-    assert_eq!(body_result, Err("synthetic test-body failure"));
-    cleanup_result.unwrap();
+    let error = task.await.unwrap_err();
+    assert!(error.is_panic());
+    let pids = observed_pids.lock().unwrap().clone();
     wait_until_absent(&pids).await;
 }
