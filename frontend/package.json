@@ -6,7 +6,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node build.mjs",
-    "test": "node --import tsx --test src/*.test.ts",
+    "test": "node --import tsx --test src/*.test.ts e2e/run-server.unit.ts",
     "test:e2e": "npm run build && playwright test"
   },
   "dependencies": {

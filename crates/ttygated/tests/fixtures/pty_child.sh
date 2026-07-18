@@ -9,6 +9,9 @@ if [ "${1-}" = "natural-resistant" ]; then
 fi
 sleep 300 &
 descendant=$!
+if [ "${1-}" = "browser-track" ]; then
+    printf '%s %s\n' "$$" "$descendant" >> "${2:?browser PID marker required}"
+fi
 if [ "${1-}" = "natural-resistant" ]; then
     trap - HUP
 fi

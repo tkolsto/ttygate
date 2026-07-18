@@ -84,6 +84,12 @@ test("view model enables only valid target and session actions", () => {
   assert.equal(viewModel(snapshot("active")).actionLabel, "Close terminal");
   assert.equal(viewModel(snapshot("denied")).actionLabel, "Connect terminal");
   assert.equal(viewModel(snapshot("denied")).targetDisabled, false);
+  const bootstrapFailure = viewModel({
+    phase: "internal-error",
+    targets: [],
+  });
+  assert.equal(bootstrapFailure.actionDisabled, true);
+  assert.equal(bootstrapFailure.targetDisabled, true);
 });
 
 test("view copy never includes target names or other server-controlled text", () => {

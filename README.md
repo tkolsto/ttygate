@@ -7,13 +7,13 @@ ttygate is a security-first browser terminal gateway inspired by Shell In A Box.
 
 ## Current status
 
-ttygate is pre-release software. The repository currently contains the Rust HTTP daemon foundation, bundled xterm.js frontend scaffold, explicit browser Origin checks, a development identity cookie, bounded single-use session tickets, an authenticated ticket-bound WebSocket bridge, and an allowlisted PTY session backend with bounded I/O and guaranteed process-group teardown. The browser terminal frontend, SSH execution, production authentication and transport gating, audit persistence, and deployment controls are still planned.
+ttygate is pre-release software. Milestone M1, completed by issue #7, provides an accessible xterm.js browser terminal over the Rust HTTP daemon, explicit browser Origin checks, a development identity cookie, bounded single-use session tickets, an authenticated ticket-bound WebSocket bridge, safe configured-target discovery, and an allowlisted PTY session backend with bounded I/O and guaranteed process-group teardown. SSH execution, production authentication and transport gating, audit persistence, and deployment controls are still planned.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
 
-## Safe scaffold quickstart
+## Repository quickstart
 
-The current quickstart verifies and builds the repository; it does not start a service.
+The current quickstart verifies and builds the repository. The browser smoke suite launches an isolated loopback daemon and disposable PTY fixtures; it does not make the pre-release build production-safe.
 
 Prerequisites:
 
@@ -30,13 +30,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 npm --prefix frontend ci
 npm --prefix frontend run check
 npm --prefix frontend run build
+npm --prefix frontend test
+npm --prefix frontend run test:e2e
 ```
 
-These commands test the HTTP/config/protocol foundations, authenticated WebSocket bridge, and PTY session lifecycle, then build the static frontend into `frontend/dist/`. It is not yet possible to run a browser terminal because the frontend integration chunk is not implemented.
+These commands test the HTTP/config/protocol foundations, authenticated WebSocket bridge, PTY session lifecycle, frontend state machine, and a real Chromium-to-PTY terminal flow, then build the static frontend into `frontend/dist/`.
 
 ## Planned v0.1 posture
 
-The planned first release will default to `127.0.0.1`, but localhost-only binding will be only one layer. Every mode, including local development, is intended to require Origin validation, a real browser session cookie, and a short-lived single-use ticket presented after the WebSocket opens. Targets will come from a server-side allowlist rather than request-supplied commands, and output will use bounded buffers with backpressure.
+The daemon defaults to `127.0.0.1`, but localhost-only binding is only one layer. Local development requires Origin validation, a real browser session cookie, and a short-lived single-use ticket presented as the first WebSocket message. The frontend lists only safe presentation metadata for server-configured targets; executable paths, arguments, SSH options, credentials, and tickets never become target-selection authority. Terminal output uses bounded server and browser queues, and a dropped WebSocket ends the session without automatic reconnect.
 
 The PTY session manager already enforces configured global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode is planned to fail closed unless real authentication and either direct TLS or an explicitly trusted reverse proxy are configured. It will add request rate limits and structured session-lifecycle audit persistence. These production controls are not implemented yet; see the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
 

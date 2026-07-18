@@ -39,6 +39,8 @@ class ManualScheduler implements Scheduler {
 class FakeSocket implements SocketPort {
   binaryType = "";
   readyState = 0;
+  bufferedAmount = 0;
+  accumulateBufferedAmount = false;
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
@@ -51,8 +53,10 @@ class FakeSocket implements SocketPort {
       this.sent.push(data);
     } else if (data instanceof ArrayBuffer) {
       this.sent.push(new Uint8Array(data));
+      if (this.accumulateBufferedAmount) this.bufferedAmount += data.byteLength;
     } else {
       this.sent.push(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      if (this.accumulateBufferedAmount) this.bufferedAmount += data.byteLength;
     }
   }
 
@@ -215,6 +219,18 @@ test("connection boot exposes stable identity and ready states with configured t
   ]);
 });
 
+test("bootstrap failure keeps terminal actions disabled and preserves internal-error", async () => {
+  const setup = harness({ targets: [] });
+
+  await setup.controller.start();
+  assert.equal(setup.states.at(-1)?.phase, "internal-error");
+
+  await setup.controller.connect("");
+
+  assert.equal(setup.states.at(-1)?.phase, "internal-error");
+  assert.equal(setup.sockets.length, 0);
+});
+
 test("ticket is the first socket message then discarded before input becomes active", async () => {
   const setup = harness();
   await setup.controller.start();
@@ -370,6 +386,22 @@ test("undrained terminal output fails closed instead of growing without bound", 
   assert.equal(setup.states.at(-1)?.phase, "internal-error");
   assert.equal(socket.closeCalls, 1);
   assert.equal(setup.terminal.writes.length, 1, "xterm drain gates later writes");
+});
+
+test("terminal input fails closed when WebSocket buffered bytes exceed the client limit", async () => {
+  const setup = harness();
+  await setup.controller.start();
+  await setup.controller.connect("shell");
+  const socket = setup.sockets[0]!;
+  socket.open();
+  socket.accumulateBufferedAmount = true;
+
+  setup.terminal.input("x".repeat((MAX_BINARY_BYTES * 17) + 1));
+
+  assert.equal(setup.states.at(-1)?.phase, "internal-error");
+  assert.equal(socket.closeCalls, 1);
+  assert.equal(setup.terminal.dataHandlers.size, 0);
+  assert.equal(setup.terminal.binaryHandlers.size, 0);
 });
 
 test("explicit close is codec-ordered, disables handlers, and becomes user-closed", async () => {

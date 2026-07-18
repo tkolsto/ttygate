@@ -27,7 +27,8 @@ export function viewModel(snapshot: ConnectionSnapshot): ViewModel {
   const sessionPending = snapshot.phase === "requesting-authorization"
     || snapshot.phase === "connecting";
   const active = snapshot.phase === "active";
-  const unavailable = snapshot.phase === "establishing-identity";
+  const unavailable = snapshot.phase === "establishing-identity"
+    || snapshot.targets.length === 0;
   return {
     status: statusCopy(snapshot),
     tone: statusTone(snapshot.phase),

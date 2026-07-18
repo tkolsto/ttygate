@@ -4,6 +4,7 @@ import {
   type TargetPresentation,
 } from "./api.ts";
 import {
+  MAX_BINARY_BYTES,
   decodeServerBinary,
   decodeServerControl,
   encodeClientControl,
@@ -21,6 +22,7 @@ import {
 } from "./terminal-io.ts";
 
 const CONNECTION_DEADLINE_MILLISECONDS = 10_000;
+const MAX_SOCKET_BUFFERED_BYTES = MAX_BINARY_BYTES * 16;
 const SOCKET_OPEN = 1;
 
 export type ConnectionPhase =
@@ -47,6 +49,7 @@ export interface ConnectionSnapshot {
 
 export interface SocketPort {
   binaryType: string;
+  readonly bufferedAmount: number;
   readonly readyState: number;
   onopen: ((event: Event) => void) | null;
   onmessage: ((event: MessageEvent<unknown>) => void) | null;
@@ -141,6 +144,7 @@ export class TerminalConnectionController {
 
   async connect(targetName: string): Promise<void> {
     const configured = this.#targets.find((target) => target.name === targetName);
+    if (configured === undefined && this.#targets.length === 0) return;
     const generation = this.#replaceConnection(true);
     if (configured === undefined) {
       this.#emit({ phase: "denied", targets: this.#targets });
@@ -303,6 +307,10 @@ export class TerminalConnectionController {
     target: TargetPresentation,
   ): void {
     if (!this.#isCurrent(generation) || socket.readyState !== SOCKET_OPEN) return;
+    if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES - data.byteLength) {
+      this.#finish("internal-error", target);
+      return;
+    }
     try {
       socket.send(data);
     } catch {

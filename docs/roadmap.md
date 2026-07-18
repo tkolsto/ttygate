@@ -42,6 +42,8 @@ Milestones M0–M4 are strictly ordered. Chunks within a milestone can be parall
 
 ## M1 — Secure Local Terminal
 
+**Status:** complete through Chunk 1.6 by the work tracked in issue #7.
+
 The first running build already enforces Origin checks and ticket-bound WebSockets — dev mode is not exempt (see plan: "Localhost Is Not a Security Boundary").
 
 ### Chunk 1.1 — Config and target allowlist
@@ -83,12 +85,13 @@ The first running build already enforces Origin checks and ticket-bound WebSocke
 
 ### Chunk 1.6 — Frontend
 
+- **Status:** implemented by the work tracked in issue #7.
 - **Deliverables:** xterm.js terminal page; session flow (fetch ticket → open WS → attach); resize propagation; paste handling; distinct error/closed/denied states; read-only rendering; no secrets in URLs; bundled into the static assets 1.3 serves.
 - **Consumes:** protocol + TS codec (1.2), endpoints (1.3, 1.5).
 - **Produces:** the v0.1 UI.
 - **Done when:** manual browser check passes the M1 exit criteria (open terminal, resize, paste, close behavior); a headless smoke test (Playwright or similar) exercises connect/echo/close if practical.
 
-**M1 exit:** all plan Phase 1 exit criteria green; a malicious third-party webpage cannot open a session against a running dev instance (verified by an Origin-mismatch integration test).
+**M1 exit:** complete. All Phase 1 exit criteria are green, including real-browser terminal interaction and Origin-mismatch rejection for session creation and WebSocket upgrade.
 
 ---
 
