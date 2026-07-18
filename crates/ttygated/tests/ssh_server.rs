@@ -37,7 +37,7 @@ use ttygated::{
         ServerTransport, SshTarget, SshUserPolicy, Target, TargetAllowlist,
     },
     origin::OriginPolicy,
-    protocol::Resize,
+    protocol::{Resize, ServerControl, decode_server_control},
     server::AppState,
     session::{
         ChildOutcome, Session, SessionCloseReason, SessionError, SessionManager, TimeoutKind,
@@ -53,21 +53,48 @@ const USER: &str = "integration-user";
 const TARGET: &str = "real-ssh";
 const IMAGE: &str = "ttygate-sshd-integration:local";
 const BANNER_MARKER: &str = "debug1: Authentication succeeded (publickey).";
+const SENTINEL_KNOWN_HOSTS: &str = "KNOWN_HOSTS_PATH_SENTINEL_943a";
+const SENTINEL_IDENTITY: &str = "IDENTITY_PATH_SENTINEL_329f";
+const SENTINEL_KNOWN_HOSTS_CONTENT: &str = "KNOWN_HOSTS_CONTENT_SENTINEL_617d";
+const SENTINEL_PRIVATE_KEY_COMMENT: &str = "PRIVATE_KEY_CONTENT_SENTINEL_f10c";
+const SENTINEL_HEADER: &str = "HEADER_SENTINEL_48af";
+const SENTINEL_ENVIRONMENT: &str = "ENVIRONMENT_SENTINEL_60bd";
+const SENTINEL_ARGUMENT: &str = "ProxyCommand=ARGV_SENTINEL_d9e7";
+const SENTINEL_AUDIT_PATH: &str = "AUDIT_PATH_SENTINEL_76ce.jsonl";
 
 static FIXTURE_SERIAL: OnceLock<AsyncMutex<()>> = OnceLock::new();
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct RealSshdFixture {
-    _serial: AsyncMutexGuard<'static, ()>,
-    directory: TempDir,
     container: ContainerGuard,
+    directory: TempDir,
+    _serial: AsyncMutexGuard<'static, ()>,
     port: u16,
     audit_path: PathBuf,
     ssh_executable: PathBuf,
 }
 
+struct WebsocketDenial {
+    code: String,
+    message: String,
+    rendered: String,
+    audit: String,
+    cookie: String,
+    ticket: String,
+}
+
 impl RealSshdFixture {
     async fn start() -> Self {
+        Self::start_inner(None).await
+    }
+
+    async fn start_paused_after_container(
+        started: tokio::sync::oneshot::Sender<(String, PathBuf)>,
+    ) -> Self {
+        Self::start_inner(Some(started)).await
+    }
+
+    async fn start_inner(started: Option<tokio::sync::oneshot::Sender<(String, PathBuf)>>) -> Self {
         let serial = FIXTURE_SERIAL
             .get_or_init(|| AsyncMutex::new(()))
             .lock()
@@ -81,6 +108,10 @@ impl RealSshdFixture {
         .unwrap();
         generate_key(directory.path().join("client_key"));
         generate_key(directory.path().join("wrong_client_key"));
+        generate_key_with_comment(
+            directory.path().join(SENTINEL_IDENTITY),
+            SENTINEL_PRIVATE_KEY_COMMENT,
+        );
         generate_key(directory.path().join("ssh_host_ed25519_key"));
         generate_key(directory.path().join("wrong_host_key"));
         fs::write(
@@ -107,6 +138,8 @@ impl RealSshdFixture {
                     "-d",
                     "--name",
                     &container,
+                    "-e",
+                    "TTYGATE_FIXTURE_SENTINEL=ENVIRONMENT_SENTINEL_60bd",
                     "-p",
                     "127.0.0.1::2222",
                     "-v",
@@ -118,6 +151,11 @@ impl RealSshdFixture {
         // Arm cleanup before the first readiness await. Dropping or cancelling
         // fixture construction can therefore never strand the container.
         let container = ContainerGuard { name: container };
+        if let Some(started) = started {
+            let _ = started.send((container.name.clone(), directory.path().to_owned()));
+            std::future::pending::<()>().await;
+            unreachable!("paused fixture construction resumes only through cancellation");
+        }
         let port = wait_for_port(&container.name).await;
         let host_public = public_key_fields(&directory.path().join("ssh_host_ed25519_key.pub"));
         let wrong_public = public_key_fields(&directory.path().join("wrong_host_key.pub"));
@@ -131,17 +169,25 @@ impl RealSshdFixture {
             format!("[127.0.0.1]:{port} {} {}\n", wrong_public.0, wrong_public.1),
         )
         .unwrap();
+        fs::write(
+            directory.path().join(SENTINEL_KNOWN_HOSTS),
+            format!(
+                "[localhost]:{port} {} {} {SENTINEL_KNOWN_HOSTS_CONTENT}\n",
+                host_public.0, host_public.1
+            ),
+        )
+        .unwrap();
         fs::write(directory.path().join("empty_known_hosts"), b"").unwrap();
-        let audit_path = directory.path().join("audit.jsonl");
+        let audit_path = directory.path().join(SENTINEL_AUDIT_PATH);
         let ssh_executable = PathBuf::from("/usr/bin/ssh");
         assert!(
             ssh_executable.is_file(),
             "system OpenSSH client is required"
         );
         Self {
-            _serial: serial,
-            directory,
             container,
+            directory,
+            _serial: serial,
             port,
             audit_path,
             ssh_executable,
@@ -222,6 +268,61 @@ impl RealSshdFixture {
         (session, manager)
     }
 
+    async fn websocket_denial(&self, target: SshTarget) -> WebsocketDenial {
+        let (_manager, state) = self.manager(target, default_limits()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            ttygated::server::serve(listener, state).await.unwrap();
+        });
+        let cookie = provision_cookie(address).await;
+        let ticket = issue_ticket(address, &cookie).await;
+        let mut request = format!("ws://{address}/api/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("origin", "http://127.0.0.1:7681".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-ttygate-test-sentinel", SENTINEL_HEADER.parse().unwrap());
+        let mut socket = connect_async(request).await.unwrap().0;
+        socket
+            .send(tungstenite::Message::Text(
+                format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+            ))
+            .await
+            .unwrap();
+        let control = timeout(WAIT, async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                if let tungstenite::Message::Text(text) = message {
+                    break decode_server_control(text.as_bytes()).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("curated real SSH WebSocket denial timed out");
+        let rendered = format!("{control:?}");
+        let ServerControl::Error(error) = control else {
+            panic!("expected curated real SSH WebSocket error, got {rendered}");
+        };
+        drop(socket);
+        server.abort();
+        let _ = server.await;
+        WebsocketDenial {
+            code: error.code,
+            message: error.message,
+            rendered,
+            audit: self.audit_text(),
+            cookie,
+            ticket,
+        }
+    }
+
     async fn assert_strict_success(&self) {
         let (mut session, _) = self.session().await;
         session
@@ -245,31 +346,21 @@ impl RealSshdFixture {
     }
 
     async fn assert_host_key_mismatch(&self) {
-        let (manager, _) = self
-            .manager(
-                self.target("mismatch_known_hosts", "client_key"),
-                default_limits(),
-            )
+        let denial = self
+            .websocket_denial(self.target("mismatch_known_hosts", "client_key"))
             .await;
-        let error = manager
-            .start(
-                Identity::new(USER).unwrap(),
-                TARGET,
-                Resize::new(80, 24).unwrap(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error, SessionError::SshHostKeyFailed);
-        let audit = self.audit_text();
+        assert_eq!(denial.code, "ssh-host-key-failed");
+        assert_eq!(
+            denial.message,
+            "The SSH host identity could not be verified."
+        );
+        let audit = denial.audit;
         assert!(
             audit.contains("\"reason\":\"host-key-mismatch\""),
             "{audit}"
         );
         assert!(!audit.contains("session-started"), "{audit}");
-        assert_eq!(
-            error.to_string(),
-            "The SSH host identity could not be verified."
-        );
+        assert_eq!(audit.matches("\"event_type\":\"access-denied\"").count(), 1);
         self.assert_no_session_children().await;
     }
 
@@ -291,27 +382,18 @@ impl RealSshdFixture {
     }
 
     async fn assert_wrong_identity(&self) {
-        let (manager, _) = self
-            .manager(
-                self.target("known_hosts", "wrong_client_key"),
-                default_limits(),
-            )
+        let denial = self
+            .websocket_denial(self.target("known_hosts", "wrong_client_key"))
             .await;
-        let error = manager
-            .start(
-                Identity::new(USER).unwrap(),
-                TARGET,
-                Resize::new(80, 24).unwrap(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error, SessionError::SshAuthenticationFailed);
-        let audit = self.audit_text();
+        assert_eq!(denial.code, "ssh-authentication-failed");
+        assert_eq!(denial.message, "SSH authentication was rejected.");
+        let audit = denial.audit;
         assert!(
             audit.contains("\"reason\":\"ssh-authentication-failed\""),
             "{audit}"
         );
         assert!(!audit.contains("session-started"), "{audit}");
+        assert_eq!(audit.matches("\"event_type\":\"access-denied\"").count(), 1);
         self.assert_no_session_children().await;
     }
 
@@ -356,27 +438,51 @@ impl RealSshdFixture {
     }
 
     async fn assert_sentinel_secrecy(&self) {
-        let secret = fs::read_to_string(self.directory.path().join("wrong_client_key")).unwrap();
-        let (manager, _) = self
-            .manager(
-                self.target("known_hosts", "wrong_client_key"),
-                default_limits(),
-            )
-            .await;
-        let error = manager
-            .start(
-                Identity::new(USER).unwrap(),
-                TARGET,
-                Resize::new(80, 24).unwrap(),
-            )
-            .await
-            .unwrap_err();
-        let audit = self.audit_text();
-        assert!(!audit.contains(BANNER_MARKER), "{audit}");
-        for line in secret.lines().filter(|line| line.len() > 20) {
-            assert!(!audit.contains(line));
-            assert!(!error.to_string().contains(line));
+        let identity_path = self.directory.path().join(SENTINEL_IDENTITY);
+        let known_hosts_path = self.directory.path().join(SENTINEL_KNOWN_HOSTS);
+        let private_key = fs::read_to_string(&identity_path).unwrap();
+        let known_hosts = fs::read_to_string(&known_hosts_path).unwrap();
+        let mut sentinel_target = self.target(SENTINEL_KNOWN_HOSTS, SENTINEL_IDENTITY);
+        sentinel_target.host = "localhost".to_owned();
+        let denial = self.websocket_denial(sentinel_target).await;
+        assert_eq!(denial.code, "ssh-authentication-failed");
+        let frontend = format!("{} {} {}", denial.code, denial.message, denial.rendered);
+        let known_host_public_data = known_hosts
+            .split_whitespace()
+            .nth(2)
+            .expect("sentinel known-host public data");
+        let mut sentinels = vec![
+            denial.cookie.as_str(),
+            denial.ticket.as_str(),
+            SENTINEL_KNOWN_HOSTS,
+            SENTINEL_IDENTITY,
+            SENTINEL_KNOWN_HOSTS_CONTENT,
+            SENTINEL_PRIVATE_KEY_COMMENT,
+            SENTINEL_HEADER,
+            SENTINEL_ENVIRONMENT,
+            SENTINEL_ARGUMENT,
+            BANNER_MARKER,
+            "localhost",
+            "ttygate",
+            known_host_public_data,
+            known_hosts_path.to_str().unwrap(),
+            identity_path.to_str().unwrap(),
+            self.audit_path.to_str().unwrap(),
+        ];
+        sentinels.extend(private_key.lines().filter(|line| line.len() > 20));
+        for sentinel in sentinels {
+            assert!(!denial.audit.contains(sentinel), "audit leaked {sentinel}");
+            assert!(!frontend.contains(sentinel), "frontend leaked {sentinel}");
         }
+        assert_eq!(
+            denial
+                .audit
+                .matches("\"event_type\":\"access-denied\"")
+                .count(),
+            1
+        );
+        assert!(!denial.audit.contains("session-started"));
+        assert!(!denial.audit.contains("session-ended"));
     }
 
     async fn assert_drop_reaps(&self) {
@@ -446,12 +552,16 @@ impl RealSshdFixture {
 
     async fn assert_cleanup_matrix(&self) {
         let mut reasons = Vec::new();
+        let mut session_ids = Vec::new();
 
+        let before = self.audit_events().len();
         let (mut explicit, _) = self.session().await;
         reasons.push(explicit.close().await.unwrap().reason);
+        session_ids.push(self.assert_completed_session_since(before, "explicit"));
 
         let mut idle_limits = default_limits();
         idle_limits.idle_timeout = Duration::from_millis(150);
+        let before = self.audit_events().len();
         let (idle_manager, _) = self
             .manager(self.target("known_hosts", "client_key"), idle_limits)
             .await;
@@ -470,9 +580,11 @@ impl RealSshdFixture {
                 .unwrap()
                 .reason,
         );
+        session_ids.push(self.assert_completed_session_since(before, "idle-timeout"));
 
         let mut absolute_limits = default_limits();
         absolute_limits.absolute_timeout = Duration::from_millis(200);
+        let before = self.audit_events().len();
         let (absolute_manager, _) = self
             .manager(self.target("known_hosts", "client_key"), absolute_limits)
             .await;
@@ -492,10 +604,13 @@ impl RealSshdFixture {
                 .unwrap()
                 .reason,
         );
+        session_ids.push(self.assert_completed_session_since(before, "absolute-timeout"));
 
+        let before = self.audit_events().len();
         let (mut shutdown_session, shutdown_manager) = self.session().await;
         timeout(WAIT, shutdown_manager.shutdown()).await.unwrap();
         reasons.push(shutdown_session.wait_closed().await.unwrap().reason);
+        session_ids.push(self.assert_completed_session_since(before, "manager-shutdown"));
 
         command_ok(
             Command::new("docker").args(["pause", &self.container]),
@@ -504,6 +619,7 @@ impl RealSshdFixture {
         let (cancel_manager, _) = self
             .manager(self.target("known_hosts", "client_key"), default_limits())
             .await;
+        let cancellation_audit_start = self.audit_events().len();
         let cancelling_manager = Arc::clone(&cancel_manager);
         let connecting = tokio::spawn(async move {
             cancelling_manager
@@ -522,6 +638,24 @@ impl RealSshdFixture {
             "unpause sshd after caller cancellation",
         );
         self.assert_no_session_children().await;
+        timeout(WAIT, async {
+            loop {
+                if self.audit_events().len() > cancellation_audit_start {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("pre-admission cancellation denial was not persisted");
+        let cancellation_events = self.audit_events();
+        let cancellation_events = &cancellation_events[cancellation_audit_start..];
+        assert_eq!(cancellation_events.len(), 1, "{cancellation_events:?}");
+        assert_eq!(cancellation_events[0]["event_type"], "access-denied");
+        assert_eq!(cancellation_events[0]["category"], "target");
+        assert_eq!(cancellation_events[0]["reason"], "session-cancelled");
+
+        let before = self.audit_events().len();
         let mut after_cancel = cancel_manager
             .start(
                 Identity::new(USER).unwrap(),
@@ -531,11 +665,14 @@ impl RealSshdFixture {
             .await
             .unwrap();
         after_cancel.close().await.unwrap();
+        session_ids.push(self.assert_completed_session_since(before, "explicit"));
 
         assert!(reasons.contains(&SessionCloseReason::Explicit));
         assert!(reasons.contains(&SessionCloseReason::Timeout(TimeoutKind::Idle)));
         assert!(reasons.contains(&SessionCloseReason::Timeout(TimeoutKind::Absolute)));
         assert!(reasons.contains(&SessionCloseReason::ManagerShutdown));
+        let unique_session_ids = session_ids.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_session_ids.len(), session_ids.len());
         self.assert_no_session_children().await;
         let audit = self.audit_events();
         let started = audit
@@ -705,6 +842,30 @@ impl RealSshdFixture {
         assert_eq!(started[0]["session_id"], ended[0]["session_id"]);
         assert_eq!(ended[0]["close_reason"], reason);
     }
+
+    fn assert_completed_session_since(&self, start: usize, reason: &str) -> String {
+        let events = self.audit_events();
+        let events = &events[start..];
+        let started = events
+            .iter()
+            .filter(|event| event["event_type"] == "session-started")
+            .collect::<Vec<_>>();
+        let ended = events
+            .iter()
+            .filter(|event| event["event_type"] == "session-ended")
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1, "{events:?}");
+        assert_eq!(ended.len(), 1, "{events:?}");
+        assert_eq!(started[0]["session_id"], ended[0]["session_id"]);
+        assert_eq!(ended[0]["close_reason"], reason);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event_type"] != "access-denied"),
+            "{events:?}"
+        );
+        started[0]["session_id"].as_str().unwrap().to_owned()
+    }
 }
 
 struct ContainerGuard {
@@ -741,6 +902,15 @@ fn generate_key(path: PathBuf) {
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
             .arg(path),
         "generate ephemeral Ed25519 fixture key",
+    );
+}
+
+fn generate_key_with_comment(path: PathBuf, comment: &str) {
+    command_ok(
+        Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", comment, "-f"])
+            .arg(path),
+        "generate sentinel-bearing ephemeral Ed25519 fixture key",
     );
 }
 
@@ -987,4 +1157,31 @@ async fn malicious_pre_auth_banner_cannot_forge_ssh_admission() {
         .await
         .assert_malicious_banner_rejected()
         .await;
+}
+
+#[tokio::test]
+async fn cancelled_fixture_construction_removes_container_materials_and_releases_lock() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let construction = tokio::spawn(RealSshdFixture::start_paused_after_container(started_tx));
+    let (container, material_directory) = timeout(Duration::from_secs(60), started_rx)
+        .await
+        .expect("fixture did not arm cleanup")
+        .expect("fixture report was dropped");
+    construction.abort();
+    assert!(matches!(
+        construction.await,
+        Err(error) if error.is_cancelled()
+    ));
+    assert!(!material_directory.exists());
+    let inspect = Command::new("docker")
+        .args(["inspect", &container])
+        .output()
+        .unwrap();
+    assert!(
+        !inspect.status.success(),
+        "cancelled fixture container survived"
+    );
+    timeout(Duration::from_secs(60), RealSshdFixture::start())
+        .await
+        .expect("cancelled fixture retained the serial lock");
 }

@@ -125,6 +125,7 @@ pub enum DenialReason {
     SshAuthenticationFailed,
     SshUserPolicyDenied,
     SshFailed,
+    SessionCancelled,
     SessionUnavailable,
     AuditUnavailable,
 }

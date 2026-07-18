@@ -1519,7 +1519,16 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
                     .result_tx
                     .send(Err(SessionError::BackendUnavailable));
             }
-            ConnectingOutcome::CallerDropped => {}
+            ConnectingOutcome::CallerDropped => {
+                let _ = record_access_denial(
+                    connecting.audit.as_deref(),
+                    &connecting.identity,
+                    &connecting.target_name,
+                    connecting.remote_address,
+                    DenialCategory::Target,
+                    DenialReason::SessionCancelled,
+                );
+            }
             ConnectingOutcome::Authenticated => unreachable!(),
         }
         return;
@@ -2940,6 +2949,17 @@ mod tests {
             fixture.wait_reaped().await;
             assert_eq!(manager.capacity.active(), (0, 0));
             assert_eq!(manager.supervisor_count_for_test(), 0);
+            let events = fixture.audit_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event_type"], "access-denied");
+            assert_eq!(events[0]["category"], "target");
+            assert_eq!(events[0]["reason"], "session-cancelled");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event_type"] != "session-started"
+                        && event["event_type"] != "session-ended")
+            );
         }
     }
 
@@ -3219,6 +3239,11 @@ mod tests {
             fixture.wait_reaped().await;
             assert_eq!(manager.capacity.active(), (0, 0));
             assert_eq!(manager.supervisor_count_for_test(), 0);
+            let events = fixture.audit_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event_type"], "access-denied");
+            assert_eq!(events[0]["category"], "target");
+            assert_eq!(events[0]["reason"], "session-cancelled");
         }
     }
 
