@@ -2344,7 +2344,7 @@ requesttty force\n"
     #[tokio::test]
     async fn ssh_admission_uses_private_fifo_and_never_raw_stderr() {
         let material = Material::new();
-        let script = b"#!/bin/sh\nwhile [ \"$1\" != \"-E\" ]; do shift; done\nlog=$2\nprintf 'READY\\n'\nread first\nprintf 'debug1: setup continues\\n' > \"$log\"\nprintf 'Authenticated to host.example using \"publickey\".\\n' >&2\nprintf 'PHASE2\\n'\nread second\nprintf 'Authenticated to host.example using \"publickey\".\\n' > \"$log\"\n";
+        let script = b"#!/bin/sh\nwhile [ \"$1\" != \"-E\" ]; do shift; done\nlog=$2\nprintf 'READY\\n'\nread first\nprintf 'debug1: setup continues\\n' > \"$log\"\nprintf 'Authenticated to host.example using \"publickey\".\\n' >&2\nprintf 'PHASE2\\n'\nread second\nprintf 'Authenticated to host.example using \"publickey\".\\n' > \"$log\"\nprintf 'DONE\\n'\n";
         write(&material.executable, script, 0o700);
         let (_target, prepared) = prepared_runtime_fixture(&material).await;
         let spec = super::SshSpawnSpec::build(&prepared, "ignored").unwrap();
@@ -2429,8 +2429,18 @@ requesttty force\n"
             classifier.classification(),
             Some(super::SshDiagnosticClass::Authenticated)
         );
-        drop(writer);
-        drop(terminal);
+        let mut completion = Vec::new();
+        tokio::time::timeout(
+            wait,
+            tokio::io::AsyncReadExt::read_to_end(&mut terminal, &mut completion),
+        )
+        .await
+        .expect("fixture terminal completion timed out")
+        .unwrap();
+        assert!(
+            completion.windows(4).any(|window| window == b"DONE"),
+            "fixture exited without its completion marker"
+        );
         assert!(
             tokio::time::timeout(wait, child.wait())
                 .await
@@ -2438,6 +2448,8 @@ requesttty force\n"
                 .unwrap()
                 .success()
         );
+        drop(writer);
+        drop(terminal);
         drop(client_log);
         assert!(!fifo_path.exists());
     }
