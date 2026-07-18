@@ -80,26 +80,28 @@ pub enum AuthError {
 #[derive(Debug)]
 pub struct DevAuthProvider {
     identity: Identity,
-    sessions: Mutex<HashMap<String, DevSession>>,
+    sessions: BrowserSessionStore,
 }
 
 #[derive(Debug)]
-struct DevSession {
+struct BrowserSessionStore {
+    sessions: Mutex<HashMap<String, BrowserSession>>,
+}
+
+#[derive(Debug)]
+struct BrowserSession {
     identity: Identity,
     created_at: Instant,
 }
 
-impl DevAuthProvider {
-    pub fn new(user: impl Into<String>) -> Result<Self, IdentityError> {
-        Ok(Self {
-            identity: Identity::new(user)?,
+impl BrowserSessionStore {
+    fn new() -> Self {
+        Self {
             sessions: Mutex::new(HashMap::new()),
-        })
+        }
     }
-}
 
-impl AuthProvider for DevAuthProvider {
-    fn establish(&self, _context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
+    fn establish(&self, identity: Identity) -> Result<ProvisionedIdentity, AuthError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         if sessions.len() >= MAX_SESSIONS
             && let Some(oldest) = sessions
@@ -116,13 +118,13 @@ impl AuthProvider for DevAuthProvider {
             if !sessions.contains_key(&token) {
                 sessions.insert(
                     token.clone(),
-                    DevSession {
-                        identity: self.identity.clone(),
+                    BrowserSession {
+                        identity: identity.clone(),
                         created_at: Instant::now(),
                     },
                 );
                 return Ok(ProvisionedIdentity {
-                    identity: self.identity.clone(),
+                    identity,
                     cookie: format!(
                         "{SESSION_COOKIE_NAME}={token}; Path=/; Secure; HttpOnly; SameSite=Strict"
                     ),
@@ -132,11 +134,7 @@ impl AuthProvider for DevAuthProvider {
         Err(AuthError::Generation)
     }
 
-    fn authenticate(
-        &self,
-        _context: &AuthContext<'_>,
-        cookie_header: Option<&str>,
-    ) -> Result<Identity, AuthError> {
+    fn authenticate(&self, cookie_header: Option<&str>) -> Result<Identity, AuthError> {
         let header = cookie_header.ok_or(AuthError::Missing)?;
         if header.len() > 4096 {
             return Err(AuthError::Malformed);
@@ -168,6 +166,29 @@ impl AuthProvider for DevAuthProvider {
     }
 }
 
+impl DevAuthProvider {
+    pub fn new(user: impl Into<String>) -> Result<Self, IdentityError> {
+        Ok(Self {
+            identity: Identity::new(user)?,
+            sessions: BrowserSessionStore::new(),
+        })
+    }
+}
+
+impl AuthProvider for DevAuthProvider {
+    fn establish(&self, _context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
+        self.sessions.establish(self.identity.clone())
+    }
+
+    fn authenticate(
+        &self,
+        _context: &AuthContext<'_>,
+        cookie_header: Option<&str>,
+    ) -> Result<Identity, AuthError> {
+        self.sessions.authenticate(cookie_header)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("trusted proxy authentication configuration is invalid")]
 pub struct AuthProviderBuildError;
@@ -176,6 +197,7 @@ pub struct AuthProviderBuildError;
 pub struct TrustedProxyAuthProvider {
     identity_header: HeaderName,
     trusted_sources: Vec<IpNet>,
+    sessions: BrowserSessionStore,
 }
 
 impl TrustedProxyAuthProvider {
@@ -189,6 +211,7 @@ impl TrustedProxyAuthProvider {
         Ok(Self {
             identity_header,
             trusted_sources,
+            sessions: BrowserSessionStore::new(),
         })
     }
 
@@ -227,17 +250,17 @@ impl TrustedProxyAuthProvider {
 impl AuthProvider for TrustedProxyAuthProvider {
     fn establish(&self, context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
         self.trusted_peer(context)?;
-        let _identity = self.identity_from_header(context.headers())?;
-        Err(AuthError::Missing)
+        let identity = self.identity_from_header(context.headers())?;
+        self.sessions.establish(identity)
     }
 
     fn authenticate(
         &self,
         context: &AuthContext<'_>,
-        _cookie_header: Option<&str>,
+        cookie_header: Option<&str>,
     ) -> Result<Identity, AuthError> {
         self.trusted_peer(context)?;
-        Err(AuthError::Missing)
+        self.sessions.authenticate(cookie_header)
     }
 }
 
@@ -676,5 +699,159 @@ mod tests {
         let context = peer_context(&headers, Ipv4Addr::new(127, 0, 0, 2).into());
 
         assert_eq!(provider.establish(&context), Err(AuthError::UntrustedPeer));
+    }
+
+    fn proxy_identity_context<'a>(
+        headers: &'a mut HeaderMap,
+        identity: &'static str,
+    ) -> AuthContext<'a> {
+        headers.insert(
+            "x-authenticated-user",
+            HeaderValue::from_static(identity),
+        );
+        peer_context(headers, IpAddr::V4(Ipv4Addr::LOCALHOST))
+    }
+
+    #[test]
+    fn trusted_proxy_establishes_existing_secure_cookie_attributes() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        let provisioned = provider
+            .establish(&proxy_identity_context(&mut headers, "alice"))
+            .unwrap();
+
+        assert_eq!(provisioned.identity.as_str(), "alice");
+        assert!(!provisioned.cookie.contains("alice"));
+        for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Path=/"] {
+            assert!(provisioned.cookie.contains(attribute));
+        }
+        let pair = provisioned.cookie.split(';').next().unwrap();
+        assert_eq!(
+            provider
+                .authenticate(
+                    &peer_context(&HeaderMap::new(), IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    Some(pair),
+                )
+                .unwrap()
+                .as_str(),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cookie_authentication_does_not_reread_identity_header() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        let provisioned = provider
+            .establish(&proxy_identity_context(&mut headers, "alice"))
+            .unwrap();
+        let pair = provisioned.cookie.split(';').next().unwrap();
+
+        let identity = provider
+            .authenticate(
+                &peer_context(&HeaderMap::new(), IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                Some(pair),
+            )
+            .unwrap();
+
+        assert_eq!(identity.as_str(), "alice");
+    }
+
+    #[test]
+    fn trusted_proxy_changed_header_cannot_replace_existing_cookie_identity() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut alice_headers = HeaderMap::new();
+        let provisioned = provider
+            .establish(&proxy_identity_context(&mut alice_headers, "alice"))
+            .unwrap();
+        let pair = provisioned.cookie.split(';').next().unwrap();
+        let mut changed_headers = HeaderMap::new();
+        changed_headers.insert(
+            "x-authenticated-user",
+            HeaderValue::from_static("mallory"),
+        );
+
+        let identity = provider
+            .authenticate(
+                &peer_context(&changed_headers, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                Some(pair),
+            )
+            .unwrap();
+
+        assert_eq!(identity.as_str(), "alice");
+    }
+
+    #[test]
+    fn trusted_proxy_cookie_still_requires_a_trusted_peer() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        let provisioned = provider
+            .establish(&proxy_identity_context(&mut headers, "alice"))
+            .unwrap();
+        let pair = provisioned.cookie.split(';').next().unwrap();
+
+        assert_eq!(
+            provider.authenticate(
+                &peer_context(
+                    &HeaderMap::new(),
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))
+                ),
+                Some(pair),
+            ),
+            Err(AuthError::UntrustedPeer)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_rejects_missing_malformed_unknown_and_duplicate_cookies() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let headers = HeaderMap::new();
+        let context = peer_context(&headers, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        assert_eq!(provider.authenticate(&context, None), Err(AuthError::Missing));
+        assert_eq!(
+            provider.authenticate(&context, Some("broken")),
+            Err(AuthError::Malformed)
+        );
+        assert_eq!(
+            provider.authenticate(
+                &context,
+                Some(&format!("{SESSION_COOKIE_NAME}={}", "A".repeat(43)))
+            ),
+            Err(AuthError::Unknown)
+        );
+        assert_eq!(
+            provider.authenticate(
+                &context,
+                Some(&format!(
+                    "{SESSION_COOKIE_NAME}={}; {SESSION_COOKIE_NAME}={}",
+                    "A".repeat(43),
+                    "B".repeat(43)
+                ))
+            ),
+            Err(AuthError::Malformed)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_session_capacity_remains_bounded() {
+        let provider = proxy(&["127.0.0.1/32"]);
+        let mut headers = HeaderMap::new();
+        let first = provider
+            .establish(&proxy_identity_context(&mut headers, "alice"))
+            .unwrap()
+            .cookie;
+        for _ in 0..MAX_SESSIONS {
+            let mut headers = HeaderMap::new();
+            provider
+                .establish(&proxy_identity_context(&mut headers, "alice"))
+                .unwrap();
+        }
+        let empty_headers = HeaderMap::new();
+        let context = peer_context(&empty_headers, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            provider.authenticate(&context, Some(first.split(';').next().unwrap())),
+            Err(AuthError::Unknown)
+        );
     }
 }
