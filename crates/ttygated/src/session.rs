@@ -518,6 +518,7 @@ pub struct SessionManager {
 enum ConnectingPanicPoint {
     BeforeAdmission,
     AfterAuditStart,
+    AfterHandoffTake,
 }
 
 #[derive(Default)]
@@ -836,7 +837,7 @@ impl SessionManager {
             reservation,
             running: Some(running),
             command_tx,
-            command_rx,
+            command_rx: Some(command_rx),
             output_tx,
             output_rx,
             close_rx,
@@ -1251,7 +1252,7 @@ struct ConnectingSupervisor {
     reservation: Reservation,
     running: Option<SpawnedBackend>,
     command_tx: mpsc::Sender<SessionCommand>,
-    command_rx: mpsc::Receiver<SessionCommand>,
+    command_rx: Option<mpsc::Receiver<SessionCommand>>,
     output_tx: mpsc::Sender<Vec<u8>>,
     output_rx: mpsc::Receiver<Vec<u8>>,
     close_tx: watch::Sender<Option<SessionCloseReason>>,
@@ -1277,8 +1278,8 @@ struct ConnectingSupervisor {
 }
 
 struct ConnectingParts {
-    reader: crate::pty_backend::PtyReader,
-    writer: crate::pty_backend::PtyWriter,
+    reader: Option<crate::pty_backend::PtyReader>,
+    writer: Option<crate::pty_backend::PtyWriter>,
     child: crate::pty_backend::PtyChild,
     admission_rx: mpsc::UnboundedReceiver<SshDiagnosticClass>,
     diagnostic_tasks: Vec<JoinHandle<()>>,
@@ -1288,6 +1289,16 @@ struct ConnectingExecution {
     connecting: Option<ConnectingSupervisor>,
     parts: Option<ConnectingParts>,
     persistent_audit: Option<PersistentAudit>,
+    handoff: Option<ConnectingHandoff>,
+}
+
+struct ConnectingHandoff {
+    connecting: ConnectingSupervisor,
+    parts: ConnectingParts,
+    persistent_audit: Option<PersistentAudit>,
+    lifecycle_started: bool,
+    reader_task: Option<JoinHandle<()>>,
+    writer_task: Option<JoinHandle<()>>,
 }
 
 fn split_connecting_backend(
@@ -1300,8 +1311,8 @@ fn split_connecting_backend(
             let (admission_tx, admission_rx) = mpsc::unbounded_channel();
             let _ = admission_tx.send(SshDiagnosticClass::Authenticated);
             ConnectingParts {
-                reader,
-                writer,
+                reader: Some(reader),
+                writer: Some(writer),
                 child,
                 admission_rx,
                 diagnostic_tasks: Vec::new(),
@@ -1330,8 +1341,8 @@ fn split_connecting_backend(
                 drain_client_log(client_log, classifier, admission_tx, &mut log_cancel).await;
             });
             ConnectingParts {
-                reader,
-                writer,
+                reader: Some(reader),
+                writer: Some(writer),
                 child,
                 admission_rx,
                 diagnostic_tasks: vec![raw_task, log_task],
@@ -1341,8 +1352,8 @@ fn split_connecting_backend(
         SpawnedBackend::TestSsh(running, admission_rx) => {
             let (reader, writer, child) = running.into_parts();
             ConnectingParts {
-                reader,
-                writer,
+                reader: Some(reader),
+                writer: Some(writer),
                 child,
                 admission_rx,
                 diagnostic_tasks: Vec::new(),
@@ -1402,6 +1413,7 @@ async fn supervise_connecting(mut connecting: ConnectingSupervisor) {
         connecting: Some(connecting),
         parts: Some(parts),
         persistent_audit: None,
+        handoff: None,
     };
     if AssertUnwindSafe(run_connecting(&mut execution))
         .catch_unwind()
@@ -1455,6 +1467,8 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
     if !matches!(outcome, ConnectingOutcome::Authenticated) {
         connecting.cancel_tx.send_replace(true);
         if matches!(outcome, ConnectingOutcome::ChildExited) {
+            drop(parts.reader.take());
+            drop(parts.writer.take());
             cleanup_group_until_proven(&parts.child).await;
         } else {
             let _ = terminate_until_proven(&mut parts.child).await;
@@ -1571,14 +1585,90 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
         panic!("injected connecting unwind after persisted audit start");
     }
 
-    let connecting = execution
-        .connecting
+    execution.handoff = Some(ConnectingHandoff {
+        connecting: execution
+            .connecting
+            .take()
+            .expect("authenticated connection hands off exactly once"),
+        parts: execution
+            .parts
+            .take()
+            .expect("authenticated process hands off exactly once"),
+        persistent_audit: execution.persistent_audit.take(),
+        lifecycle_started: false,
+        reader_task: None,
+        writer_task: None,
+    });
+    #[cfg(test)]
+    if execution.handoff.as_ref().is_some_and(|handoff| {
+        handoff.connecting.connecting_panic_for_test == Some(ConnectingPanicPoint::AfterHandoffTake)
+    }) {
+        panic!("injected connecting unwind after handoff take");
+    }
+    let created_at = Instant::now();
+    let mut state = StateMachine::new();
+    state.start().expect("authenticated admission starts once");
+    {
+        let handoff = execution
+            .handoff
+            .as_mut()
+            .expect("authenticated handoff remains owned during construction");
+        for transition in [LifecycleTransition::Created, LifecycleTransition::Running] {
+            let event = lifecycle_event(
+                &handoff.connecting.identity,
+                &handoff.connecting.target_name,
+                transition,
+            );
+            handoff
+                .connecting
+                .event_tx
+                .try_send(event.clone())
+                .expect("lifecycle channel holds every possible transition");
+            let _ = handoff.connecting.audit_tx.send(event);
+        }
+        handoff.lifecycle_started = true;
+        let reader = handoff
+            .parts
+            .reader
+            .take()
+            .expect("handoff reader starts exactly once");
+        handoff.reader_task = Some(tokio::spawn(read_output(
+            reader,
+            handoff.connecting.output_tx.clone(),
+            handoff.connecting.cancel_rx.clone(),
+            handoff.connecting.activity_tx.clone(),
+            handoff.connecting.worker_event_tx.clone(),
+        )));
+        let writer = handoff
+            .parts
+            .writer
+            .take()
+            .expect("handoff writer starts exactly once");
+        let command_rx = handoff
+            .connecting
+            .command_rx
+            .take()
+            .expect("handoff command receiver starts exactly once");
+        handoff.writer_task = Some(tokio::spawn(write_input(
+            writer,
+            command_rx,
+            handoff.connecting.cancel_rx.clone(),
+            handoff.connecting.activity_tx.clone(),
+            handoff.connecting.worker_event_tx.clone(),
+            handoff.connecting.read_only,
+        )));
+    }
+    let ConnectingHandoff {
+        connecting,
+        parts,
+        persistent_audit,
+        lifecycle_started: _,
+        reader_task,
+        writer_task,
+    } = execution
+        .handoff
         .take()
-        .expect("authenticated connection hands off exactly once");
-    let parts = execution
-        .parts
-        .take()
-        .expect("authenticated process hands off exactly once");
+        .expect("authenticated handoff completes exactly once");
     let ConnectingSupervisor {
         identity,
         target_name,
@@ -1587,14 +1677,14 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
         reservation,
         running: _,
         command_tx,
-        command_rx,
-        output_tx,
+        command_rx: _,
+        output_tx: _,
         output_rx,
         close_tx,
         close_rx,
         cancel_tx,
-        cancel_rx,
-        activity_tx,
+        cancel_rx: _,
+        activity_tx: _,
         activity_rx,
         final_tx,
         final_rx,
@@ -1603,7 +1693,7 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
         audit_tx,
         audit: _,
         remote_address: _,
-        worker_event_tx,
+        worker_event_tx: _,
         worker_event_rx,
         result_tx,
         #[cfg(test)]
@@ -1611,33 +1701,6 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
         #[cfg(test)]
             connecting_panic_for_test: _,
     } = connecting;
-    let created_at = Instant::now();
-    let persistent_audit = execution.persistent_audit.take();
-
-    let mut state = StateMachine::new();
-    state.start().expect("authenticated admission starts once");
-    for transition in [LifecycleTransition::Created, LifecycleTransition::Running] {
-        let event = lifecycle_event(&identity, &target_name, transition);
-        event_tx
-            .try_send(event.clone())
-            .expect("lifecycle channel holds every possible transition");
-        let _ = audit_tx.send(event);
-    }
-    let reader_task = tokio::spawn(read_output(
-        parts.reader,
-        output_tx,
-        cancel_rx.clone(),
-        activity_tx.clone(),
-        worker_event_tx.clone(),
-    ));
-    let writer_task = tokio::spawn(write_input(
-        parts.writer,
-        command_rx,
-        cancel_rx,
-        activity_tx,
-        worker_event_tx,
-        read_only,
-    ));
     let supervisor = Supervisor {
         state,
         identity,
@@ -1653,8 +1716,8 @@ async fn run_connecting(execution: &mut ConnectingExecution) {
         event_tx,
         audit_tx,
         worker_event_rx,
-        reader_task: Some(reader_task),
-        writer_task: Some(writer_task),
+        reader_task,
+        writer_task,
         diagnostic_tasks: parts.diagnostic_tasks,
         persistent_audit,
         #[cfg(test)]
@@ -1681,6 +1744,52 @@ async fn cleanup_connecting(parts: &mut ConnectingParts, cancel: &watch::Sender<
 }
 
 async fn recover_connecting_unwind(execution: &mut ConnectingExecution) {
+    if let Some(mut handoff) = execution.handoff.take() {
+        handoff.connecting.cancel_tx.send_replace(true);
+        let (status, _) = terminate_until_proven(&mut handoff.parts.child).await;
+        if let Some(task) = handoff.reader_task.take() {
+            join_worker(task).await;
+        }
+        if let Some(task) = handoff.writer_task.take() {
+            join_worker(task).await;
+        }
+        for task in handoff.parts.diagnostic_tasks.drain(..) {
+            join_worker(task).await;
+        }
+        let outcome = Some(ChildOutcome::from_status(status));
+        if handoff.lifecycle_started {
+            let event = lifecycle_event(
+                &handoff.connecting.identity,
+                &handoff.connecting.target_name,
+                LifecycleTransition::Closed {
+                    reason: SessionCloseReason::SupervisorUnwind,
+                    outcome,
+                },
+            );
+            let _ = handoff.connecting.event_tx.try_send(event.clone());
+            let _ = handoff.connecting.audit_tx.send(event);
+        }
+        if let Some(audit) = &handoff.persistent_audit
+            && let Ok(ended_at) = AuditTimestamp::now()
+        {
+            let target = ResolvedAuditTarget::from_resolved_name(&handoff.connecting.target_name);
+            let _ = audit.log.record(&AuditEvent::session_ended(
+                audit.session_id.clone(),
+                &handoff.connecting.identity,
+                &target,
+                audit.remote_address,
+                audit.started_at.clone(),
+                ended_at,
+                AuditCloseReason::SupervisorUnwind,
+                outcome.map(audit_outcome),
+            ));
+        }
+        let _ = handoff
+            .connecting
+            .result_tx
+            .send(Err(SessionError::BackendUnavailable));
+        return;
+    }
     let outcome = if let (Some(connecting), Some(parts)) =
         (execution.connecting.as_ref(), execution.parts.as_mut())
     {
@@ -1881,6 +1990,7 @@ async fn run_supervisor(supervisor: &mut Supervisor) -> (SessionCloseReason, Opt
 
     supervisor.cancel_tx.send_replace(true);
     let outcome = if let Some(status) = natural_status {
+        join_supervisor_workers(supervisor).await;
         if cleanup_group_until_proven(&supervisor.child).await {
             reason = SessionCloseReason::BackendFailure;
         }
@@ -1893,7 +2003,9 @@ async fn run_supervisor(supervisor: &mut Supervisor) -> (SessionCloseReason, Opt
         Some(ChildOutcome::from_status(status))
     };
 
-    join_supervisor_workers(supervisor).await;
+    if natural_status.is_none() {
+        join_supervisor_workers(supervisor).await;
+    }
     (reason, outcome)
 }
 
@@ -2388,6 +2500,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum SshAdmissionScript {
         Authenticated,
+        AuthenticatedSingleProcess,
         Pending,
         Failure(crate::ssh::SshDiagnosticClass),
         AuthenticatedThenExit(u8),
@@ -2412,6 +2525,12 @@ mod tests {
             assert!(matches!(target, super::BackendSpawn::Ssh { .. }));
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
             let process_target = match self.script {
+                SshAdmissionScript::AuthenticatedSingleProcess => PtyTarget {
+                    name: "scripted-ssh-child".to_owned(),
+                    executable: "/bin/sleep".into(),
+                    argv: vec!["300".to_owned()],
+                    read_only: false,
+                },
                 SshAdmissionScript::AuthenticatedThenExit(code)
                 | SshAdmissionScript::PendingThenExit(code) => PtyTarget {
                     name: "scripted-ssh-child".to_owned(),
@@ -2427,6 +2546,7 @@ mod tests {
             let (admission_tx, admission_rx) = mpsc::unbounded_channel();
             match self.script {
                 SshAdmissionScript::Authenticated
+                | SshAdmissionScript::AuthenticatedSingleProcess
                 | SshAdmissionScript::AuthenticatedThenExit(_) => {
                     let _ = admission_tx.send(crate::ssh::SshDiagnosticClass::Authenticated);
                 }
@@ -2746,6 +2866,62 @@ mod tests {
         ));
         fixture.wait_reaped().await;
         assert_eq!(manager.capacity.active(), (0, 0));
+        assert!(lifecycle.try_recv().is_err());
+        let events = fixture.audit_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_type"] == "session-started")
+                .count(),
+            1
+        );
+        let ended = events
+            .iter()
+            .filter(|event| event["event_type"] == "session-ended")
+            .collect::<Vec<_>>();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0]["close_reason"], "supervisor-unwind");
+    }
+
+    #[tokio::test]
+    async fn connecting_unwind_after_handoff_take_retains_cleanup_and_audit_owner() {
+        let fixture = SshAdmissionFixture::new(SshAdmissionScript::AuthenticatedSingleProcess);
+        let manager = fixture.manager_with_connecting_panic(ConnectingPanicPoint::AfterHandoffTake);
+        let mut lifecycle = manager.subscribe_events();
+
+        let start = manager.start(
+            Identity::new("alice").unwrap(),
+            "remote",
+            Resize::new(80, 24).unwrap(),
+        );
+        tokio::pin!(start);
+        let mut delivered_during_cleanup = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !fixture.was_reaped() {
+                tokio::select! {
+                    result = &mut start => {
+                        delivered_during_cleanup = Some(result);
+                        break;
+                    }
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("post-handoff-take process-group cleanup proof timed out");
+        assert!(
+            fixture.was_reaped(),
+            "post-handoff-take result was delivered before process-group cleanup proof"
+        );
+        let result = match delivered_during_cleanup {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(1), &mut start)
+                .await
+                .expect("post-handoff-take result delivery timed out after cleanup proof"),
+        };
+        assert!(matches!(result, Err(SessionError::BackendUnavailable)));
+        assert_eq!(manager.capacity.active(), (0, 0));
+        assert_eq!(manager.supervisor_count_for_test(), 0);
         assert!(lifecycle.try_recv().is_err());
         let events = fixture.audit_events();
         assert_eq!(

@@ -168,6 +168,15 @@ fn process_exists(pid: u32) -> bool {
     }
 }
 
+fn process_group_exists(process_group: u32) -> bool {
+    let process_group = i32::try_from(process_group).expect("fixture PGID fits i32");
+    match killpg(Pid::from_raw(process_group), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(error) => panic!("process-group probe failed: {error}"),
+    }
+}
+
 async fn assert_absent(pid: u32) {
     timeout(WAIT, async {
         while process_exists(pid) {
@@ -470,8 +479,18 @@ async fn capacity_is_held_until_resistant_group_teardown_finishes() {
         Err(ttygated::session::SessionError::GlobalLimit)
     ));
     assert_eq!(closing.await.unwrap().reason, SessionCloseReason::Explicit);
-    assert_absent(leader).await;
-    assert_absent(descendant).await;
+    assert!(
+        !process_exists(leader),
+        "leader remained after capacity release"
+    );
+    assert!(
+        !process_exists(descendant),
+        "descendant remained after capacity release"
+    );
+    assert!(
+        !process_group_exists(leader),
+        "process group remained after capacity release"
+    );
     let mut second = manager
         .start(
             Identity::new("second").unwrap(),

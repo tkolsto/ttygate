@@ -48,6 +48,8 @@ fi
 while IFS= read -r line; do
     case "$line" in
         exit)
+            kill "$descendant" 2>/dev/null || true
+            wait "$descendant" 2>/dev/null || true
             exit 0
             ;;
         size)
