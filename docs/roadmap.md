@@ -121,12 +121,18 @@ The first running build already enforces Origin checks and ticket-bound WebSocke
 
 ### Chunk 2.4 — Audit subsystem
 
+- **Status:** complete (Refs #10). Versioned structured JSONL records cover authentication, denials, and correlated admitted-session start/end outcomes; startup and runtime failures deny new authority.
 - **Deliverables:** structured JSON lifecycle log (session id, user, target, remote address, start/end, exit status, denial reasons including host-key failures later); append-only JSONL file per config; no terminal input in logs; audit event serialization tests.
 - **Consumes:** lifecycle events (1.4), auth outcomes (2.2, 2.3).
 - **Produces:** audit event API that M3 (host-key failures) and M5 (recording) extend.
 - **Done when:** an integration test reconstructs "who opened which target and when" purely from the log; a grep-style test asserts typed terminal input never appears.
 
-**M2 exit:** plan Phase 2 exit criteria green; security docs updated with residual limitations.
+**M2 exit — Status: complete.** Phase 2 exit criteria are green. The audit log
+alone reconstructs who opened which configured target, from which listener
+peer, when, and with what outcome; complete-file tests exclude credential,
+request, command, environment, terminal-input, and output sentinels. Security
+docs retain the filesystem, durability, rotation/retention, shared-OS-user, and
+recording limitations.
 
 ---
 

@@ -18,11 +18,12 @@ and binds that identity through the secure browser cookie, session ticket, WSS
 upgrade, and PTY session. Roadmap Chunk 2.3 is complete (Refs #24):
 authenticated session requests and authentication failures are rate-limited,
 and configured global/per-identity capacity is reserved when a ticket is issued
-and transferred exactly once to the live session. Audit persistence, SSH,
-recording, reconnect, packaging, and release hardening remain future work, so
-the current build is still not production-safe.
-Rate limiting is implemented; audit persistence, SSH, recording, packaging,
-and other release controls remain future work.
+and transferred exactly once to the live session. Roadmap Chunk 2.4 is complete (Refs #10):
+both modes require a restrictive structured lifecycle audit sink
+before application construction or listener binding, and new authority fails
+closed if that sink becomes unavailable. Milestone M2 is complete. SSH,
+recording, reconnect, packaging, deployment examples, and release hardening
+remain future work, so the current build is still not production-safe.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
 
@@ -165,11 +166,61 @@ positive `Retry-After`; concurrency exhaustion returns HTTP 503 with
 bound local state but do not prevent distributed denial of service or host,
 socket, proxy, or allowlisted-command exhaustion.
 
+## Lifecycle audit log
+
+Chunk 2.4 implements this audit configuration in development and production:
+
+```toml
+[audit]
+format = "json"
+path = "./ttygate-audit.jsonl"
+recording = false
+```
+
+The path is literal: ttygate does not expand environment variables or `~`.
+Every existing parent must be a real directory rather than a symlink, and the
+destination must be a regular non-symlink file. A missing destination is
+created owner-only (`0600` on Unix); ttygate rejects an existing file with
+group/other permissions and never weakens it with an automatic `chmod`.
+Existing content must end at a complete newline-delimited record.
+
+The sink writes schema-versioned JSONL in append mode. One process-owned mutex
+keeps each bounded event on one complete line. Events cover authentication
+success, stable access denials, and one correlated start/end pair for every
+admitted PTY session, including normal exit, WebSocket disconnect, timeouts,
+manager shutdown, caller cancellation, supervisor unwind, and resistant-child
+cleanup. Attribution uses only the listener-supplied socket peer; forwarding
+headers, Host, query strings, WebSocket subprotocols, and hostile request values
+are not audit authority and are not reflected into denial records.
+
+Lifecycle records include identity, configured target name, peer address,
+timestamps, stable reasons, and exit outcome where available. They never
+include cookies, tickets, credentials, executable paths, arguments,
+environment, raw terminal input, or routine terminal output. Recording is a
+separate future feature; `recording = false` is currently the only supported
+value.
+Terminal input and output never appear in lifecycle audit records.
+
+Startup refuses to construct the application or bind a listener if the audit
+destination cannot be opened safely. A runtime write or flush failure
+permanently marks the process sink unavailable and denies subsequent identity,
+ticket, and session authority with stable errors. The JSONL writer flushes the
+language-level buffer but does not call `fsync` per event, so recent records can
+still be lost on kernel, storage, or power failure.
+
+ttygate does not rotate, retain, ship, back up, or delete audit files.
+Operators own rotation and retention and must coordinate them without replacing
+the live path behind the daemon. The containing filesystem is a trust boundary;
+administrators able to rename parent components remain trusted. Validation resists
+ordinary symlinks and unsafe permissions, but it is not a defense against a
+privileged actor concurrently mutating the filesystem namespace. Audit metadata
+is sensitive even though terminal contents and credentials are excluded.
+
 ## Planned v0.1 posture
 
 The daemon defaults to `127.0.0.1`, but localhost-only binding is only one layer. Local development requires Origin validation, a real browser session cookie, and a short-lived single-use ticket presented as the first WebSocket message. The frontend lists only safe presentation metadata for server-configured targets; executable paths, arguments, SSH options, credentials, and tickets never become target-selection authority. Terminal output uses bounded server and browser queues, and a dropped WebSocket ends the session without automatic reconnect.
 
-The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits are implemented; structured session-lifecycle audit persistence remains planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits and structured session-lifecycle audit persistence are implemented. SSH execution, recording, packaging, deployment examples, and release work remain planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
 
 ## Security model and non-goals
 
