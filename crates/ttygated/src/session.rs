@@ -1,10 +1,13 @@
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     os::unix::process::ExitStatusExt,
+    panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
+use futures_util::FutureExt;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -14,6 +17,10 @@ use tokio::{
 };
 
 use crate::{
+    audit::{
+        AuditCloseReason, AuditEvent, AuditLog, AuditOutcome, AuditTimestamp, CorrelationId,
+        DenialCategory, DenialReason, SessionId,
+    },
     config::{Limits, PtyTarget, Target, TargetAllowlist},
     protocol::{self, MAX_BINARY_BYTES, Resize},
     pty_backend::{BackendError, PtyProcessBackend, RunningPty},
@@ -45,7 +52,9 @@ pub enum TimeoutKind {
 pub enum SessionCloseReason {
     ChildExited,
     Explicit,
+    TransportDropped,
     HandleDropped,
+    SupervisorUnwind,
     ManagerShutdown,
     Timeout(TimeoutKind),
     BackendFailure,
@@ -114,6 +123,8 @@ pub enum SessionError {
     ReservationUnavailable,
     #[error("The terminal backend is unavailable.")]
     BackendUnavailable,
+    #[error("The required audit control is unavailable.")]
+    AuditUnavailable,
     #[error("The terminal session is closed.")]
     Closed,
     #[error("The configured terminal is read-only.")]
@@ -447,6 +458,9 @@ pub struct SessionManager {
     targets: Arc<TargetAllowlist>,
     supervisors: Arc<SupervisorRegistry>,
     audit_tx: broadcast::Sender<LifecycleEvent>,
+    audit: Option<Arc<AuditLog>>,
+    #[cfg(test)]
+    panic_supervisor_for_test: bool,
 }
 
 #[derive(Default)]
@@ -497,6 +511,14 @@ impl std::fmt::Debug for SessionManager {
 
 impl SessionManager {
     pub fn new(limits: Limits, targets: TargetAllowlist) -> Self {
+        Self::build(limits, targets, None)
+    }
+
+    pub fn new_with_audit(limits: Limits, targets: TargetAllowlist, audit: Arc<AuditLog>) -> Self {
+        Self::build(limits, targets, Some(audit))
+    }
+
+    fn build(limits: Limits, targets: TargetAllowlist, audit: Option<Arc<AuditLog>>) -> Self {
         let (audit_tx, _) = broadcast::channel(AUDIT_CHANNEL_CAPACITY);
         Self {
             capacity: Arc::new(Capacity::new(&limits)),
@@ -505,7 +527,16 @@ impl SessionManager {
             targets: Arc::new(targets),
             supervisors: Arc::new(SupervisorRegistry::default()),
             audit_tx,
+            audit,
+            #[cfg(test)]
+            panic_supervisor_for_test: false,
         }
+    }
+
+    #[cfg(test)]
+    fn with_supervisor_panic_for_test(mut self) -> Self {
+        self.panic_supervisor_for_test = true;
+        self
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<LifecycleEvent> {
@@ -517,6 +548,17 @@ impl SessionManager {
         identity: Identity,
         target_name: &str,
         initial_size: Resize,
+    ) -> Result<Session, SessionError> {
+        self.start_with_remote(identity, target_name, initial_size, None)
+            .await
+    }
+
+    pub async fn start_with_remote(
+        &self,
+        identity: Identity,
+        target_name: &str,
+        initial_size: Resize,
+        remote_address: Option<SocketAddr>,
     ) -> Result<Session, SessionError> {
         let _admission = self.supervisors.admission.read().await;
         if self
@@ -534,7 +576,8 @@ impl SessionManager {
         };
         validate_resize(&initial_size)?;
         let reservation = self.capacity.reserve(&identity)?;
-        self.start_admitted(identity, target, initial_size, reservation)
+        self.start_admitted(identity, target, initial_size, reservation, remote_address)
+            .await
     }
 
     pub async fn reserve(
@@ -562,6 +605,18 @@ impl SessionManager {
         target_name: &str,
         initial_size: Resize,
     ) -> Result<Session, SessionError> {
+        self.start_reserved_with_remote(reservation, identity, target_name, initial_size, None)
+            .await
+    }
+
+    pub async fn start_reserved_with_remote(
+        &self,
+        reservation: SessionReservation,
+        identity: Identity,
+        target_name: &str,
+        initial_size: Resize,
+        remote_address: Option<SocketAddr>,
+    ) -> Result<Session, SessionError> {
         let _admission = self.supervisors.admission.read().await;
         if self
             .supervisors
@@ -578,26 +633,68 @@ impl SessionManager {
         };
         validate_resize(&initial_size)?;
         let reservation = reservation.activate(&identity)?;
-        self.start_admitted(identity, target, initial_size, reservation)
+        self.start_admitted(identity, target, initial_size, reservation, remote_address)
+            .await
     }
 
-    fn start_admitted(
+    async fn start_admitted(
         &self,
         identity: Identity,
         target: PtyTarget,
         initial_size: Resize,
         reservation: Reservation,
+        remote_address: Option<SocketAddr>,
     ) -> Result<Session, SessionError> {
         let created_at = Instant::now();
         let mut state = StateMachine::new();
         let (event_tx, event_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
+        let persistent_audit = self
+            .audit
+            .as_ref()
+            .map(|audit| {
+                Ok::<_, SessionError>(PersistentAudit {
+                    log: Arc::clone(audit),
+                    session_id: SessionId::generate()
+                        .map_err(|_| SessionError::AuditUnavailable)?,
+                    started_at: AuditTimestamp::now()
+                        .map_err(|_| SessionError::AuditUnavailable)?,
+                    remote_address,
+                })
+            })
+            .transpose()?;
 
-        let running = self
-            .backend
-            .spawn(&target, initial_size)
-            .map_err(|_| SessionError::SpawnUnavailable)?;
+        let running = match self.backend.spawn(&target, initial_size) {
+            Ok(running) => running,
+            Err(_) => {
+                if self
+                    .record_spawn_denial(&identity, &target, remote_address)
+                    .is_err()
+                {
+                    return Err(SessionError::AuditUnavailable);
+                }
+                return Err(SessionError::SpawnUnavailable);
+            }
+        };
         state.start()?;
         debug_assert_eq!(state.state(), SessionState::Running);
+        if let Some(audit) = &persistent_audit
+            && audit
+                .log
+                .record(&AuditEvent::session_started(
+                    audit.session_id.clone(),
+                    &identity,
+                    &target.name,
+                    remote_address,
+                    audit.started_at.clone(),
+                ))
+                .is_err()
+        {
+            let (reader, writer, mut child) = running.into_parts();
+            drop(reader);
+            drop(writer);
+            let _ = child.terminate(CLEANUP_GRACE).await;
+            return Err(SessionError::AuditUnavailable);
+        }
         for transition in [LifecycleTransition::Created, LifecycleTransition::Running] {
             let event = lifecycle_event(&identity, &target, transition);
             event_tx
@@ -645,8 +742,11 @@ impl SessionManager {
             event_tx,
             audit_tx: self.audit_tx.clone(),
             worker_event_rx,
-            reader_task,
-            writer_task,
+            reader_task: Some(reader_task),
+            writer_task: Some(writer_task),
+            persistent_audit,
+            #[cfg(test)]
+            panic_for_test: self.panic_supervisor_for_test,
         };
         let (start_tx, start_rx) = oneshot::channel();
         let supervisors = Arc::clone(&self.supervisors);
@@ -685,6 +785,30 @@ impl SessionManager {
             event_rx,
             read_only: target.read_only,
         })
+    }
+
+    fn record_spawn_denial(
+        &self,
+        identity: &Identity,
+        target: &PtyTarget,
+        remote_address: Option<SocketAddr>,
+    ) -> Result<(), ()> {
+        let Some(audit) = &self.audit else {
+            return Ok(());
+        };
+        let correlation_id = CorrelationId::generate().map_err(|_| ())?;
+        let occurred_at = AuditTimestamp::now().map_err(|_| ())?;
+        audit
+            .record(&AuditEvent::access_denied(
+                correlation_id,
+                DenialCategory::Target,
+                DenialReason::SessionUnavailable,
+                Some(identity),
+                Some(&target.name),
+                remote_address,
+                occurred_at,
+            ))
+            .map_err(|_| ())
     }
 
     pub async fn shutdown(&self) {
@@ -799,6 +923,11 @@ impl Session {
 
     pub async fn close(&mut self) -> Result<SessionClosed, SessionError> {
         request_close(&self.close_tx, SessionCloseReason::Explicit);
+        self.wait_closed().await
+    }
+
+    pub(crate) async fn transport_dropped(&mut self) -> Result<SessionClosed, SessionError> {
+        request_close(&self.close_tx, SessionCloseReason::TransportDropped);
         self.wait_closed().await
     }
 
@@ -954,11 +1083,47 @@ struct Supervisor {
     event_tx: mpsc::Sender<LifecycleEvent>,
     audit_tx: broadcast::Sender<LifecycleEvent>,
     worker_event_rx: mpsc::Receiver<WorkerEvent>,
-    reader_task: JoinHandle<()>,
-    writer_task: JoinHandle<()>,
+    reader_task: Option<JoinHandle<()>>,
+    writer_task: Option<JoinHandle<()>>,
+    persistent_audit: Option<PersistentAudit>,
+    #[cfg(test)]
+    panic_for_test: bool,
+}
+
+struct PersistentAudit {
+    log: Arc<AuditLog>,
+    session_id: SessionId,
+    started_at: AuditTimestamp,
+    remote_address: Option<SocketAddr>,
 }
 
 async fn supervise(mut supervisor: Supervisor) {
+    let result = AssertUnwindSafe(run_supervisor(&mut supervisor))
+        .catch_unwind()
+        .await;
+    let (reason, outcome) = match result {
+        Ok(completion) => completion,
+        Err(_) => {
+            supervisor.cancel_tx.send_replace(true);
+            let outcome = supervisor
+                .child
+                .terminate(CLEANUP_GRACE)
+                .await
+                .ok()
+                .map(ChildOutcome::from_status);
+            join_supervisor_workers(&mut supervisor).await;
+            (SessionCloseReason::SupervisorUnwind, outcome)
+        }
+    };
+    complete_supervisor(supervisor, reason, outcome);
+}
+
+async fn run_supervisor(supervisor: &mut Supervisor) -> (SessionCloseReason, Option<ChildOutcome>) {
+    #[cfg(test)]
+    if supervisor.panic_for_test {
+        panic!("injected supervisor unwind");
+    }
+
     let absolute_deadline = supervisor.created_at + supervisor.limits.absolute_timeout;
     let idle_deadline = supervisor.created_at + supervisor.limits.idle_timeout;
     let absolute_sleep = sleep_until(absolute_deadline);
@@ -1030,12 +1195,42 @@ async fn supervise(mut supervisor: Supervisor) {
         }
     };
 
-    join_worker(supervisor.reader_task).await;
-    join_worker(supervisor.writer_task).await;
+    join_supervisor_workers(supervisor).await;
+    (reason, outcome)
+}
+
+async fn join_supervisor_workers(supervisor: &mut Supervisor) {
+    if let Some(reader) = supervisor.reader_task.take() {
+        join_worker(reader).await;
+    }
+    if let Some(writer) = supervisor.writer_task.take() {
+        join_worker(writer).await;
+    }
+}
+
+fn complete_supervisor(
+    mut supervisor: Supervisor,
+    reason: SessionCloseReason,
+    outcome: Option<ChildOutcome>,
+) {
     let closed = supervisor
         .state
         .close(reason, outcome)
         .expect("supervisor closes a running session exactly once");
+    if let Some(audit) = &supervisor.persistent_audit
+        && let Ok(ended_at) = AuditTimestamp::now()
+    {
+        let _ = audit.log.record(&AuditEvent::session_ended(
+            audit.session_id.clone(),
+            &supervisor.identity,
+            &supervisor.target_name,
+            audit.remote_address,
+            audit.started_at.clone(),
+            ended_at,
+            audit_close_reason(reason),
+            outcome.map(audit_outcome),
+        ));
+    }
     supervisor.final_tx.send_replace(Some(closed));
     let closed_event = LifecycleEvent {
         identity: supervisor.identity,
@@ -1046,6 +1241,28 @@ async fn supervise(mut supervisor: Supervisor) {
     let _ = supervisor.event_tx.try_send(closed_event.clone());
     let _ = supervisor.audit_tx.send(closed_event);
     drop(supervisor.reservation);
+}
+
+fn audit_close_reason(reason: SessionCloseReason) -> AuditCloseReason {
+    match reason {
+        SessionCloseReason::ChildExited => AuditCloseReason::ChildExited,
+        SessionCloseReason::Explicit => AuditCloseReason::Explicit,
+        SessionCloseReason::TransportDropped => AuditCloseReason::WebsocketDisconnect,
+        SessionCloseReason::HandleDropped => AuditCloseReason::Cancellation,
+        SessionCloseReason::SupervisorUnwind => AuditCloseReason::SupervisorUnwind,
+        SessionCloseReason::ManagerShutdown => AuditCloseReason::ManagerShutdown,
+        SessionCloseReason::Timeout(TimeoutKind::Idle) => AuditCloseReason::IdleTimeout,
+        SessionCloseReason::Timeout(TimeoutKind::Absolute) => AuditCloseReason::AbsoluteTimeout,
+        SessionCloseReason::BackendFailure => AuditCloseReason::BackendFailure,
+    }
+}
+
+fn audit_outcome(outcome: ChildOutcome) -> AuditOutcome {
+    match outcome {
+        ChildOutcome::Code(code) => AuditOutcome::Code(code),
+        ChildOutcome::Signal(signal) => AuditOutcome::Signal(signal),
+        ChildOutcome::Unavailable => AuditOutcome::Unavailable,
+    }
 }
 
 async fn join_worker(mut worker: JoinHandle<()>) {
@@ -1061,6 +1278,7 @@ async fn join_worker(mut worker: JoinHandle<()>) {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         os::unix::process::ExitStatusExt,
         sync::{Arc, Barrier, Mutex as StdMutex},
         thread,
@@ -1068,6 +1286,7 @@ mod tests {
     };
 
     use crate::{
+        audit::AuditLog,
         config::{Limits, PtyTarget, Target, TargetAllowlist},
         protocol::{MAX_BINARY_BYTES, Resize},
         ticket::{Identity, TicketGrant, TicketStore},
@@ -1133,7 +1352,9 @@ mod tests {
     fn typed_close_reasons_distinguish_timeout_and_control_paths() {
         let reasons = [
             SessionCloseReason::Explicit,
+            SessionCloseReason::TransportDropped,
             SessionCloseReason::HandleDropped,
+            SessionCloseReason::SupervisorUnwind,
             SessionCloseReason::ManagerShutdown,
             SessionCloseReason::Timeout(TimeoutKind::Idle),
             SessionCloseReason::Timeout(TimeoutKind::Absolute),
@@ -2100,5 +2321,49 @@ mod tests {
             ),
             "{transition:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_unwind_reaps_child_and_has_exactly_one_audit_completion() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let audit = Arc::new(AuditLog::open(&path).unwrap());
+        let manager = SessionManager::new_with_audit(
+            limits(4, 2),
+            allowlist(&[fixture_target(false)]),
+            audit,
+        )
+        .with_supervisor_panic_for_test();
+        let mut session = manager
+            .start(
+                Identity::new("alice").unwrap(),
+                "fixture",
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let closed = session.wait_closed().await.unwrap();
+        assert_eq!(closed.reason, SessionCloseReason::SupervisorUnwind);
+        manager.shutdown().await;
+
+        let events = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_type"] == "session-started")
+                .count(),
+            1
+        );
+        let ended = events
+            .iter()
+            .filter(|event| event["event_type"] == "session-ended")
+            .collect::<Vec<_>>();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0]["close_reason"], "supervisor-unwind");
     }
 }

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -9,6 +9,7 @@ use tokio::{
 };
 
 use crate::{
+    audit::{AuditEvent, AuditLog, AuditTimestamp, CorrelationId, DenialCategory, DenialReason},
     config::Target,
     protocol::{
         self, ClientControl, ClientFrame, CloseReason, ProtocolError, ProtocolErrorMessage, Resize,
@@ -100,6 +101,7 @@ fn safe_session_error(error: SessionError) -> BridgeFailure {
         },
         SessionError::SpawnUnavailable
         | SessionError::BackendUnavailable
+        | SessionError::AuditUnavailable
         | SessionError::Closed
         | SessionError::InvalidTransition => BridgeFailure {
             error: error_control(
@@ -125,9 +127,19 @@ fn terminal_controls(closed: SessionClosed) -> Vec<ServerControl> {
         SessionCloseReason::Explicit => {
             vec![ServerControl::Close(CloseReason::ClientRequest)]
         }
+        SessionCloseReason::TransportDropped => {
+            vec![ServerControl::Close(CloseReason::TransportError)]
+        }
         SessionCloseReason::HandleDropped => {
             vec![ServerControl::Close(CloseReason::TransportError)]
         }
+        SessionCloseReason::SupervisorUnwind => vec![
+            error_control(
+                "session-unavailable",
+                "The terminal session is unavailable.",
+            ),
+            ServerControl::Close(CloseReason::InternalError),
+        ],
         SessionCloseReason::ManagerShutdown => {
             vec![ServerControl::Close(CloseReason::Policy)]
         }
@@ -149,6 +161,8 @@ pub async fn accept_upgrade(
     identity: Identity,
     tickets: Arc<TicketStore>,
     sessions: Arc<SessionManager>,
+    audit: Arc<AuditLog>,
+    remote_address: Option<SocketAddr>,
 ) {
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     let message = loop {
@@ -163,7 +177,14 @@ pub async fn accept_upgrade(
             }
             Ok(Some(Ok(message))) => break message,
             Err(_) => {
-                send_failure(&mut socket, safe_ticket_error(TicketError::Malformed)).await;
+                deny_ticket(
+                    &mut socket,
+                    &audit,
+                    &identity,
+                    remote_address,
+                    TicketError::Malformed,
+                )
+                .await;
                 return;
             }
         }
@@ -171,6 +192,16 @@ pub async fn accept_upgrade(
     let ticket = match parse_handshake(&message) {
         Ok(ticket) => ticket,
         Err(HandshakeError::TooLarge) => {
+            if record_ticket_denial(&audit, &identity, remote_address, TicketError::Malformed)
+                .is_err()
+            {
+                send_failure(
+                    &mut socket,
+                    safe_session_error(SessionError::AuditUnavailable),
+                )
+                .await;
+                return;
+            }
             send_failure(
                 &mut socket,
                 protocol_failure(ProtocolError::ControlTooLarge),
@@ -179,14 +210,21 @@ pub async fn accept_upgrade(
             return;
         }
         Err(_) => {
-            send_failure(&mut socket, safe_ticket_error(TicketError::Malformed)).await;
+            deny_ticket(
+                &mut socket,
+                &audit,
+                &identity,
+                remote_address,
+                TicketError::Malformed,
+            )
+            .await;
             return;
         }
     };
     let grant = match tickets.redeem(&ticket, &identity) {
         Ok(grant) => grant,
         Err(error) => {
-            send_failure(&mut socket, safe_ticket_error(error)).await;
+            deny_ticket(&mut socket, &audit, &identity, remote_address, error).await;
             return;
         }
     };
@@ -202,7 +240,7 @@ pub async fn accept_upgrade(
     let size =
         Resize::new(INITIAL_COLS, INITIAL_ROWS).expect("the fixed initial terminal size is valid");
     let session = match sessions
-        .start_reserved(reservation, identity, target.name(), size)
+        .start_reserved_with_remote(reservation, identity, target.name(), size, remote_address)
         .await
     {
         Ok(session) => session,
@@ -213,6 +251,50 @@ pub async fn accept_upgrade(
     };
 
     bridge(socket, session).await;
+}
+
+fn record_ticket_denial(
+    audit: &AuditLog,
+    identity: &Identity,
+    remote_address: Option<SocketAddr>,
+    error: TicketError,
+) -> Result<(), ()> {
+    let reason = match error {
+        TicketError::Malformed => DenialReason::TicketMalformed,
+        TicketError::Unknown => DenialReason::TicketUnknown,
+        TicketError::Expired => DenialReason::TicketExpired,
+        TicketError::WrongIdentity => DenialReason::TicketWrongIdentity,
+        TicketError::AtCapacity => DenialReason::TicketCapacity,
+        TicketError::Generation => DenialReason::TicketGeneration,
+    };
+    let correlation_id = CorrelationId::generate().map_err(|_| ())?;
+    let occurred_at = AuditTimestamp::now().map_err(|_| ())?;
+    audit
+        .record(&AuditEvent::access_denied(
+            correlation_id,
+            DenialCategory::Ticket,
+            reason,
+            Some(identity),
+            None,
+            remote_address,
+            occurred_at,
+        ))
+        .map_err(|_| ())
+}
+
+async fn deny_ticket(
+    socket: &mut WebSocket,
+    audit: &AuditLog,
+    identity: &Identity,
+    remote_address: Option<SocketAddr>,
+    error: TicketError,
+) {
+    let failure = if record_ticket_denial(audit, identity, remote_address, error).is_ok() {
+        safe_ticket_error(error)
+    } else {
+        safe_session_error(SessionError::AuditUnavailable)
+    };
+    send_failure(socket, failure).await;
 }
 
 async fn send_control(socket: &mut WebSocket, control: &ServerControl) -> Result<(), ()> {
@@ -643,7 +725,7 @@ async fn finish_bridge(
             return;
         }
         Termination::Transport => {
-            let _ = session.close().await;
+            let _ = session.transport_dropped().await;
             cancel_tx.send_replace(true);
             join_task(reader).await;
             join_task(writer).await;

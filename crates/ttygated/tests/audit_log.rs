@@ -11,6 +11,9 @@ use ttygated::{
         AuditError, AuditEvent, AuditLog, AuditTimestamp, CorrelationId, DenialCategory,
         DenialReason, SessionId,
     },
+    config::{Limits, PtyTarget, Target, TargetAllowlist},
+    protocol::Resize,
+    session::{SessionCloseReason, SessionError, SessionManager},
     ticket::Identity,
 };
 
@@ -137,6 +140,14 @@ fn denial(sequence: u8) -> AuditEvent {
     )
 }
 
+fn audit_values(path: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 #[test]
 fn audit_open_creates_restrictive_literal_destination() {
     use std::os::unix::fs::PermissionsExt;
@@ -256,5 +267,101 @@ fn concurrent_audit_writers_produce_individually_parseable_jsonl() {
         lines
             .iter()
             .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+}
+
+fn lifecycle_limits() -> Limits {
+    Limits {
+        max_sessions: 2,
+        max_sessions_per_user: 1,
+        idle_timeout: Duration::from_secs(30),
+        absolute_timeout: Duration::from_secs(60),
+        session_requests_per_window: 10,
+        session_request_window: Duration::from_secs(60),
+        authentication_failures_per_window: 20,
+        authentication_failure_window: Duration::from_secs(60),
+    }
+}
+
+#[tokio::test]
+async fn admitted_session_has_one_correlated_start_and_end() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLog::open(&path).unwrap());
+    let manager = SessionManager::new_with_audit(
+        lifecycle_limits(),
+        TargetAllowlist::new(vec![Target::Pty(PtyTarget {
+            name: "quick-exit".into(),
+            executable: "/usr/bin/true".into(),
+            argv: Vec::new(),
+            read_only: false,
+        })])
+        .unwrap(),
+        Arc::clone(&audit),
+    );
+    let identity = Identity::new("alice").unwrap();
+    let remote: SocketAddr = "127.0.0.1:45555".parse().unwrap();
+
+    let mut session = manager
+        .start_with_remote(
+            identity,
+            "quick-exit",
+            Resize::new(80, 24).unwrap(),
+            Some(remote),
+        )
+        .await
+        .unwrap();
+    let closed = session.wait_closed().await.unwrap();
+    assert_eq!(closed.reason, SessionCloseReason::ChildExited);
+
+    let values = audit_values(&path);
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0]["event_type"], "session-started");
+    assert_eq!(values[1]["event_type"], "session-ended");
+    assert_eq!(values[0]["session_id"], values[1]["session_id"]);
+    assert_eq!(values[0]["identity"], "alice");
+    assert_eq!(values[0]["target"], "quick-exit");
+    assert_eq!(values[0]["remote_address"], remote.to_string());
+    assert_eq!(values[0]["started_at"], values[1]["started_at"]);
+    assert_eq!(values[1]["close_reason"], "child-exited");
+}
+
+#[tokio::test]
+async fn spawn_failure_has_denial_without_orphaned_start() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("audit.jsonl");
+    let manager = SessionManager::new_with_audit(
+        lifecycle_limits(),
+        TargetAllowlist::new(vec![Target::Pty(PtyTarget {
+            name: "unavailable".into(),
+            executable: "/definitely-not-a-real-audit-fixture".into(),
+            argv: Vec::new(),
+            read_only: false,
+        })])
+        .unwrap(),
+        Arc::new(AuditLog::open(&path).unwrap()),
+    );
+
+    assert!(matches!(
+        manager
+            .start_with_remote(
+                Identity::new("alice").unwrap(),
+                "unavailable",
+                Resize::new(80, 24).unwrap(),
+                Some("127.0.0.1:46666".parse().unwrap()),
+            )
+            .await,
+        Err(SessionError::SpawnUnavailable)
+    ));
+
+    let values = audit_values(&path);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["event_type"], "access-denied");
+    assert_eq!(values[0]["category"], "target");
+    assert_eq!(values[0]["reason"], "session-unavailable");
+    assert!(
+        values
+            .iter()
+            .all(|value| value["event_type"] != "session-started")
     );
 }

@@ -103,13 +103,23 @@ fn state_with_all(
     auth: Arc<dyn AuthProvider>,
     limits: Limits,
 ) -> AppState {
+    state_with_all_and_audit(target, tickets, auth, limits, test_audit())
+}
+
+fn state_with_all_and_audit(
+    target: Target,
+    tickets: TicketStore,
+    auth: Arc<dyn AuthProvider>,
+    limits: Limits,
+    audit: AuditLog,
+) -> AppState {
     AppState::new(
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
         tickets,
         limits,
-        test_audit(),
+        audit,
     )
 }
 
@@ -504,6 +514,113 @@ async fn missing_malformed_unknown_and_wrong_identity_handshakes_start_no_sessio
         events.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
+}
+
+#[tokio::test]
+async fn ticket_denials_are_stable_and_never_include_ticket() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let audit = AuditLog::open(&audit_path).unwrap();
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        target(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        limits(),
+        audit,
+    );
+    let wrong_identity_ticket =
+        issue_ticket(&state, Identity::new("another-user").unwrap(), target()).await;
+    let unknown_ticket = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+
+    for handshake in [
+        r#"{"ticket":"HOSTILE-TICKET-SENTINEL"}"#.to_owned(),
+        format!(r#"{{"ticket":"{unknown_ticket}"}}"#),
+        format!(r#"{{"ticket":"{wrong_identity_ticket}"}}"#),
+    ] {
+        let mut socket = connect_websocket(server.address, &cookie).await;
+        socket
+            .send(tungstenite::Message::Text(handshake.into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_server_control(&mut socket).await,
+            ServerControl::Error(message) if message.code == "authorization-denied"
+        ));
+    }
+
+    let contents = std::fs::read_to_string(audit_path).unwrap();
+    assert!(!contents.contains("HOSTILE-TICKET-SENTINEL"));
+    assert!(!contents.contains(unknown_ticket));
+    assert!(!contents.contains(&wrong_identity_ticket));
+    let reasons = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event_type"] == "access-denied")
+        .map(|event| event["reason"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        [
+            "ticket-malformed",
+            "ticket-unknown",
+            "ticket-wrong-identity"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn websocket_disconnect_has_exactly_one_audit_completion() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let audit_path = directory.path().join("audit.jsonl");
+    let audit = AuditLog::open(&audit_path).unwrap();
+    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+    let state = state_with_all_and_audit(
+        target(),
+        TicketStore::new(Duration::from_secs(10), 32),
+        auth,
+        limits(),
+        audit,
+    );
+    let ticket = issue_ticket(&state, Identity::new("developer").unwrap(), target()).await;
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    socket.close(None).await.unwrap();
+
+    let events = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = std::fs::read_to_string(&audit_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            if events
+                .iter()
+                .any(|event| event["event_type"] == "session-ended")
+            {
+                break events;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session audit completion timed out");
+    let started = events
+        .iter()
+        .filter(|event| event["event_type"] == "session-started")
+        .collect::<Vec<_>>();
+    let ended = events
+        .iter()
+        .filter(|event| event["event_type"] == "session-ended")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1);
+    assert_eq!(ended.len(), 1);
+    assert_eq!(started[0]["session_id"], ended[0]["session_id"]);
+    assert_eq!(ended[0]["close_reason"], "websocket-disconnect");
 }
 
 #[tokio::test]

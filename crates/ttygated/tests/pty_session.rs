@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::{path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use nix::{
     sys::signal::{Signal, kill, killpg},
@@ -8,6 +8,7 @@ use nix::{
 };
 use tokio::time::timeout;
 use ttygated::{
+    audit::AuditLog,
     config::{Limits, PtyTarget, Target, TargetAllowlist},
     protocol::Resize,
     session::{ChildOutcome, LifecycleTransition, Session, SessionCloseReason, SessionManager},
@@ -51,6 +52,55 @@ async fn running_session(arguments: &[&str]) -> Session {
     )
     .await
     .unwrap()
+}
+
+fn audited_manager(
+    arguments: &[&str],
+    idle: Duration,
+    absolute: Duration,
+) -> (tempfile::TempDir, PathBuf, SessionManager) {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("audit.jsonl");
+    let target = fixture_target(arguments);
+    let manager = SessionManager::new_with_audit(
+        limits(idle, absolute),
+        TargetAllowlist::new(vec![Target::Pty(target)]).unwrap(),
+        Arc::new(AuditLog::open(&path).unwrap()),
+    );
+    (directory, path, manager)
+}
+
+async fn assert_one_audit_completion(path: &PathBuf, expected_reason: &str) {
+    let events = timeout(WAIT, async {
+        loop {
+            let events = fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            if events
+                .iter()
+                .any(|event| event["event_type"] == "session-ended")
+            {
+                break events;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("audit completion timed out");
+    let started = events
+        .iter()
+        .filter(|event| event["event_type"] == "session-started")
+        .collect::<Vec<_>>();
+    let ended = events
+        .iter()
+        .filter(|event| event["event_type"] == "session-ended")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1);
+    assert_eq!(ended.len(), 1);
+    assert_eq!(started[0]["session_id"], ended[0]["session_id"]);
+    assert_eq!(ended[0]["close_reason"], expected_reason);
 }
 
 struct ProcessGroupGuard {
@@ -166,8 +216,20 @@ async fn dropped_session_terminates_and_reaps_process_group() {
 }
 
 #[tokio::test]
-async fn natural_leader_exit_still_terminates_descendant() {
-    let mut session = running_session(&["natural-resistant"]).await;
+async fn normal_exit_has_exactly_one_audit_completion() {
+    let (_directory, path, manager) = audited_manager(
+        &["natural-resistant"],
+        Duration::from_secs(60),
+        Duration::from_secs(600),
+    );
+    let mut session = manager
+        .start(
+            Identity::new("integration-user").unwrap(),
+            "lifecycle-fixture",
+            Resize::new(80, 24).unwrap(),
+        )
+        .await
+        .unwrap();
     let (leader, descendant) = process_ids(&mut session).await;
     let mut guard = ProcessGroupGuard::new(leader);
     session.write(b"exit\n".to_vec()).await.unwrap();
@@ -181,12 +243,25 @@ async fn natural_leader_exit_still_terminates_descendant() {
     ));
     assert_absent(leader).await;
     assert_absent(descendant).await;
+    assert_one_audit_completion(&path, "child-exited").await;
     guard.disarm();
 }
 
 #[tokio::test]
-async fn hup_resistant_group_escalates_to_sigkill_and_is_reaped() {
-    let mut session = running_session(&["ignore-hup"]).await;
+async fn resistant_child_cleanup_has_exactly_one_audit_completion() {
+    let (_directory, path, manager) = audited_manager(
+        &["ignore-hup"],
+        Duration::from_secs(60),
+        Duration::from_secs(600),
+    );
+    let mut session = manager
+        .start(
+            Identity::new("integration-user").unwrap(),
+            "lifecycle-fixture",
+            Resize::new(80, 24).unwrap(),
+        )
+        .await
+        .unwrap();
     let (leader, descendant) = process_ids(&mut session).await;
     let mut guard = ProcessGroupGuard::new(leader);
     let closed = session.close().await.unwrap();
@@ -194,16 +269,14 @@ async fn hup_resistant_group_escalates_to_sigkill_and_is_reaped() {
     assert_eq!(closed.outcome, Some(ChildOutcome::Signal(9)));
     assert_absent(leader).await;
     assert_absent(descendant).await;
+    assert_one_audit_completion(&path, "explicit").await;
     guard.disarm();
 }
 
 #[tokio::test]
-async fn idle_timeout_terminates_and_reaps_process_group() {
-    let target = fixture_target(&[]);
-    let manager = SessionManager::new(
-        limits(Duration::from_millis(500), Duration::from_secs(2)),
-        TargetAllowlist::new(vec![Target::Pty(target.clone())]).unwrap(),
-    );
+async fn idle_timeout_has_exactly_one_audit_completion() {
+    let (_directory, path, manager) =
+        audited_manager(&[], Duration::from_millis(500), Duration::from_secs(2));
     let mut session = manager
         .start(
             Identity::new("integration-user").unwrap(),
@@ -224,16 +297,14 @@ async fn idle_timeout_terminates_and_reaps_process_group() {
     ));
     assert_absent(leader).await;
     assert_absent(descendant).await;
+    assert_one_audit_completion(&path, "idle-timeout").await;
     guard.disarm();
 }
 
 #[tokio::test]
-async fn absolute_timeout_terminates_and_reaps_process_group() {
-    let target = fixture_target(&[]);
-    let manager = SessionManager::new(
-        limits(Duration::from_secs(2), Duration::from_millis(500)),
-        TargetAllowlist::new(vec![Target::Pty(target.clone())]).unwrap(),
-    );
+async fn absolute_timeout_has_exactly_one_audit_completion() {
+    let (_directory, path, manager) =
+        audited_manager(&[], Duration::from_secs(2), Duration::from_millis(500));
     let mut session = manager
         .start(
             Identity::new("integration-user").unwrap(),
@@ -254,15 +325,16 @@ async fn absolute_timeout_terminates_and_reaps_process_group() {
     ));
     assert_absent(leader).await;
     assert_absent(descendant).await;
+    assert_one_audit_completion(&path, "absolute-timeout").await;
     guard.disarm();
 }
 
 #[tokio::test]
-async fn manager_shutdown_awaits_group_teardown_and_preserves_audit_event() {
-    let target = fixture_target(&["ignore-hup"]);
-    let manager = SessionManager::new(
-        limits(Duration::from_secs(60), Duration::from_secs(600)),
-        TargetAllowlist::new(vec![Target::Pty(target)]).unwrap(),
+async fn manager_shutdown_has_exactly_one_audit_completion() {
+    let (_directory, path, manager) = audited_manager(
+        &["ignore-hup"],
+        Duration::from_secs(60),
+        Duration::from_secs(600),
     );
     let mut audit = manager.subscribe_events();
     let mut session = manager
@@ -295,6 +367,7 @@ async fn manager_shutdown_awaits_group_teardown_and_preserves_audit_event() {
             ..
         }
     ));
+    assert_one_audit_completion(&path, "manager-shutdown").await;
     guard.disarm();
 }
 
@@ -329,8 +402,20 @@ async fn cancelled_shutdown_keeps_supervisors_owned_until_next_shutdown() {
 }
 
 #[tokio::test]
-async fn caller_cancellation_during_output_backpressure_reaps_process_group() {
-    let mut session = running_session(&["flood"]).await;
+async fn cancelled_caller_has_exactly_one_audit_completion() {
+    let (_directory, path, manager) = audited_manager(
+        &["flood"],
+        Duration::from_secs(60),
+        Duration::from_secs(600),
+    );
+    let mut session = manager
+        .start(
+            Identity::new("integration-user").unwrap(),
+            "lifecycle-fixture",
+            Resize::new(80, 24).unwrap(),
+        )
+        .await
+        .unwrap();
     let (leader, descendant) = process_ids(&mut session).await;
     let mut guard = ProcessGroupGuard::new(leader);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -342,6 +427,7 @@ async fn caller_cancellation_during_output_backpressure_reaps_process_group() {
     assert!(owner.await.unwrap_err().is_cancelled());
     assert_absent(leader).await;
     assert_absent(descendant).await;
+    assert_one_audit_completion(&path, "cancellation").await;
     guard.disarm();
 }
 

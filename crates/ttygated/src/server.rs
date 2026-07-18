@@ -77,9 +77,10 @@ impl AppState {
             limits.session_request_window,
             LIMITER_KEY_CAPACITY,
         ));
-        let sessions = SessionManager::new(limits, targets.clone());
+        let audit = Arc::new(audit);
+        let sessions = SessionManager::new_with_audit(limits, targets.clone(), Arc::clone(&audit));
         Self {
-            audit: Arc::new(audit),
+            audit,
             origin: Arc::new(origin),
             auth,
             targets: Arc::new(targets),
@@ -207,9 +208,13 @@ async fn upgrade_websocket(
         };
     let tickets = Arc::clone(&state.tickets);
     let sessions = Arc::clone(&state.sessions);
+    let audit = Arc::clone(&state.audit);
+    let remote_address = context.peer_addr();
     ws.max_message_size(MAX_BINARY_BYTES)
         .max_frame_size(MAX_BINARY_BYTES)
-        .on_upgrade(move |socket| websocket::accept_upgrade(socket, identity, tickets, sessions))
+        .on_upgrade(move |socket| {
+            websocket::accept_upgrade(socket, identity, tickets, sessions, audit, remote_address)
+        })
 }
 
 async fn enforce_origin_if_present(
