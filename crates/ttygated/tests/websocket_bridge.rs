@@ -165,6 +165,43 @@ async fn provision_cookie(address: SocketAddr) -> String {
         .to_owned()
 }
 
+async fn create_session_over_http(address: SocketAddr, cookie: &str) -> (StatusCode, String) {
+    let body = r#"{"target":"fixture"}"#;
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /api/sessions HTTP/1.1\r\nHost: {address}\r\nOrigin: {ORIGIN}\r\nCookie: {cookie}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .unwrap();
+    (status, response)
+}
+
+async fn issue_ticket_over_http(address: SocketAddr, cookie: &str) -> Option<String> {
+    let (status, response) = create_session_over_http(address, cookie).await;
+    if status != StatusCode::CREATED {
+        return None;
+    }
+    let body = response.split_once("\r\n\r\n")?.1;
+    serde_json::from_str::<serde_json::Value>(body).ok()?["ticket"]
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn websocket_request(
     address: SocketAddr,
     origin: Option<&str>,
@@ -506,6 +543,40 @@ async fn valid_ticket_starts_once_and_reuse_starts_no_second_session() {
         events.try_recv(),
         Ok(event) if event.transition == LifecycleTransition::Created
     ));
+}
+
+#[tokio::test]
+async fn development_authority_path_recovers_ticket_capacity_after_real_pty_close() {
+    let configured = fixture_target(&[], false);
+    let mut configured_limits = limits();
+    configured_limits.max_sessions = 2;
+    configured_limits.max_sessions_per_user = 1;
+    let state = state_with_all(
+        configured,
+        TicketStore::new(Duration::from_secs(10), 32),
+        Arc::new(DevAuthProvider::new("developer").unwrap()),
+        configured_limits,
+    );
+    let server = start_server_with_state(state).await;
+    let cookie = provision_cookie(server.address).await;
+    let ticket = issue_ticket_over_http(server.address, &cookie)
+        .await
+        .expect("first ticket");
+    let rejected = create_session_over_http(server.address, &cookie).await;
+    assert_eq!(rejected.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(rejected.1.contains("identity-session-limit"));
+
+    let mut socket = connect_websocket(server.address, &cookie).await;
+    send_ticket(&mut socket, &ticket).await;
+    collect_binary_until(&mut socket, b"READY").await;
+    socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        issue_ticket_over_http(server.address, &cookie)
+            .await
+            .is_some(),
+        "capacity did not recover after real development PTY close"
+    );
 }
 
 #[tokio::test]

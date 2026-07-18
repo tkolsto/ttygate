@@ -440,9 +440,10 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         }
     };
     let presentation = TargetPresentation::from(&target);
+    let expiry = state.tickets.next_expiry();
     let reservation = match state
         .sessions
-        .reserve(&identity, tokio::time::Instant::now() + state.tickets.ttl())
+        .reserve(&identity, tokio::time::Instant::from_std(expiry.instant()))
         .await
     {
         Ok(reservation) => reservation,
@@ -468,7 +469,10 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             );
         }
     };
-    match state.tickets.issue(identity, target, reservation) {
+    match state
+        .tickets
+        .issue_at(identity, target, reservation, expiry)
+    {
         Ok(ticket) => (
             StatusCode::CREATED,
             axum::Json(TicketResponse {

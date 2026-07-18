@@ -65,6 +65,15 @@ impl Ticket {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TicketExpiry(Instant);
+
+impl TicketExpiry {
+    pub(crate) fn instant(self) -> Instant {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum TicketError {
     #[error("ticket is malformed")]
@@ -148,6 +157,20 @@ impl TicketStore {
         target: Target,
         reservation: SessionReservation,
     ) -> Result<Ticket, TicketError> {
+        self.issue_at(identity, target, reservation, self.next_expiry())
+    }
+
+    pub(crate) fn next_expiry(&self) -> TicketExpiry {
+        TicketExpiry(self.clock.now() + self.ttl)
+    }
+
+    pub(crate) fn issue_at(
+        &self,
+        identity: Identity,
+        target: Target,
+        reservation: SessionReservation,
+        expiry: TicketExpiry,
+    ) -> Result<Ticket, TicketError> {
         let now = self.clock.now();
         let mut entries = self
             .entries
@@ -166,7 +189,7 @@ impl TicketStore {
                     Entry {
                         identity,
                         target,
-                        expires_at: now + self.ttl,
+                        expires_at: expiry.instant(),
                         reservation,
                     },
                 );
@@ -423,6 +446,35 @@ mod tests {
             store.issue(identity.clone(), target("other"), reservation(&identity)),
             Err(TicketError::Generation)
         );
+        clock.millis.store(10, Ordering::SeqCst);
+        assert!(matches!(
+            store.redeem(ticket.as_str(), &identity),
+            Err(TicketError::Expired)
+        ));
+    }
+
+    #[test]
+    fn ticket_and_reservation_can_share_one_exact_expiry_deadline() {
+        let (store, clock) = controlled_store(Duration::from_millis(10), 1);
+        let identity = Identity::new("dev").unwrap();
+        let expiry = store.next_expiry();
+        let ticket = store
+            .issue_at(
+                identity.clone(),
+                target("shell"),
+                reservation(&identity),
+                expiry,
+            )
+            .unwrap();
+
+        let stored_expiry = store
+            .entries
+            .lock()
+            .unwrap()
+            .get(ticket.as_str())
+            .unwrap()
+            .expires_at;
+        assert_eq!(stored_expiry, expiry.instant());
         clock.millis.store(10, Ordering::SeqCst);
         assert!(matches!(
             store.redeem(ticket.as_str(), &identity),

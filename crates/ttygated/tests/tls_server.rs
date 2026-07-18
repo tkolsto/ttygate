@@ -61,6 +61,10 @@ impl Drop for TlsTestServer {
 
 impl TlsTestServer {
     async fn start() -> Self {
+        Self::start_with_capacity(4, 4).await
+    }
+
+    async fn start_with_capacity(max_sessions: usize, max_sessions_per_user: usize) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let certificate_path = directory.path().join("certificate.pem");
         let private_key_path = directory.path().join("private-key.pem");
@@ -83,6 +87,8 @@ impl TlsTestServer {
             &certificate_path,
             &private_key_path,
             &marker,
+            max_sessions,
+            max_sessions_per_user,
         );
         let config = config::parse(&source).unwrap();
         let task = tokio::spawn(async move {
@@ -273,6 +279,8 @@ fn configuration(
     certificate: &Path,
     private_key: &Path,
     marker: &Path,
+    max_sessions: usize,
+    max_sessions_per_user: usize,
 ) -> String {
     format!(
         r#"
@@ -291,8 +299,8 @@ format = "json"
 path = "./unused-tls-test-audit.jsonl"
 recording = false
 [limits]
-max_sessions = 4
-max_sessions_per_user = 4
+max_sessions = {max_sessions}
+max_sessions_per_user = {max_sessions_per_user}
 idle_timeout_seconds = 30
 absolute_timeout_seconds = 60
 [[targets]]
@@ -454,6 +462,57 @@ async fn https_exact_origin_creates_session_and_wss_ticket_reaches_real_pty() {
         })
     })
     .await;
+}
+
+#[tokio::test]
+async fn direct_tls_authority_path_recovers_ticket_capacity_after_real_pty_close() {
+    let server = TlsTestServer::start_with_capacity(2, 1).await;
+    let cookie = server.provision_cookie().await;
+    let ticket = server.issue_ticket(&cookie).await;
+    let rejected = server
+        .request(
+            "POST",
+            "/api/sessions",
+            Some(&server.origin),
+            Some(&cookie),
+            br#"{"target":"shell"}"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status, 503);
+    assert!(
+        rejected
+            .body
+            .windows(b"identity-session-limit".len())
+            .any(|window| window == b"identity-session-limit")
+    );
+
+    let mut socket = server.websocket(&server.origin, &cookie).await.unwrap();
+    socket
+        .send(tungstenite::Message::Text(
+            format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    collect_binary_until(&mut socket, b"READY").await;
+    socket.close(None).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let recovered = server
+        .request(
+            "POST",
+            "/api/sessions",
+            Some(&server.origin),
+            Some(&cookie),
+            br#"{"target":"shell"}"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.status, 201,
+        "capacity did not recover after PTY close"
+    );
+    server.stop().await.unwrap();
 }
 
 #[tokio::test]

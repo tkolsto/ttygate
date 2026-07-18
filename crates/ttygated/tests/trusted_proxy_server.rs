@@ -372,6 +372,10 @@ async fn wait_for_fixture_absence(marker: &Path) {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_capacity(8, 2).await
+    }
+
+    async fn start_with_capacity(max_sessions: usize, max_sessions_per_user: usize) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("proxy-fixture-pids");
         let listener = TcpListener::bind("[::]:0").await.unwrap();
@@ -392,8 +396,8 @@ format = "json"
 path = "./audit.jsonl"
 recording = false
 [limits]
-max_sessions = 8
-max_sessions_per_user = 2
+max_sessions = {max_sessions}
+max_sessions_per_user = {max_sessions_per_user}
 idle_timeout_seconds = 5
 absolute_timeout_seconds = 10
 [[targets]]
@@ -766,6 +770,63 @@ async fn trusted_proxy_https_cookie_ticket_wss_reaches_real_pty_echo() {
     .await
     .unwrap();
     socket.close(None).await.unwrap();
+    proxy.stop().await;
+    backend.stop().await;
+}
+
+#[tokio::test]
+async fn trusted_proxy_authority_path_recovers_ticket_capacity_after_real_pty_close() {
+    let backend = TestServer::start_with_capacity(2, 1).await;
+    let proxy = TlsProxy::start(backend.address, "alice").await;
+    let cookie = proxy.provision_cookie().await;
+    let ticket = proxy.issue_ticket(&cookie).await;
+    let rejected = proxy
+        .request(
+            "POST",
+            "/api/sessions",
+            Some(&proxy.origin),
+            Some(&cookie),
+            &[],
+            br#"{"target":"shell"}"#,
+        )
+        .await;
+    assert_eq!(rejected.status, 503);
+    assert!(
+        rejected
+            .body
+            .windows(b"identity-session-limit".len())
+            .any(|window| window == b"identity-session-limit")
+    );
+
+    let mut socket = proxy.websocket(&proxy.origin, &cookie).await.unwrap();
+    socket
+        .send(tungstenite::Message::Text(
+            format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(tungstenite::Message::Binary(
+            b"proxy-capacity\r".to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !output
+            .windows(b"ECHO:proxy-capacity".len())
+            .any(|window| window == b"ECHO:proxy-capacity")
+        {
+            if let tungstenite::Message::Binary(bytes) = socket.next().await.unwrap().unwrap() {
+                output.extend_from_slice(&bytes);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(proxy.issue_ticket(&cookie).await.len() == 43);
     proxy.stop().await;
     backend.stop().await;
 }

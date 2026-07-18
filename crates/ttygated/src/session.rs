@@ -191,6 +191,7 @@ struct CapacityInner {
     max_sessions: usize,
     max_sessions_per_identity: usize,
     state: Mutex<CapacityState>,
+    clock: Arc<dyn CapacityClock>,
 }
 
 #[derive(Debug, Default)]
@@ -212,13 +213,31 @@ enum LeaseState {
     Live,
 }
 
+trait CapacityClock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug)]
+struct SystemCapacityClock;
+
+impl CapacityClock for SystemCapacityClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 impl Capacity {
     fn new(limits: &Limits) -> Self {
+        Self::with_clock(limits, Arc::new(SystemCapacityClock))
+    }
+
+    fn with_clock(limits: &Limits, clock: Arc<dyn CapacityClock>) -> Self {
         Self {
             inner: Arc::new(CapacityInner {
                 max_sessions: limits.max_sessions,
                 max_sessions_per_identity: limits.max_sessions_per_user,
                 state: Mutex::new(CapacityState::default()),
+                clock,
             }),
         }
     }
@@ -245,7 +264,7 @@ impl Capacity {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        purge_expired_leases(&mut state, Instant::now());
+        purge_expired_leases(&mut state, self.inner.clock.now());
         if state.closed {
             return Err(SessionError::ManagerClosed);
         }
@@ -282,7 +301,7 @@ impl Capacity {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        purge_expired_leases(&mut state, Instant::now());
+        purge_expired_leases(&mut state, self.inner.clock.now());
         let mut by_identity = HashMap::<Identity, usize>::new();
         for lease in state.leases.values() {
             *by_identity.entry(lease.identity.clone()).or_default() += 1;
@@ -331,7 +350,7 @@ impl Reservation {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        purge_expired_leases(&mut state, Instant::now());
+        purge_expired_leases(&mut state, self.capacity.clock.now());
         if state.closed {
             return Err(SessionError::ManagerClosed);
         }
@@ -1033,7 +1052,7 @@ async fn join_worker(mut worker: JoinHandle<()>) {
 mod tests {
     use std::{
         os::unix::process::ExitStatusExt,
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, Mutex as StdMutex},
         thread,
         time::{Duration, SystemTime},
     };
@@ -1216,6 +1235,38 @@ mod tests {
         ));
         drop(pending);
         assert!(capacity.reserve(&bob).is_ok());
+    }
+
+    #[derive(Debug)]
+    struct ManualCapacityClock(StdMutex<Instant>);
+
+    impl super::CapacityClock for ManualCapacityClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn pending_lease_expiry_uses_a_deterministic_exact_boundary_clock() {
+        let start = Instant::now();
+        let clock = Arc::new(ManualCapacityClock(StdMutex::new(start)));
+        let capacity = Capacity::with_clock(&limits(1, 1), clock.clone());
+        let alice = Identity::new("alice").unwrap();
+        let bob = Identity::new("bob").unwrap();
+        let pending = capacity
+            .reserve_pending(&alice, start + Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(
+            capacity.reserve(&bob),
+            Err(SessionError::GlobalLimit)
+        ));
+
+        *clock.0.lock().unwrap() = start + Duration::from_secs(10);
+        let replacement = capacity
+            .reserve(&bob)
+            .expect("capacity must recover at the exact deadline");
+        drop((pending, replacement));
+        assert_eq!(capacity.active(), (0, 0));
     }
 
     #[test]
