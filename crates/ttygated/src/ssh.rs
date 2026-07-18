@@ -2027,6 +2027,34 @@ requesttty force\n"
     }
 
     #[tokio::test]
+    async fn secrecy_sentinel_is_an_actual_dynamic_runtime_argv_value() {
+        let mut material = Material::new();
+        let known_hosts = material
+            .directory
+            .path()
+            .join("KNOWN_HOSTS_PATH_SENTINEL_943a");
+        let identity = material
+            .directory
+            .path()
+            .join("IDENTITY_PATH_SENTINEL_329f");
+        fs::rename(&material.known_hosts, &known_hosts).unwrap();
+        fs::rename(&material.identity, &identity).unwrap();
+        material.known_hosts = known_hosts;
+        material.identity = identity;
+        let (_target, prepared) = prepared_runtime_fixture(&material).await;
+        let spec = super::SshSpawnSpec::build(&prepared, "ignored").unwrap();
+        let options = runtime_options(spec.argv());
+        assert!(
+            options.contains(
+                &format!("UserKnownHostsFile={}", material.known_hosts.display()).as_str()
+            )
+        );
+        assert!(
+            options.contains(&format!("IdentityFile={}", material.identity.display()).as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn hostile_browser_and_identity_values_cannot_alter_ssh_argv_structure() {
         let material = Material::new();
         let (mut target, _prepared) = prepared_runtime_fixture(&material).await;

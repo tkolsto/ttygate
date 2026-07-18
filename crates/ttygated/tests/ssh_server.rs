@@ -59,8 +59,9 @@ const SENTINEL_KNOWN_HOSTS_CONTENT: &str = "KNOWN_HOSTS_CONTENT_SENTINEL_617d";
 const SENTINEL_PRIVATE_KEY_COMMENT: &str = "PRIVATE_KEY_CONTENT_SENTINEL_f10c";
 const SENTINEL_HEADER: &str = "HEADER_SENTINEL_48af";
 const SENTINEL_ENVIRONMENT: &str = "ENVIRONMENT_SENTINEL_60bd";
-const SENTINEL_ARGUMENT: &str = "ProxyCommand=ARGV_SENTINEL_d9e7";
 const SENTINEL_AUDIT_PATH: &str = "AUDIT_PATH_SENTINEL_76ce.jsonl";
+const SENTINEL_ENV_KEY: &str = "TTYGATE_AMBIENT_SENTINEL";
+const SENTINEL_INNER_KEY: &str = "TTYGATE_SECRET_TEST_INNER";
 
 static FIXTURE_SERIAL: OnceLock<AsyncMutex<()>> = OnceLock::new();
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -447,10 +448,32 @@ impl RealSshdFixture {
         let denial = self.websocket_denial(sentinel_target).await;
         assert_eq!(denial.code, "ssh-authentication-failed");
         let frontend = format!("{} {} {}", denial.code, denial.message, denial.rendered);
+        let (mut environment_session, _) = self.session().await;
+        environment_session
+            .write(b"stty -echo\n".to_vec())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        environment_session
+            .write(
+                b"if env | grep -q '^TTYGATE_AMBIENT_SENTINEL='; then printf 'AMBIENT_ENV_FORWARDED\\n'; else printf 'AMBIENT_ENV_CLEARED\\n'; fi\n"
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        let environment_output = read_until(&mut environment_session, "AMBIENT_ENV_CLEARED").await;
+        assert!(
+            environment_output.contains("AMBIENT_ENV_CLEARED")
+                && !environment_output.contains("AMBIENT_ENV_FORWARDED")
+        );
+        environment_session.close().await.unwrap();
+        let complete_audit = self.audit_text();
         let known_host_public_data = known_hosts
             .split_whitespace()
             .nth(2)
             .expect("sentinel known-host public data");
+        let known_hosts_argv = format!("UserKnownHostsFile={}", known_hosts_path.display());
+        let identity_argv = format!("IdentityFile={}", identity_path.display());
         let mut sentinels = vec![
             denial.cookie.as_str(),
             denial.ticket.as_str(),
@@ -460,7 +483,13 @@ impl RealSshdFixture {
             SENTINEL_PRIVATE_KEY_COMMENT,
             SENTINEL_HEADER,
             SENTINEL_ENVIRONMENT,
-            SENTINEL_ARGUMENT,
+            known_hosts_argv.as_str(),
+            identity_argv.as_str(),
+            "StrictHostKeyChecking=yes",
+            "ProxyCommand=none",
+            "LANG=C",
+            "LC_ALL=C",
+            "TERM=xterm-256color",
             BANNER_MARKER,
             "localhost",
             "ttygate",
@@ -471,7 +500,10 @@ impl RealSshdFixture {
         ];
         sentinels.extend(private_key.lines().filter(|line| line.len() > 20));
         for sentinel in sentinels {
-            assert!(!denial.audit.contains(sentinel), "audit leaked {sentinel}");
+            assert!(
+                !complete_audit.contains(sentinel),
+                "audit leaked {sentinel}"
+            );
             assert!(!frontend.contains(sentinel), "frontend leaked {sentinel}");
         }
         assert_eq!(
@@ -1119,10 +1151,30 @@ async fn ssh_terminal_input_output_are_opaque_and_absent_from_audit() {
 
 #[tokio::test]
 async fn ssh_secret_sentinels_never_reach_audit_or_frontend_errors() {
-    RealSshdFixture::start()
-        .await
-        .assert_sentinel_secrecy()
-        .await;
+    if std::env::var_os(SENTINEL_INNER_KEY).is_some() {
+        assert_eq!(
+            std::env::var(SENTINEL_ENV_KEY).as_deref(),
+            Ok(SENTINEL_ENVIRONMENT)
+        );
+        RealSshdFixture::start()
+            .await
+            .assert_sentinel_secrecy()
+            .await;
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("ssh_secret_sentinels_never_reach_audit_or_frontend_errors")
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .env(SENTINEL_INNER_KEY, "1")
+        .env(SENTINEL_ENV_KEY, SENTINEL_ENVIRONMENT)
+        .output()
+        .expect("self-spawn isolated SSH secrecy test");
+    assert!(
+        output.status.success(),
+        "isolated SSH secrecy test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
