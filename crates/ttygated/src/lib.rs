@@ -6,4 +6,5 @@ mod pty_backend;
 pub mod server;
 pub mod session;
 pub mod ticket;
+pub mod tls;
 pub mod websocket;

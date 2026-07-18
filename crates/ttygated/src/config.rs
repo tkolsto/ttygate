@@ -854,7 +854,12 @@ fn validate_typed_target(index: usize, target: &Target) -> Result<(), ConfigErro
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use tempfile::tempdir;
 
@@ -1449,8 +1454,8 @@ private_key = "/etc/ttygate/tls/private-key.pem""#,
         assert!(matches!(
             direct_tls.server.transport,
             ServerTransport::DirectTls(ref tls)
-                if tls.certificate == PathBuf::from("/etc/ttygate/tls/certificate.pem")
-                    && tls.private_key == PathBuf::from("/etc/ttygate/tls/private-key.pem")
+                if tls.certificate == Path::new("/etc/ttygate/tls/certificate.pem")
+                    && tls.private_key == Path::new("/etc/ttygate/tls/private-key.pem")
         ));
 
         let trusted_proxy = COMPLETE_CONFIG
