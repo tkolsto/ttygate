@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs::{self, File},
     future::Future,
     io::Read,
@@ -18,6 +19,12 @@ use crate::config::{SshTarget, Target};
 pub const MAX_SSH_EXECUTABLE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_IDENTITY_BYTES: u64 = 1024 * 1024;
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) const MAX_SSH_DIAGNOSTIC_BYTES: usize = 32 * 1024;
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) const MAX_SSH_DIAGNOSTIC_LINES: usize = 128;
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) const MAX_SSH_DIAGNOSTIC_LINE_BYTES: usize = 1024;
 const MAX_PROBE_OUTPUT_BYTES: u64 = 64 * 1024;
 const MAX_IDENTITY_COMMENT_BYTES: usize = 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -143,6 +150,250 @@ impl PreparedSshTarget {
         recheck(&self.known_hosts, &self.known_hosts_snapshot)?;
         recheck(&self.identity, &self.identity_snapshot)
     }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+const SSH_RUNTIME_ENVIRONMENT: [(&str, &str); 3] =
+    [("LANG", "C"), ("LC_ALL", "C"), ("TERM", "xterm-256color")];
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum SshSpawnError {
+    #[error("SSH target authority is unavailable.")]
+    AuthorityUnavailable,
+    #[error("SSH target material changed after startup.")]
+    MaterialChanged,
+    #[error("The SSH terminal backend is unavailable.")]
+    BackendUnavailable,
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) struct SshSpawnSpec {
+    executable: PathBuf,
+    argv: Vec<OsString>,
+    prepared: PreparedSshTarget,
+}
+
+impl std::fmt::Debug for SshSpawnSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshSpawnSpec")
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+impl SshSpawnSpec {
+    pub(crate) fn build(
+        prepared: &PreparedSshTarget,
+        target: &SshTarget,
+        authenticated_user: &str,
+    ) -> Result<Self, SshSpawnError> {
+        if prepared.name != target.name
+            || prepared.executable != target.ssh_executable
+            || prepared.known_hosts != target.known_hosts
+            || prepared.identity != target.identity_file
+        {
+            return Err(SshSpawnError::AuthorityUnavailable);
+        }
+        let resolved_user = target
+            .user_policy
+            .resolve(authenticated_user)
+            .map_err(|_| SshSpawnError::AuthorityUnavailable)?;
+        prepared
+            .recheck_before_spawn()
+            .map_err(|_| SshSpawnError::MaterialChanged)?;
+
+        let mut argv = Vec::with_capacity(STRICT_SSH_PROBE_OPTIONS.len() * 2 + 10);
+        argv.extend([OsString::from("-vv"), OsString::from("-tt")]);
+        argv.extend([OsString::from("-F"), OsString::from("/dev/null")]);
+        for option in STRICT_SSH_PROBE_OPTIONS {
+            let runtime_option = match option.split_once('=').map(|(key, _)| key) {
+                Some("UserKnownHostsFile") => {
+                    let mut value = OsString::from("UserKnownHostsFile=");
+                    value.push(&prepared.known_hosts);
+                    value
+                }
+                Some("IdentityFile") => {
+                    let mut value = OsString::from("IdentityFile=");
+                    value.push(&prepared.identity);
+                    value
+                }
+                _ => OsString::from(option),
+            };
+            argv.extend([OsString::from("-o"), runtime_option]);
+        }
+        argv.extend([
+            OsString::from("-p"),
+            OsString::from(target.port.to_string()),
+            OsString::from("-l"),
+            OsString::from(resolved_user),
+            OsString::from("--"),
+            OsString::from(&target.host),
+        ]);
+        Ok(Self {
+            executable: prepared.executable.clone(),
+            argv,
+            prepared: prepared.clone(),
+        })
+    }
+
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(crate) fn argv(&self) -> &[OsString] {
+        &self.argv
+    }
+
+    pub(crate) const fn environment(&self) -> [(&'static str, &'static str); 3] {
+        SSH_RUNTIME_ENVIRONMENT
+    }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SshDiagnosticClass {
+    Authenticated,
+    UnknownHostKey,
+    HostKeyMismatch,
+    ConnectionFailed,
+    AuthenticationFailed,
+    GenericFailure,
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) struct SshDiagnosticClassifier {
+    bytes: Vec<u8>,
+    line_count: usize,
+    current_line_bytes: usize,
+    line_open: bool,
+    invalid: bool,
+}
+
+impl std::fmt::Debug for SshDiagnosticClassifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshDiagnosticClassifier")
+            .field("accepted_bytes", &self.bytes.len())
+            .field("invalid", &self.invalid)
+            .finish()
+    }
+}
+
+impl Default for SshDiagnosticClassifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+impl SshDiagnosticClassifier {
+    pub(crate) const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            line_count: 0,
+            current_line_bytes: 0,
+            line_open: false,
+            invalid: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        if self.invalid
+            || self
+                .bytes
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|size| size > MAX_SSH_DIAGNOSTIC_BYTES)
+        {
+            self.invalid = true;
+            self.bytes.clear();
+            return;
+        }
+        for byte in chunk {
+            if *byte == b'\n' {
+                if !self.line_open {
+                    self.line_count += 1;
+                }
+                self.current_line_bytes = 0;
+                self.line_open = false;
+                if self.line_count > MAX_SSH_DIAGNOSTIC_LINES {
+                    self.invalid = true;
+                    self.bytes.clear();
+                    return;
+                }
+            } else {
+                if !self.line_open {
+                    self.line_count += 1;
+                    self.line_open = true;
+                }
+                self.current_line_bytes += 1;
+                if self.line_count > MAX_SSH_DIAGNOSTIC_LINES
+                    || self.current_line_bytes > MAX_SSH_DIAGNOSTIC_LINE_BYTES
+                {
+                    self.invalid = true;
+                    self.bytes.clear();
+                    return;
+                }
+            }
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    pub(crate) fn finish(self) -> SshDiagnosticClass {
+        if self.invalid {
+            return SshDiagnosticClass::GenericFailure;
+        }
+        let Ok(diagnostics) = std::str::from_utf8(&self.bytes) else {
+            return SshDiagnosticClass::GenericFailure;
+        };
+        classify_diagnostics(diagnostics)
+    }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+fn classify_diagnostics(diagnostics: &str) -> SshDiagnosticClass {
+    if diagnostics.contains("REMOTE HOST IDENTIFICATION HAS CHANGED!")
+        || diagnostics.contains("Offending ") && diagnostics.contains(" key in ")
+    {
+        SshDiagnosticClass::HostKeyMismatch
+    } else if diagnostics.contains("No ED25519 host key is known for ")
+        || diagnostics.contains("No ECDSA host key is known for ")
+        || diagnostics.contains("No RSA host key is known for ")
+        || diagnostics.contains("Host key verification failed.")
+    {
+        SshDiagnosticClass::UnknownHostKey
+    } else if diagnostics.contains("Authenticated to ")
+        && diagnostics.contains(" using \"publickey\"")
+    {
+        SshDiagnosticClass::Authenticated
+    } else if diagnostics.contains("Permission denied (publickey")
+        || diagnostics.contains("No more authentication methods to try.")
+    {
+        SshDiagnosticClass::AuthenticationFailed
+    } else if diagnostics.contains("ssh: connect to host ")
+        || diagnostics.contains("Could not resolve hostname ")
+        || diagnostics.contains("Connection closed by ")
+        || diagnostics.contains("Connection reset by ")
+        || diagnostics.contains("Connection timed out")
+    {
+        SshDiagnosticClass::ConnectionFailed
+    } else {
+        SshDiagnosticClass::GenericFailure
+    }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) fn spawn(
+    spec: &SshSpawnSpec,
+    size: crate::protocol::Resize,
+) -> Result<crate::pty_backend::RunningSsh, SshSpawnError> {
+    spec.prepared
+        .recheck_before_spawn()
+        .map_err(|_| SshSpawnError::MaterialChanged)?;
+    crate::pty_backend::PtyProcessBackend::spawn_ssh(spec, size)
+        .map_err(|_| SshSpawnError::BackendUnavailable)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1351,5 +1602,325 @@ requesttty force\n"
         .unwrap_err();
         assert_eq!(error, SshPreparationError::CapabilityUnsupported);
         assert_eq!(*calls.lock().unwrap(), [material.executable]);
+    }
+
+    async fn prepared_runtime_fixture(
+        material: &Material,
+    ) -> (SshTarget, super::PreparedSshTarget) {
+        let target = material.target();
+        let prepared = prepare_target_with_probe(&target, accept_probe)
+            .await
+            .unwrap();
+        (target, prepared)
+    }
+
+    fn runtime_options(argv: &[OsString]) -> Vec<&str> {
+        argv.windows(2)
+            .filter(|pair| pair[0] == "-o")
+            .map(|pair| pair[1].to_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ssh_argv_serializes_every_pinned_option_exactly_once() {
+        let material = Material::new();
+        let (target, prepared) = prepared_runtime_fixture(&material).await;
+        let spec = super::SshSpawnSpec::build(&prepared, &target, "browser-user").unwrap();
+        let argv = spec.argv();
+        let options = runtime_options(argv);
+        assert_eq!(options.len(), super::STRICT_SSH_PROBE_OPTIONS.len());
+        for probe_option in super::STRICT_SSH_PROBE_OPTIONS {
+            let key = probe_option.split_once('=').unwrap().0;
+            assert_eq!(
+                options
+                    .iter()
+                    .filter(|option| option.split_once('=').unwrap().0 == key)
+                    .count(),
+                1,
+                "{key} was not serialized exactly once"
+            );
+        }
+        assert_eq!(argv[0], "-vv");
+        assert_eq!(argv[1], "-tt");
+    }
+
+    #[tokio::test]
+    async fn ssh_spawn_contract_uses_no_shell_and_only_the_literal_executable() {
+        let material = Material::new();
+        let record = material.directory.path().join("spawn-record");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'terminal-marker\\n'\nprintf 'Authenticated to synthetic.example using \"publickey\".\\n' >&2\n",
+            record.display()
+        );
+        write(&material.executable, script.as_bytes(), 0o700);
+        let (target, prepared) = prepared_runtime_fixture(&material).await;
+        let spec = super::SshSpawnSpec::build(&prepared, &target, "ignored").unwrap();
+        assert_eq!(spec.executable(), material.executable);
+        assert_eq!(
+            spec.executable().file_name().unwrap(),
+            std::ffi::OsStr::new("ssh")
+        );
+        assert!(!spec.argv().iter().any(|value| value == "-c"));
+
+        let running = super::spawn(&spec, crate::protocol::Resize::new(80, 24).unwrap())
+            .expect("spawn literal SSH executable");
+        let (mut terminal, _writer, mut child, mut diagnostics) = running.into_parts();
+        let mut terminal_bytes = Vec::new();
+        let mut diagnostic_bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut terminal, &mut terminal_bytes)
+            .await
+            .unwrap();
+        tokio::io::AsyncReadExt::read_to_end(&mut diagnostics, &mut diagnostic_bytes)
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert!(
+            terminal_bytes
+                .windows(15)
+                .any(|value| value == b"terminal-marker")
+        );
+        assert!(
+            !terminal_bytes
+                .windows(13)
+                .any(|value| value == b"Authenticated")
+        );
+        assert!(
+            diagnostic_bytes
+                .windows(13)
+                .any(|value| value == b"Authenticated")
+        );
+        assert_eq!(
+            fs::read(record).unwrap(),
+            spec.argv()
+                .iter()
+                .flat_map(|argument| {
+                    let mut bytes =
+                        std::os::unix::ffi::OsStrExt::as_bytes(argument.as_os_str()).to_vec();
+                    bytes.push(b'\n');
+                    bytes
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_spawn_rechecks_material_after_argv_construction() {
+        let material = Material::new();
+        let (target, prepared) = prepared_runtime_fixture(&material).await;
+        let spec = super::SshSpawnSpec::build(&prepared, &target, "ignored").unwrap();
+        let replacement = material.directory.path().join("known-hosts-replacement");
+        write(&replacement, KNOWN_HOST, 0o644);
+        fs::rename(replacement, &material.known_hosts).unwrap();
+
+        assert_eq!(
+            super::spawn(&spec, crate::protocol::Resize::new(80, 24).unwrap()).unwrap_err(),
+            super::SshSpawnError::MaterialChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_argv_loads_no_ambient_configuration() {
+        let material = Material::new();
+        let (target, prepared) = prepared_runtime_fixture(&material).await;
+        let spec = super::SshSpawnSpec::build(&prepared, &target, "ignored").unwrap();
+        let argv = spec.argv();
+        assert_eq!(
+            argv.windows(2)
+                .filter(|pair| pair[0] == "-F" && pair[1] == "/dev/null")
+                .count(),
+            1
+        );
+        assert_eq!(
+            runtime_options(argv)
+                .iter()
+                .filter(|option| **option == "CanonicalizeHostname=no")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_argv_disables_password_keyboard_interactive_agent_x11_forwarding_proxy_and_local_commands()
+     {
+        let material = Material::new();
+        let (target, prepared) = prepared_runtime_fixture(&material).await;
+        let spec = super::SshSpawnSpec::build(&prepared, &target, "ignored").unwrap();
+        let options = runtime_options(spec.argv());
+        for required in [
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "ChallengeResponseAuthentication=no",
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ForwardX11Trusted=no",
+            "ProxyCommand=none",
+            "ProxyJump=none",
+            "PermitLocalCommand=no",
+        ] {
+            assert!(options.contains(&required), "missing {required}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_argv_authority_comes_only_from_typed_target_and_resolved_policy() {
+        let material = Material::new();
+        let (mut target, prepared) = prepared_runtime_fixture(&material).await;
+        target.port = 22022;
+        target.user_policy = SshUserPolicy::Mapping(std::collections::BTreeMap::from([(
+            "browser-user".into(),
+            "remote-user".into(),
+        )]));
+        let spec = super::SshSpawnSpec::build(&prepared, &target, "browser-user").unwrap();
+        let argv = spec.argv();
+        assert_eq!(
+            &argv[argv.len() - 6..],
+            ["-p", "22022", "-l", "remote-user", "--", "host.example"].map(OsString::from)
+        );
+        assert!(!argv.iter().any(|value| value == "browser-user"));
+        assert_eq!(
+            runtime_options(argv)
+                .iter()
+                .find(|value| value.starts_with("UserKnownHostsFile="))
+                .unwrap(),
+            &format!("UserKnownHostsFile={}", material.known_hosts.display())
+        );
+        assert_eq!(
+            runtime_options(argv)
+                .iter()
+                .find(|value| value.starts_with("IdentityFile="))
+                .unwrap(),
+            &format!("IdentityFile={}", material.identity.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn hostile_browser_and_identity_values_cannot_alter_ssh_argv_structure() {
+        let material = Material::new();
+        let (mut target, prepared) = prepared_runtime_fixture(&material).await;
+        target.user_policy = SshUserPolicy::SameAsAuthenticatedUser;
+        for hostile in [
+            "-oProxyCommand=touch /tmp/nope",
+            "operator\nProxyCommand=unsafe",
+            "operаtor",
+        ] {
+            assert!(super::SshSpawnSpec::build(&prepared, &target, hostile).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_environment_is_cleared_and_contains_only_fixed_locale_and_term() {
+        let material = Material::new();
+        let record = material.directory.path().join("environment-record");
+        let source = material.directory.path().join("environment-recorder.c");
+        let program = format!(
+            "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nextern char **environ;\nstatic int compare(const void *left, const void *right) {{ return strcmp(*(const char *const *)left, *(const char *const *)right); }}\nint main(void) {{ size_t count = 0; while (environ[count] != NULL) count++; qsort(environ, count, sizeof(char *), compare); FILE *record = fopen(\"{}\", \"w\"); if (record == NULL) return 2; for (size_t index = 0; index < count; index++) fprintf(record, \"%s\\n\", environ[index]); return fclose(record) == 0 ? 0 : 3; }}\n",
+            record.display()
+        );
+        write(&source, program.as_bytes(), 0o600);
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-Wall", "-Wextra", "-Werror"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&material.executable)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (target, prepared) = prepared_runtime_fixture(&material).await;
+        let spec = super::SshSpawnSpec::build(&prepared, &target, "ignored").unwrap();
+        assert_eq!(
+            spec.environment(),
+            [("LANG", "C"), ("LC_ALL", "C"), ("TERM", "xterm-256color")]
+        );
+        for forbidden in ["PATH", "HOME", "USER", "SSH_AUTH_SOCK"] {
+            assert!(
+                !spec
+                    .environment()
+                    .iter()
+                    .any(|(name, _)| *name == forbidden)
+            );
+        }
+        let running = super::spawn(&spec, crate::protocol::Resize::new(80, 24).unwrap())
+            .expect("spawn environment recorder");
+        let (_reader, _writer, mut child, _diagnostics) = running.into_parts();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(
+            fs::read_to_string(record).unwrap(),
+            "LANG=C\nLC_ALL=C\nTERM=xterm-256color\n"
+        );
+    }
+
+    #[test]
+    fn ssh_classifier_distinguishes_unknown_mismatch_transport_authentication_and_generic_failure()
+    {
+        use super::SshDiagnosticClass::{
+            Authenticated, AuthenticationFailed, ConnectionFailed, GenericFailure, HostKeyMismatch,
+            UnknownHostKey,
+        };
+
+        for (diagnostic, expected) in [
+            (
+                b"No ED25519 host key is known for host.example and you have requested strict checking.\r\n"
+                    .as_slice(),
+                UnknownHostKey,
+            ),
+            (
+                b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n".as_slice(),
+                HostKeyMismatch,
+            ),
+            (
+                b"ssh: connect to host host.example port 22: Connection refused\n".as_slice(),
+                ConnectionFailed,
+            ),
+            (
+                b"operator@host.example: Permission denied (publickey).\n".as_slice(),
+                AuthenticationFailed,
+            ),
+            (
+                b"Authenticated to host.example ([192.0.2.1]:22) using \"publickey\".\n".as_slice(),
+                Authenticated,
+            ),
+            (b"ssh: unexplained failure\n".as_slice(), GenericFailure),
+        ] {
+            let mut classifier = super::SshDiagnosticClassifier::new();
+            classifier.push(diagnostic);
+            assert_eq!(classifier.finish(), expected);
+        }
+    }
+
+    #[test]
+    fn ssh_classifier_is_bounded_locale_pinned_and_never_returns_diagnostics() {
+        use super::{SshDiagnosticClass, SshDiagnosticClassifier};
+
+        let mut oversized = SshDiagnosticClassifier::new();
+        oversized.push(&[b'x'; super::MAX_SSH_DIAGNOSTIC_BYTES + 1]);
+        assert_eq!(oversized.finish(), SshDiagnosticClass::GenericFailure);
+
+        let mut too_many_lines = SshDiagnosticClassifier::new();
+        too_many_lines.push(&[b'\n'; super::MAX_SSH_DIAGNOSTIC_LINES + 1]);
+        assert_eq!(too_many_lines.finish(), SshDiagnosticClass::GenericFailure);
+        let mut trailing_extra_line = SshDiagnosticClassifier::new();
+        trailing_extra_line.push(&[b'\n'; super::MAX_SSH_DIAGNOSTIC_LINES]);
+        trailing_extra_line.push(b"Authenticated to synthetic using \"publickey\".");
+        assert_eq!(
+            trailing_extra_line.finish(),
+            SshDiagnosticClass::GenericFailure
+        );
+
+        let mut long_line = SshDiagnosticClassifier::new();
+        long_line.push(&[b'x'; super::MAX_SSH_DIAGNOSTIC_LINE_BYTES + 1]);
+        assert_eq!(long_line.finish(), SshDiagnosticClass::GenericFailure);
+
+        let mut invalid_utf8 = SshDiagnosticClassifier::new();
+        invalid_utf8.push(&[0xff]);
+        assert_eq!(invalid_utf8.finish(), SshDiagnosticClass::GenericFailure);
+
+        let debug = format!("{:?}", {
+            let mut classifier = SshDiagnosticClassifier::new();
+            classifier.push(b"secret-host secret-user /secret/path");
+            classifier
+        });
+        assert!(!debug.contains("secret"));
     }
 }

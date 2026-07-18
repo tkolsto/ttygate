@@ -1,5 +1,6 @@
 use std::{
     pin::Pin,
+    process::Stdio,
     task::{Context, Poll},
 };
 
@@ -10,10 +11,10 @@ use nix::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    process::Child,
+    process::{Child, ChildStderr},
 };
 
-use crate::{config::PtyTarget, protocol::Resize};
+use crate::{config::PtyTarget, protocol::Resize, ssh::SshSpawnSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum BackendError {
@@ -46,6 +47,60 @@ impl PtyProcessBackend {
                 process_group: pid,
             },
         })
+    }
+
+    #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+    pub(crate) fn spawn_ssh(spec: &SshSpawnSpec, size: Resize) -> Result<RunningSsh, BackendError> {
+        let (pty, pts) = pty_process::open().map_err(|_| BackendError::Unavailable)?;
+        pty.resize(pty_process::Size::new(size.rows, size.cols))
+            .map_err(|_| BackendError::Unavailable)?;
+        let command = pty_process::Command::new(spec.executable())
+            .args(spec.argv())
+            .env_clear()
+            .envs(spec.environment())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn(pts).map_err(|_| BackendError::Unavailable)?;
+        let diagnostics = child.stderr.take().ok_or(BackendError::Unavailable)?;
+        let pid = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map(Pid::from_raw)
+            .ok_or(BackendError::Unavailable)?;
+        let (reader, writer) = pty.into_split();
+        Ok(RunningSsh {
+            reader: PtyReader(reader),
+            writer: PtyWriter(writer),
+            child: PtyChild {
+                inner: child,
+                process_group: pid,
+            },
+            diagnostics,
+        })
+    }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) struct RunningSsh {
+    reader: PtyReader,
+    writer: PtyWriter,
+    child: PtyChild,
+    diagnostics: ChildStderr,
+}
+
+impl std::fmt::Debug for RunningSsh {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunningSsh")
+            .field("process_group", &self.child.process_group)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunningSsh {
+    #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+    pub(crate) fn into_parts(self) -> (PtyReader, PtyWriter, PtyChild, ChildStderr) {
+        (self.reader, self.writer, self.child, self.diagnostics)
     }
 }
 
