@@ -49,10 +49,13 @@ impl PtyProcessBackend {
             child: PtyChild {
                 inner: child,
                 process_group: pid,
+                exit_status: None,
                 #[cfg(test)]
                 reaped: None,
                 #[cfg(test)]
                 cleanup_failures: None,
+                #[cfg(test)]
+                post_kill_wait_gate: None,
             },
         })
     }
@@ -85,10 +88,13 @@ impl PtyProcessBackend {
             child: PtyChild {
                 inner: child,
                 process_group: pid,
+                exit_status: None,
                 #[cfg(test)]
                 reaped: None,
                 #[cfg(test)]
                 cleanup_failures: None,
+                #[cfg(test)]
+                post_kill_wait_gate: None,
             },
             raw_stderr,
             client_log,
@@ -210,18 +216,27 @@ impl AsyncWrite for PtyWriter {
 pub(crate) struct PtyChild {
     inner: Child,
     process_group: Pid,
+    exit_status: Option<std::process::ExitStatus>,
     #[cfg(test)]
     reaped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     cleanup_failures: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    post_kill_wait_gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl PtyChild {
     pub(crate) async fn wait(&mut self) -> Result<std::process::ExitStatus, BackendError> {
-        self.inner
+        if let Some(status) = self.exit_status {
+            return Ok(status);
+        }
+        let status = self
+            .inner
             .wait()
             .await
-            .map_err(|_| BackendError::Unavailable)
+            .map_err(|_| BackendError::Unavailable)?;
+        self.exit_status = Some(status);
+        Ok(status)
     }
 
     pub(crate) async fn terminate(
@@ -245,24 +260,33 @@ impl PtyChild {
         // group cleanup succeeds. The final signal therefore owns the result.
         let _ = signal(self.process_group, Signal::SIGHUP);
         let grace_deadline = tokio::time::Instant::now() + grace;
-        match tokio::time::timeout_at(grace_deadline, self.inner.wait()).await {
+        match tokio::time::timeout_at(grace_deadline, self.wait()).await {
             Ok(result) => {
-                let status = result.map_err(|_| BackendError::Unavailable);
+                let status = result;
                 tokio::time::sleep_until(grace_deadline).await;
                 signal(self.process_group, Signal::SIGKILL)?;
                 status
             }
             Err(_) => {
                 let cleanup = signal(self.process_group, Signal::SIGKILL);
-                let status = self
-                    .inner
-                    .wait()
+                let status = tokio::time::timeout(grace, self.wait_after_final_signal())
                     .await
-                    .map_err(|_| BackendError::Unavailable);
+                    .map_err(|_| BackendError::Unavailable)
+                    .and_then(std::convert::identity);
                 cleanup?;
                 status
             }
         }
+    }
+
+    async fn wait_after_final_signal(&mut self) -> Result<std::process::ExitStatus, BackendError> {
+        #[cfg(test)]
+        if let Some(gate) = &mut self.post_kill_wait_gate {
+            gate.wait_for(|released| *released)
+                .await
+                .map_err(|_| BackendError::Unavailable)?;
+        }
+        self.wait().await
     }
 
     pub(crate) async fn cleanup_group_after_exit(
@@ -459,6 +483,48 @@ mod tests {
         assert_eq!(
             kill(Pid::from_raw(pid.as_raw()), None),
             Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sigkill_child_wait_is_bounded_and_retryable() {
+        let running =
+            PtyProcessBackend::spawn(&target(&["ignore-hup"]), Resize::new(80, 24).unwrap())
+                .expect("spawn fixture");
+        let (mut reader, _writer, mut child) = running.into_parts();
+        let mut output = Vec::new();
+        read_until(&mut reader, &mut output, b"READY").await;
+        let (release_wait, wait_gate) = tokio::sync::watch::channel(false);
+        child.post_kill_wait_gate = Some(wait_gate);
+
+        let result = timeout(
+            Duration::from_millis(300),
+            child.terminate_with(Duration::from_millis(50), signal_group),
+        )
+        .await;
+        let retry = timeout(
+            Duration::from_millis(300),
+            child.terminate_with(Duration::from_millis(50), signal_group),
+        )
+        .await;
+        let cached_retry = timeout(
+            Duration::from_millis(300),
+            child.terminate_with(Duration::from_millis(50), signal_group),
+        )
+        .await;
+
+        release_wait.send_replace(true);
+        assert!(
+            matches!(result, Ok(Err(BackendError::Unavailable))),
+            "post-SIGKILL child wait must return a bounded retryable error"
+        );
+        assert!(
+            matches!(retry, Ok(Ok(_))),
+            "retry must reap the child after the bounded failure"
+        );
+        assert!(
+            matches!(cached_retry, Ok(Ok(_))),
+            "later retries must reuse the cached child status"
         );
     }
 }
