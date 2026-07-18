@@ -350,8 +350,10 @@ impl SshDiagnosticClassifier {
         if self.invalid {
             return Some(SshDiagnosticClass::GenericFailure);
         }
-        let Ok(diagnostics) = std::str::from_utf8(&self.bytes) else {
-            return None;
+        let diagnostics = match std::str::from_utf8(&self.bytes) {
+            Ok(diagnostics) => diagnostics,
+            Err(error) if error.error_len().is_none() => return None,
+            Err(_) => return Some(SshDiagnosticClass::GenericFailure),
         };
         classify_diagnostics(diagnostics)
     }
@@ -1945,6 +1947,10 @@ requesttty force\n"
         assert_eq!(split_utf8.classification(), None);
         split_utf8.push(b"\xa9\n");
         assert_eq!(split_utf8.classification(), None);
+
+        let mut invalid_utf8 = super::SshDiagnosticClassifier::new();
+        invalid_utf8.push(&[0xff]);
+        assert_eq!(invalid_utf8.classification(), Some(GenericFailure));
 
         let mut unrecognized = super::SshDiagnosticClassifier::new();
         unrecognized.push(b"debug1: setup continues\n");
