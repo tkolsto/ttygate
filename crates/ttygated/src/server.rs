@@ -28,6 +28,7 @@ use crate::{
     protocol::MAX_BINARY_BYTES,
     rate_limit::{Attempt, FixedWindowLimiter, LimitError},
     session::{SessionError, SessionManager},
+    ssh::PreparedSshTargets,
     ticket::{TicketError, TicketStore},
     websocket,
 };
@@ -59,6 +60,7 @@ pub struct AppState {
     sessions: Arc<SessionManager>,
     authentication_failures: Arc<FixedWindowLimiter<PeerKey>>,
     session_requests: Arc<FixedWindowLimiter<crate::ticket::Identity>>,
+    prepared_ssh: Arc<PreparedSshTargets>,
 }
 
 impl AppState {
@@ -91,6 +93,7 @@ impl AppState {
             sessions: Arc::new(sessions),
             authentication_failures,
             session_requests,
+            prepared_ssh: Arc::new(PreparedSshTargets::default()),
         }
     }
 
@@ -145,6 +148,15 @@ impl AppState {
 
     pub fn audit(&self) -> Arc<AuditLog> {
         Arc::clone(&self.audit)
+    }
+
+    pub fn prepared_ssh(&self) -> Arc<PreparedSshTargets> {
+        Arc::clone(&self.prepared_ssh)
+    }
+
+    pub(crate) fn with_prepared_ssh(mut self, prepared_ssh: PreparedSshTargets) -> Self {
+        self.prepared_ssh = Arc::new(prepared_ssh);
+        self
     }
 }
 

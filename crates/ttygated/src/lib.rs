@@ -7,6 +7,7 @@ mod pty_backend;
 pub mod rate_limit;
 pub mod server;
 pub mod session;
+pub mod ssh;
 pub mod startup;
 pub mod ticket;
 pub mod tls;

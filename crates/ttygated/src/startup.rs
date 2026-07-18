@@ -11,8 +11,9 @@ use tokio::net::TcpListener;
 
 use crate::{
     audit::{AuditError, AuditLog},
-    config::{Config, ConfigError, ServerTransport, TlsConfig, validate_startup_contract},
+    config::{Config, ConfigError, ServerTransport, Target, TlsConfig, validate_startup_contract},
     server::{self, AppState, ServerBuildError},
+    ssh::{self, PreparedSshTargets, SshPreparationError},
     tls::{self, TlsError},
 };
 
@@ -33,6 +34,8 @@ pub enum StartupError {
     Config(#[from] ConfigError),
     #[error(transparent)]
     Tls(#[from] TlsError),
+    #[error(transparent)]
+    Ssh(#[from] SshPreparationError),
     #[error(transparent)]
     Audit(#[from] AuditError),
     #[error(transparent)]
@@ -85,6 +88,32 @@ where
     AuditLoader: FnOnce(&Path) -> Result<AuditLog, AuditError>,
     AppBuilder: FnOnce(&Config, AuditLog) -> Result<AppState, ServerBuildError>,
 {
+    prepare_with_ssh(config, tls_loader, ssh::prepare, audit_loader, app_builder).await
+}
+
+pub async fn prepare_with_ssh<
+    'a,
+    TlsLoader,
+    TlsFuture,
+    SshLoader,
+    SshFuture,
+    AuditLoader,
+    AppBuilder,
+>(
+    config: &'a Config,
+    tls_loader: TlsLoader,
+    ssh_loader: SshLoader,
+    audit_loader: AuditLoader,
+    app_builder: AppBuilder,
+) -> Result<PreparedServer, StartupError>
+where
+    TlsLoader: FnOnce(&'a TlsConfig) -> TlsFuture,
+    TlsFuture: Future<Output = Result<RustlsConfig, TlsError>>,
+    SshLoader: FnOnce(&'a [Target]) -> SshFuture,
+    SshFuture: Future<Output = Result<PreparedSshTargets, SshPreparationError>>,
+    AuditLoader: FnOnce(&Path) -> Result<AuditLog, AuditError>,
+    AppBuilder: FnOnce(&Config, AuditLog) -> Result<AppState, ServerBuildError>,
+{
     validate_startup_contract(config)?;
     let transport = match &config.server.transport {
         ServerTransport::Plaintext => Some(PreparedTransport::Plaintext),
@@ -93,8 +122,9 @@ where
         }
         ServerTransport::TrustedProxy(_) => Some(PreparedTransport::Plaintext),
     };
+    let prepared_ssh = ssh_loader(&config.targets).await?;
     let audit = audit_loader(&config.audit.path)?;
-    let state = app_builder(config, audit)?;
+    let state = app_builder(config, audit)?.with_prepared_ssh(prepared_ssh);
     Ok(PreparedServer {
         bind: config.server.bind,
         state,
@@ -140,6 +170,47 @@ mod tests {
     };
 
     use super::{PreparedServer, PreparedTransport, StartupError, start, start_with};
+
+    #[tokio::test]
+    async fn ssh_preparation_failure_reaches_neither_application_nor_bind() {
+        let mut config = parse(source()).unwrap();
+        config.targets = vec![crate::config::Target::Ssh(crate::config::SshTarget {
+            name: "remote".into(),
+            host: "host.example".into(),
+            port: 22,
+            ssh_executable: "/missing/ssh".into(),
+            identity_file: "/missing/identity".into(),
+            known_hosts: "/missing/known-hosts".into(),
+            user_policy: crate::config::SshUserPolicy::Fixed("operator".into()),
+            read_only: false,
+        })];
+        let (record, observed) = phases();
+        let audit_record = Arc::clone(&record);
+        let app_record = Arc::clone(&record);
+        let bind_record = Arc::clone(&record);
+
+        let error = start_with(
+            &config,
+            |_| async { unreachable!("plaintext config must not load TLS") },
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                unreachable!("failed SSH preparation must not open audit")
+            },
+            move |_, _| {
+                app_record.lock().unwrap().push("app");
+                unreachable!("failed SSH preparation must not build app")
+            },
+            move |_: PreparedServer| {
+                bind_record.lock().unwrap().push("bind");
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, StartupError::Ssh(_)));
+        assert!(observed.lock().unwrap().is_empty());
+    }
 
     type PhaseLog = Arc<Mutex<Vec<&'static str>>>;
 

@@ -1,0 +1,836 @@
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    future::Future,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
+use base64::{Engine, engine::general_purpose::STANDARD};
+use thiserror::Error;
+use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+
+use crate::config::{SshTarget, Target};
+
+pub const MAX_SSH_EXECUTABLE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_KNOWN_HOSTS_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_IDENTITY_BYTES: u64 = 1024 * 1024;
+const MAX_PROBE_OUTPUT_BYTES: u64 = 64 * 1024;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+const CAPABILITY_PROBE_ARGV: [&str; 24] = [
+    "-G",
+    "-F",
+    "/dev/null",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ClearAllForwardings=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "IdentityAgent=none",
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "KbdInteractiveAuthentication=no",
+    "-o",
+    "PubkeyAuthentication=yes",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "GlobalKnownHostsFile=/dev/null",
+    "ttygate-capability.invalid",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SshPreparationError {
+    #[error("configured SSH executable is unsafe or unavailable")]
+    ExecutableUnsafe,
+    #[error("configured SSH known-hosts material is unsafe or malformed")]
+    KnownHostsUnsafe,
+    #[error("configured SSH identity material is unsafe, malformed, or encrypted")]
+    IdentityUnsafe,
+    #[error("configured SSH executable does not support the required security policy")]
+    CapabilityUnsupported,
+    #[error("configured SSH material changed after startup preparation")]
+    MaterialChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSnapshot {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl FileSnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.mode(),
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedSshTarget {
+    name: String,
+    executable: PathBuf,
+    executable_snapshot: FileSnapshot,
+    known_hosts: PathBuf,
+    known_hosts_snapshot: FileSnapshot,
+    identity: PathBuf,
+    identity_snapshot: FileSnapshot,
+}
+
+impl PreparedSshTarget {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub fn known_hosts(&self) -> &Path {
+        &self.known_hosts
+    }
+
+    pub fn identity(&self) -> &Path {
+        &self.identity
+    }
+
+    pub fn recheck_before_spawn(&self) -> Result<(), SshPreparationError> {
+        recheck(&self.executable, &self.executable_snapshot)?;
+        recheck(&self.known_hosts, &self.known_hosts_snapshot)?;
+        recheck(&self.identity, &self.identity_snapshot)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreparedSshTargets {
+    targets: BTreeMap<String, PreparedSshTarget>,
+}
+
+impl PreparedSshTargets {
+    pub fn get(&self, name: &str) -> Option<&PreparedSshTarget> {
+        self.targets.get(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PreparedSshTarget> {
+        self.targets.values()
+    }
+}
+
+pub async fn prepare(targets: &[Target]) -> Result<PreparedSshTargets, SshPreparationError> {
+    prepare_with_probe(targets, |executable: PathBuf| async move {
+        probe_capabilities(&executable).await
+    })
+    .await
+}
+
+pub async fn prepare_with_probe<P, F>(
+    targets: &[Target],
+    probe: P,
+) -> Result<PreparedSshTargets, SshPreparationError>
+where
+    P: Fn(PathBuf) -> F,
+    F: Future<Output = Result<(), SshPreparationError>>,
+{
+    let mut prepared = BTreeMap::new();
+    for target in targets {
+        let Target::Ssh(target) = target else {
+            continue;
+        };
+        let target = prepare_target_with_probe(target, &probe).await?;
+        prepared.insert(target.name.clone(), target);
+    }
+    Ok(PreparedSshTargets { targets: prepared })
+}
+
+async fn prepare_target_with_probe<P, F>(
+    target: &SshTarget,
+    probe: P,
+) -> Result<PreparedSshTarget, SshPreparationError>
+where
+    P: Fn(PathBuf) -> F,
+    F: Future<Output = Result<(), SshPreparationError>>,
+{
+    let (_, executable_snapshot) = read_file(
+        &target.ssh_executable,
+        MaterialKind::Executable,
+        MAX_SSH_EXECUTABLE_BYTES,
+    )?;
+    let (known_hosts, known_hosts_snapshot) = read_file(
+        &target.known_hosts,
+        MaterialKind::KnownHosts,
+        MAX_KNOWN_HOSTS_BYTES,
+    )?;
+    validate_known_hosts(&known_hosts)?;
+    let (identity, identity_snapshot) = read_file(
+        &target.identity_file,
+        MaterialKind::Identity,
+        MAX_IDENTITY_BYTES,
+    )?;
+    validate_identity(&identity)?;
+    let prepared = PreparedSshTarget {
+        name: target.name.clone(),
+        executable: target.ssh_executable.clone(),
+        executable_snapshot,
+        known_hosts: target.known_hosts.clone(),
+        known_hosts_snapshot,
+        identity: target.identity_file.clone(),
+        identity_snapshot,
+    };
+    prepared.recheck_before_spawn()?;
+    probe(target.ssh_executable.clone()).await?;
+    prepared.recheck_before_spawn()?;
+    Ok(prepared)
+}
+
+pub async fn probe_capabilities(executable: &Path) -> Result<(), SshPreparationError> {
+    let mut command = Command::new(executable);
+    command
+        .args(CAPABILITY_PROBE_ARGV)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(SshPreparationError::CapabilityUnsupported)?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(SshPreparationError::CapabilityUnsupported)?;
+    let completed = timeout(PROBE_TIMEOUT, async {
+        let stdout_read = async {
+            let mut bytes = Vec::new();
+            stdout
+                .take(MAX_PROBE_OUTPUT_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map(|_| bytes)
+        };
+        let stderr_read = async {
+            let mut bytes = Vec::new();
+            stderr
+                .take(MAX_PROBE_OUTPUT_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map(|_| bytes)
+        };
+        let (status, stdout, stderr) = tokio::join!(child.wait(), stdout_read, stderr_read);
+        (status, stdout, stderr)
+    })
+    .await
+    .map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    let (status, stdout, stderr) = completed;
+    let status = status.map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    let stdout = stdout.map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    let stderr = stderr.map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    if !status.success()
+        || stdout.len() as u64 > MAX_PROBE_OUTPUT_BYTES
+        || stderr.len() as u64 > MAX_PROBE_OUTPUT_BYTES
+    {
+        return Err(SshPreparationError::CapabilityUnsupported);
+    }
+    let output =
+        std::str::from_utf8(&stdout).map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    let normalized = output.to_ascii_lowercase();
+    let required_values = [
+        ("batchmode", &["yes", "true"][..]),
+        ("clearallforwardings", &["yes", "true"][..]),
+        ("identitiesonly", &["yes", "true"][..]),
+        ("identityagent", &["none"][..]),
+        ("passwordauthentication", &["no", "false"][..]),
+        ("kbdinteractiveauthentication", &["no", "false"][..]),
+        ("pubkeyauthentication", &["yes", "true"][..]),
+        ("stricthostkeychecking", &["yes", "true"][..]),
+        ("userknownhostsfile", &["/dev/null"][..]),
+        ("globalknownhostsfile", &["/dev/null"][..]),
+    ];
+    if required_values
+        .iter()
+        .any(|(key, values)| !has_probe_value(&normalized, key, values))
+    {
+        return Err(SshPreparationError::CapabilityUnsupported);
+    }
+    Ok(())
+}
+
+fn has_probe_value(output: &str, key: &str, allowed_values: &[&str]) -> bool {
+    output.lines().any(|line| {
+        line.split_once(char::is_whitespace)
+            .is_some_and(|(found_key, value)| {
+                found_key == key && allowed_values.contains(&value.trim())
+            })
+    })
+}
+
+#[derive(Clone, Copy)]
+enum MaterialKind {
+    Executable,
+    KnownHosts,
+    Identity,
+}
+
+fn read_file(
+    path: &Path,
+    kind: MaterialKind,
+    maximum: u64,
+) -> Result<(Vec<u8>, FileSnapshot), SshPreparationError> {
+    if !path.is_absolute() {
+        return Err(kind.error());
+    }
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+    let file = options.open(path).map_err(|_| kind.error())?;
+    let metadata = file.metadata().map_err(|_| kind.error())?;
+    validate_metadata(&metadata, kind, maximum)?;
+    let snapshot = FileSnapshot::from_metadata(&metadata);
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::take(file.try_clone().map_err(|_| kind.error())?, maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| kind.error())?;
+    let after = file.metadata().map_err(|_| kind.error())?;
+    if FileSnapshot::from_metadata(&after) != snapshot
+        || bytes.is_empty()
+        || bytes.len() as u64 > maximum
+    {
+        return Err(kind.error());
+    }
+    Ok((bytes, snapshot))
+}
+
+fn validate_metadata(
+    metadata: &fs::Metadata,
+    kind: MaterialKind,
+    maximum: u64,
+) -> Result<(), SshPreparationError> {
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
+        return Err(kind.error());
+    }
+    let effective_uid = nix::unistd::geteuid().as_raw();
+    let mode = metadata.mode();
+    match kind {
+        MaterialKind::Executable => {
+            if (metadata.uid() != 0 && metadata.uid() != effective_uid)
+                || mode & 0o022 != 0
+                || !executable_by_daemon(metadata, effective_uid)
+            {
+                return Err(kind.error());
+            }
+        }
+        MaterialKind::KnownHosts => {
+            if metadata.uid() != effective_uid || mode & 0o022 != 0 {
+                return Err(kind.error());
+            }
+        }
+        MaterialKind::Identity => {
+            if metadata.uid() != effective_uid || mode & 0o077 != 0 {
+                return Err(kind.error());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn executable_by_daemon(metadata: &fs::Metadata, effective_uid: u32) -> bool {
+    let mode = metadata.mode();
+    if metadata.uid() == effective_uid {
+        return mode & 0o100 != 0;
+    }
+    if mode & 0o001 != 0 {
+        return true;
+    }
+    if mode & 0o010 == 0 {
+        return false;
+    }
+    let effective_gid = nix::unistd::getegid().as_raw();
+    metadata.gid() == effective_gid
+}
+
+impl MaterialKind {
+    fn error(self) -> SshPreparationError {
+        match self {
+            Self::Executable => SshPreparationError::ExecutableUnsafe,
+            Self::KnownHosts => SshPreparationError::KnownHostsUnsafe,
+            Self::Identity => SshPreparationError::IdentityUnsafe,
+        }
+    }
+}
+
+fn validate_known_hosts(bytes: &[u8]) -> Result<(), SshPreparationError> {
+    if !bytes.ends_with(b"\n") || bytes.contains(&0) {
+        return Err(SshPreparationError::KnownHostsUnsafe);
+    }
+    Ok(())
+}
+
+fn validate_identity(bytes: &[u8]) -> Result<(), SshPreparationError> {
+    const BEGIN: &[u8] = b"-----BEGIN OPENSSH PRIVATE KEY-----\n";
+    const END: &[u8] = b"-----END OPENSSH PRIVATE KEY-----\n";
+    if !bytes.ends_with(b"\n") || bytes.contains(&0) {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    let encoded = bytes
+        .strip_prefix(BEGIN)
+        .and_then(|bytes| bytes.strip_suffix(END))
+        .ok_or(SshPreparationError::IdentityUnsafe)?;
+    if encoded.is_empty() || encoded.contains(&b'-') {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    let encoded = encoded
+        .split(|byte| *byte == b'\n')
+        .flat_map(|line| line.iter().copied())
+        .collect::<Vec<_>>();
+    let decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_| SshPreparationError::IdentityUnsafe)?;
+    let mut remaining = decoded
+        .strip_prefix(b"openssh-key-v1\0")
+        .ok_or(SshPreparationError::IdentityUnsafe)?;
+    let cipher = take_ssh_string(&mut remaining)?;
+    let kdf = take_ssh_string(&mut remaining)?;
+    let kdf_options = take_ssh_string(&mut remaining)?;
+    if cipher != b"none" || kdf != b"none" || !kdf_options.is_empty() {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    if take_u32(&mut remaining)? != 1 {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    let public_key = take_ssh_string(&mut remaining)?;
+    let mut private_block = take_ssh_string(&mut remaining)?;
+    if public_key.is_empty() || !remaining.is_empty() {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    let first_check = take_u32(&mut private_block)?;
+    let second_check = take_u32(&mut private_block)?;
+    let key_type = take_ssh_string(&mut private_block)?;
+    if first_check != second_check || key_type.is_empty() || private_block.is_empty() {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    Ok(())
+}
+
+fn take_ssh_string<'a>(remaining: &mut &'a [u8]) -> Result<&'a [u8], SshPreparationError> {
+    let length = remaining
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or(SshPreparationError::IdentityUnsafe)? as usize;
+    let value = remaining
+        .get(4..4 + length)
+        .ok_or(SshPreparationError::IdentityUnsafe)?;
+    *remaining = remaining
+        .get(4 + length..)
+        .ok_or(SshPreparationError::IdentityUnsafe)?;
+    Ok(value)
+}
+
+fn take_u32(remaining: &mut &[u8]) -> Result<u32, SshPreparationError> {
+    let value = remaining
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or(SshPreparationError::IdentityUnsafe)?;
+    *remaining = remaining
+        .get(4..)
+        .ok_or(SshPreparationError::IdentityUnsafe)?;
+    Ok(value)
+}
+
+fn recheck(path: &Path, expected: &FileSnapshot) -> Result<(), SshPreparationError> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+    let file = options
+        .open(path)
+        .map_err(|_| SshPreparationError::MaterialChanged)?;
+    let actual = file
+        .metadata()
+        .map(|metadata| FileSnapshot::from_metadata(&metadata))
+        .map_err(|_| SshPreparationError::MaterialChanged)?;
+    if &actual != expected {
+        return Err(SshPreparationError::MaterialChanged);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsString,
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+    };
+
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use tempfile::TempDir;
+
+    use crate::config::{SshTarget, SshUserPolicy, Target};
+
+    use super::{
+        SshPreparationError, prepare_target_with_probe, prepare_with_probe, probe_capabilities,
+    };
+
+    const KNOWN_HOST: &[u8] = b"host.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA==\n";
+
+    struct Material {
+        directory: TempDir,
+        executable: PathBuf,
+        known_hosts: PathBuf,
+        identity: PathBuf,
+    }
+
+    impl Material {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let executable = directory.path().join("ssh");
+            let known_hosts = directory.path().join("known_hosts");
+            let identity = directory.path().join("identity");
+            write(&executable, b"#!/bin/sh\nexit 0\n", 0o700);
+            write(&known_hosts, KNOWN_HOST, 0o644);
+            write(&identity, &unencrypted_identity(), 0o600);
+            Self {
+                directory,
+                executable,
+                known_hosts,
+                identity,
+            }
+        }
+
+        fn target(&self) -> SshTarget {
+            SshTarget {
+                name: "remote".into(),
+                host: "host.example".into(),
+                port: 22,
+                ssh_executable: self.executable.clone(),
+                identity_file: self.identity.clone(),
+                known_hosts: self.known_hosts.clone(),
+                user_policy: SshUserPolicy::Fixed("operator".into()),
+                read_only: false,
+            }
+        }
+    }
+
+    fn write(path: &Path, bytes: &[u8], mode: u32) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn wrong_owner_path(directory: &Path, name: &str) -> PathBuf {
+        let effective_uid = nix::unistd::geteuid();
+        if effective_uid.as_raw() != 0 {
+            let system_file = PathBuf::from("/usr/bin/ssh");
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                fs::metadata(&system_file).unwrap().uid(),
+                effective_uid.as_raw()
+            );
+            return system_file;
+        }
+        let path = directory.join(name);
+        write(&path, b"wrong-owner\n", 0o600);
+        nix::unistd::chown(&path, Some(nix::unistd::Uid::from_raw(1)), None).unwrap();
+        path
+    }
+
+    fn unencrypted_identity() -> Vec<u8> {
+        fn string(output: &mut Vec<u8>, value: &[u8]) {
+            output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            output.extend_from_slice(value);
+        }
+        let mut binary = b"openssh-key-v1\0".to_vec();
+        string(&mut binary, b"none");
+        string(&mut binary, b"none");
+        string(&mut binary, b"");
+        binary.extend_from_slice(&1u32.to_be_bytes());
+        string(&mut binary, b"synthetic-public-key");
+        let mut private = 0x1234_5678u32.to_be_bytes().to_vec();
+        private.extend_from_slice(&0x1234_5678u32.to_be_bytes());
+        string(&mut private, b"ssh-ed25519");
+        private.extend_from_slice(b"synthetic-non-key-data");
+        string(&mut binary, &private);
+        let encoded = STANDARD.encode(binary);
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{encoded}\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+        .into_bytes()
+    }
+
+    fn incomplete_identity() -> Vec<u8> {
+        let mut binary = b"openssh-key-v1\0".to_vec();
+        for value in [b"none".as_slice(), b"none", b""] {
+            binary.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            binary.extend_from_slice(value);
+        }
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            STANDARD.encode(binary)
+        )
+        .into_bytes()
+    }
+
+    async fn accept_probe(_: PathBuf) -> Result<(), SshPreparationError> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ssh_executable_rejects_relative_symlink_special_nonexecutable_and_writable_files() {
+        let material = Material::new();
+        let symlink_path = material.directory.path().join("ssh-link");
+        symlink(&material.executable, &symlink_path).unwrap();
+        let special = material.directory.path().join("ssh-special");
+        nix::unistd::mkfifo(&special, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let relative = PathBuf::from("relative-ssh");
+
+        for (path, mode) in [
+            (relative, None),
+            (symlink_path, None),
+            (special, None),
+            (material.executable.clone(), Some(0o600)),
+            (material.executable.clone(), Some(0o722)),
+        ] {
+            if let Some(mode) = mode {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let mut target = material.target();
+            target.ssh_executable = path;
+            let error = prepare_target_with_probe(&target, accept_probe)
+                .await
+                .unwrap_err();
+            assert_eq!(error, SshPreparationError::ExecutableUnsafe);
+            assert!(
+                !error
+                    .to_string()
+                    .contains(material.directory.path().to_str().unwrap())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_hosts_rejects_relative_symlink_directory_special_wrong_owner_unsafe_empty_oversize_and_incomplete_data()
+     {
+        let material = Material::new();
+        let symlink_path = material.directory.path().join("known-hosts-link");
+        symlink(&material.known_hosts, &symlink_path).unwrap();
+        let special = material.directory.path().join("known-hosts-special");
+        nix::unistd::mkfifo(&special, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let cases = [
+            (PathBuf::from("relative-known-hosts"), None, None),
+            (symlink_path, None, None),
+            (material.directory.path().to_path_buf(), None, None),
+            (special, None, None),
+            (material.known_hosts.clone(), Some(KNOWN_HOST), Some(0o666)),
+            (material.known_hosts.clone(), Some(b""), Some(0o600)),
+            (
+                material.known_hosts.clone(),
+                Some(&vec![b'a'; super::MAX_KNOWN_HOSTS_BYTES as usize + 1]),
+                Some(0o600),
+            ),
+            (
+                material.known_hosts.clone(),
+                Some(b"host ssh-ed25519 AAAA"),
+                Some(0o600),
+            ),
+            (
+                material.known_hosts.clone(),
+                Some(b"host\0 ssh-ed25519 AAAA\n"),
+                Some(0o600),
+            ),
+        ];
+        for (path, contents, mode) in cases {
+            if let Some(contents) = contents {
+                write(&path, contents, mode.unwrap());
+            }
+            let mut target = material.target();
+            target.known_hosts = path;
+            assert_eq!(
+                prepare_target_with_probe(&target, accept_probe)
+                    .await
+                    .unwrap_err(),
+                SshPreparationError::KnownHostsUnsafe
+            );
+        }
+
+        let mut target = material.target();
+        target.known_hosts = wrong_owner_path(material.directory.path(), "wrong-owner-known-hosts");
+        assert_eq!(
+            prepare_target_with_probe(&target, accept_probe)
+                .await
+                .unwrap_err(),
+            SshPreparationError::KnownHostsUnsafe
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_rejects_relative_symlink_directory_special_wrong_owner_unsafe_empty_oversize_encrypted_and_trailing_data()
+     {
+        let material = Material::new();
+        let symlink_path = material.directory.path().join("identity-link");
+        symlink(&material.identity, &symlink_path).unwrap();
+        let special = material.directory.path().join("identity-special");
+        nix::unistd::mkfifo(&special, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let mut encrypted_binary = b"openssh-key-v1\0".to_vec();
+        for value in [b"aes256-ctr".as_slice(), b"bcrypt", b"salt"] {
+            encrypted_binary.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            encrypted_binary.extend_from_slice(value);
+        }
+        let encrypted = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            STANDARD.encode(encrypted_binary)
+        );
+        let mut trailing = unencrypted_identity();
+        trailing.extend_from_slice(b"trailing\n");
+        let cases = [
+            (PathBuf::from("relative-identity"), None, None),
+            (symlink_path, None, None),
+            (material.directory.path().to_path_buf(), None, None),
+            (special, None, None),
+            (
+                material.identity.clone(),
+                Some(unencrypted_identity()),
+                Some(0o640),
+            ),
+            (material.identity.clone(), Some(Vec::new()), Some(0o600)),
+            (
+                material.identity.clone(),
+                Some(vec![b'a'; super::MAX_IDENTITY_BYTES as usize + 1]),
+                Some(0o600),
+            ),
+            (
+                material.identity.clone(),
+                Some(encrypted.into_bytes()),
+                Some(0o600),
+            ),
+            (
+                material.identity.clone(),
+                Some(incomplete_identity()),
+                Some(0o600),
+            ),
+            (material.identity.clone(), Some(trailing), Some(0o600)),
+        ];
+        for (path, contents, mode) in cases {
+            if let Some(contents) = contents {
+                write(&path, &contents, mode.unwrap());
+            }
+            let mut target = material.target();
+            target.identity_file = path;
+            assert_eq!(
+                prepare_target_with_probe(&target, accept_probe)
+                    .await
+                    .unwrap_err(),
+                SshPreparationError::IdentityUnsafe
+            );
+        }
+
+        let mut target = material.target();
+        target.identity_file = wrong_owner_path(material.directory.path(), "wrong-owner-identity");
+        assert_eq!(
+            prepare_target_with_probe(&target, accept_probe)
+                .await
+                .unwrap_err(),
+            SshPreparationError::IdentityUnsafe
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_material_paths_are_rechecked_before_spawn() {
+        let material = Material::new();
+        let prepared = prepare_target_with_probe(&material.target(), accept_probe)
+            .await
+            .unwrap();
+        assert!(prepared.recheck_before_spawn().is_ok());
+
+        let replacement = material.directory.path().join("replacement");
+        write(&replacement, KNOWN_HOST, 0o644);
+        fs::rename(&replacement, &material.known_hosts).unwrap();
+        assert_eq!(
+            prepared.recheck_before_spawn().unwrap_err(),
+            SshPreparationError::MaterialChanged
+        );
+
+        let material = Material::new();
+        let known_hosts = material.known_hosts.clone();
+        let error = prepare_target_with_probe(&material.target(), move |_| {
+            let replacement = known_hosts.with_extension("replacement");
+            write(&replacement, KNOWN_HOST, 0o644);
+            fs::rename(replacement, &known_hosts).unwrap();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, SshPreparationError::MaterialChanged);
+    }
+
+    #[tokio::test]
+    async fn ssh_capability_probe_uses_literal_executable_fixed_argv_and_cleared_environment() {
+        let material = Material::new();
+        let record_path = material.directory.path().join("probe-record");
+        let script = format!(
+            "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; env; }} > '{}'\nprintf '%s\\n' \\\n 'batchmode yes' \\\n 'clearallforwardings yes' \\\n 'identitiesonly yes' \\\n 'identityagent none' \\\n 'passwordauthentication no' \\\n 'kbdinteractiveauthentication no' \\\n 'pubkeyauthentication true' \\\n 'stricthostkeychecking true' \\\n 'userknownhostsfile /dev/null' \\\n 'globalknownhostsfile /dev/null'\n",
+            record_path.display()
+        );
+        write(&material.executable, script.as_bytes(), 0o700);
+        probe_capabilities(&material.executable).await.unwrap();
+
+        let record = fs::read_to_string(record_path).unwrap();
+        let lines = record.lines().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            &lines[..super::CAPABILITY_PROBE_ARGV.len()],
+            super::CAPABILITY_PROBE_ARGV
+        );
+        assert!(record.contains("LC_ALL=C"));
+        assert!(record.contains("LANG=C"));
+        assert!(!record.lines().any(|line| line.starts_with("PATH=")));
+    }
+
+    #[tokio::test]
+    async fn production_configured_ssh_target_has_no_insecure_runtime_fallback() {
+        let material = Material::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        let target = Target::Ssh(material.target());
+        let error = prepare_with_probe(&[target], move |path: PathBuf| {
+            observed.lock().unwrap().push(path);
+            std::future::ready(Err(SshPreparationError::CapabilityUnsupported))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, SshPreparationError::CapabilityUnsupported);
+        assert_eq!(*calls.lock().unwrap(), [material.executable]);
+    }
+}
