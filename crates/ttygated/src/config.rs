@@ -167,6 +167,8 @@ pub struct SshTarget {
     pub name: String,
     pub host: String,
     pub port: u16,
+    pub ssh_executable: PathBuf,
+    pub identity_file: PathBuf,
     pub known_hosts: PathBuf,
     pub user_policy: SshUserPolicy,
     pub read_only: bool,
@@ -311,6 +313,8 @@ enum RawTarget {
         name: String,
         host: String,
         port: u16,
+        ssh_executable: PathBuf,
+        identity_file: PathBuf,
         known_hosts: PathBuf,
         user_policy: RawUserPolicy,
         #[serde(default)]
@@ -622,6 +626,8 @@ fn convert_target(index: usize, raw: RawTarget) -> Result<Target, ConfigError> {
             name,
             host,
             port,
+            ssh_executable,
+            identity_file,
             known_hosts,
             user_policy,
             user,
@@ -640,6 +646,8 @@ fn convert_target(index: usize, raw: RawTarget) -> Result<Target, ConfigError> {
                     "must be between 1 and 65535",
                 ));
             }
+            validate_literal_path(&ssh_executable, &format!("targets[{index}].ssh_executable"))?;
+            validate_literal_path(&identity_file, &format!("targets[{index}].identity_file"))?;
             validate_literal_path(&known_hosts, &format!("targets[{index}].known_hosts"))?;
             let policy = match user_policy {
                 RawUserPolicy::SameAsAuthUser => {
@@ -692,6 +700,8 @@ fn convert_target(index: usize, raw: RawTarget) -> Result<Target, ConfigError> {
                 name,
                 host,
                 port,
+                ssh_executable,
+                identity_file,
                 known_hosts,
                 user_policy: policy,
                 read_only,
@@ -870,11 +880,14 @@ fn validate_username(value: &str, field: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_username_value(value: &str) -> Result<(), ()> {
-    if value.is_empty()
-        || value.len() > 256
-        || value.starts_with('-')
-        || value.chars().any(char::is_whitespace)
-        || value.chars().any(char::is_control)
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 128
+        || !bytes[0].is_ascii_alphanumeric()
+        || bytes.last() == Some(&b'-')
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(());
     }
@@ -899,6 +912,14 @@ fn validate_typed_target(index: usize, target: &Target) -> Result<(), ConfigErro
                     "must be between 1 and 65535",
                 ));
             }
+            validate_literal_path(
+                &target.ssh_executable,
+                &format!("targets[{index}].ssh_executable"),
+            )?;
+            validate_literal_path(
+                &target.identity_file,
+                &format!("targets[{index}].identity_file"),
+            )?;
             validate_literal_path(
                 &target.known_hosts,
                 &format!("targets[{index}].known_hosts"),
@@ -974,6 +995,8 @@ name = "lab-host"
 type = "ssh"
 host = "lab.example.internal"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "same-as-auth-user"
 "#;
@@ -1192,6 +1215,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "/etc/ttygate/known_hosts"
 user_policy = "same-as-auth-user""#,
         ))
@@ -1234,6 +1259,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 {policy}"#
             ));
@@ -1265,6 +1292,8 @@ command = [""]"#,
 type = "ssh"
 host = ""
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "same-as-auth-user""#,
                 "targets[0].host",
@@ -1274,6 +1303,8 @@ user_policy = "same-as-auth-user""#,
 type = "ssh"
 host = "example.test"
 port = 0
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "same-as-auth-user""#,
                 "targets[0].port",
@@ -1283,6 +1314,8 @@ user_policy = "same-as-auth-user""#,
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "fixed""#,
                 "targets[0].user",
@@ -1292,6 +1325,8 @@ user_policy = "fixed""#,
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "mapping""#,
                 "targets[0].user_mapping",
@@ -1301,6 +1336,8 @@ user_policy = "mapping""#,
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "mapping"
 user_mapping = {}"#,
@@ -1311,6 +1348,8 @@ user_mapping = {}"#,
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "same-as-auth-user"
 user = "stray""#,
@@ -1340,6 +1379,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "browser-chooses""#,
             ),
@@ -1410,6 +1451,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = {path:?}
 user_policy = "same-as-auth-user""#
             ));
@@ -1437,6 +1480,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = {path:?}
 user_policy = "same-as-auth-user""#
             ));
@@ -1510,6 +1555,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "mapping"
 user_mapping = { alice = "one", alice = "two" }"#,
@@ -1539,6 +1586,8 @@ user_mapping = { alice = "one", alice = "two" }"#,
             ("command = [\"/bin/bash\", \"-l\"]", "command"),
             ("host = \"lab.example.internal\"", "host"),
             ("port = 22", "port"),
+            ("ssh_executable = \"/usr/bin/ssh\"", "ssh_executable"),
+            ("identity_file = \"./id_ed25519\"", "identity_file"),
             ("known_hosts = \"./known_hosts\"", "known_hosts"),
             ("user_policy = \"same-as-auth-user\"", "user_policy"),
         ];
@@ -1614,6 +1663,8 @@ user_mapping = { alice = "one", alice = "two" }"#,
             name: "host".into(),
             host: "example.test".into(),
             port: 0,
+            ssh_executable: "/usr/bin/ssh".into(),
+            identity_file: "./id_ed25519".into(),
             known_hosts: "./known_hosts".into(),
             user_policy: SshUserPolicy::SameAsAuthenticatedUser,
             read_only: false,
@@ -2077,6 +2128,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "mapping"
 {mapping}"#
@@ -2096,6 +2149,8 @@ user_policy = "mapping"
             name: "host".into(),
             host: "example.test".into(),
             port: 22,
+            ssh_executable: "/usr/bin/ssh".into(),
+            identity_file: "./id_ed25519".into(),
             known_hosts: "./known_hosts".into(),
             user_policy: SshUserPolicy::Fixed("operator".into()),
             read_only: false,
@@ -2108,6 +2163,8 @@ name = "host"
 type = "ssh"
 host = "example.test"
 port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "./id_ed25519"
 known_hosts = "./known_hosts"
 user_policy = "fixed"
 user = "-oProxyCommand=bad""#,
@@ -2124,5 +2181,197 @@ user = "-oProxyCommand=bad""#,
     fn mapping_policy_is_typed() {
         let policy = SshUserPolicy::Mapping(BTreeMap::from([("alice".into(), "remote".into())]));
         assert_eq!(policy.resolve("alice").unwrap(), "remote");
+    }
+
+    fn ssh_target(policy: &str) -> String {
+        config_with_target(&format!(
+            r#"[[targets]]
+name = "host"
+type = "ssh"
+host = "example.test"
+port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "/etc/ttygate/id_ed25519"
+known_hosts = "/etc/ttygate/known_hosts"
+{policy}"#
+        ))
+    }
+
+    fn parsed_ssh(policy: &str) -> SshTarget {
+        let config = parse(&ssh_target(policy)).expect("SSH target should parse");
+        let Target::Ssh(target) = config.targets.into_iter().next().unwrap() else {
+            panic!("expected SSH target");
+        };
+        target
+    }
+
+    #[test]
+    fn ssh_target_requires_literal_executable_and_identity_paths() {
+        let target = parsed_ssh(r#"user_policy = "same-as-auth-user""#);
+        assert_eq!(target.ssh_executable, PathBuf::from("/usr/bin/ssh"));
+        assert_eq!(
+            target.identity_file,
+            PathBuf::from("/etc/ttygate/id_ed25519")
+        );
+
+        for (line, field) in [
+            ("ssh_executable = \"/usr/bin/ssh\"\n", "ssh_executable"),
+            (
+                "identity_file = \"/etc/ttygate/id_ed25519\"\n",
+                "identity_file",
+            ),
+        ] {
+            let source = ssh_target(r#"user_policy = "same-as-auth-user""#).replace(line, "");
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains(field), "{error:?} did not contain {field:?}");
+        }
+    }
+
+    #[test]
+    fn ssh_target_rejects_unknown_duplicate_and_stray_credential_fields() {
+        let cases = [
+            ssh_target(
+                r#"user_policy = "same-as-auth-user"
+ssh_executible = "/usr/bin/ssh""#,
+            ),
+            ssh_target(
+                r#"user_policy = "same-as-auth-user"
+ssh_executable = "/bin/ssh""#,
+            ),
+            config_with_target(
+                r#"[[targets]]
+name = "shell"
+type = "pty"
+command = ["/bin/sh"]
+identity_file = "/etc/ttygate/id_ed25519""#,
+            ),
+        ];
+
+        for source in cases {
+            assert!(matches!(parse(&source), Err(ConfigError::Parse { .. })));
+        }
+    }
+
+    #[test]
+    fn fixed_user_policy_resolves_exactly() {
+        let target = parsed_ssh(
+            r#"user_policy = "fixed"
+user = "operator_1""#,
+        );
+        assert_eq!(target.user_policy.resolve("alice").unwrap(), "operator_1");
+    }
+
+    #[test]
+    fn same_as_authenticated_user_policy_resolves_exactly() {
+        let target = parsed_ssh(r#"user_policy = "same-as-auth-user""#);
+        assert_eq!(target.user_policy.resolve("alice.1").unwrap(), "alice.1");
+    }
+
+    #[test]
+    fn mapping_user_policy_resolves_exactly_and_rejects_missing_mapping() {
+        let target = parsed_ssh(
+            r#"user_policy = "mapping"
+user_mapping = { alice = "remote-alice" }"#,
+        );
+        assert_eq!(target.user_policy.resolve("alice").unwrap(), "remote-alice");
+        assert!(matches!(
+            target.user_policy.resolve("bob"),
+            Err(super::UserPolicyError::NotMapped(user)) if user == "bob"
+        ));
+    }
+
+    #[test]
+    fn ssh_usernames_reject_option_control_whitespace_confusable_unicode_and_oversize() {
+        for username in [
+            "",
+            "-operator",
+            "operator-",
+            "_operator",
+            ".operator",
+            "operator name",
+            "operator\nname",
+            "operаtor",
+            "operator/name",
+            "operator@example",
+        ] {
+            let source = ssh_target(&format!("user_policy = \"fixed\"\nuser = {username:?}"));
+            assert!(
+                parse(&source)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("targets[0].user"),
+                "accepted invalid SSH username {username:?}"
+            );
+        }
+        assert!(matches!(
+            SshUserPolicy::Fixed("oper\u{0000}ator".into()).resolve("ignored"),
+            Err(super::UserPolicyError::InvalidResolvedUser)
+        ));
+
+        let oversize = "a".repeat(129);
+        assert!(
+            parse(&ssh_target(&format!(
+                "user_policy = \"fixed\"\nuser = {oversize:?}"
+            )))
+            .is_err()
+        );
+
+        for username in ["a", "A1", "operator.name", "operator_name", "operator-name"] {
+            let target = parsed_ssh(&format!("user_policy = \"fixed\"\nuser = {username:?}"));
+            assert_eq!(target.user_policy.resolve("ignored").unwrap(), username);
+        }
+    }
+
+    #[test]
+    fn ssh_literal_paths_preserve_bytes_without_tilde_or_environment_expansion() {
+        let source = ssh_target(r#"user_policy = "same-as-auth-user""#)
+            .replace("/usr/bin/ssh", "./bin/ssh with spaces")
+            .replace(
+                "/etc/ttygate/id_ed25519",
+                "./credentials/id_ed25519.literal",
+            );
+        let config = parse(&source).unwrap();
+        let Target::Ssh(target) = &config.targets[0] else {
+            panic!("expected SSH target");
+        };
+        assert_eq!(
+            target.ssh_executable,
+            PathBuf::from("./bin/ssh with spaces")
+        );
+        assert_eq!(
+            target.identity_file,
+            PathBuf::from("./credentials/id_ed25519.literal")
+        );
+
+        for (field, path) in [
+            ("ssh_executable", "~/bin/ssh"),
+            ("ssh_executable", "$HOME/bin/ssh"),
+            ("identity_file", "~/id_ed25519"),
+            ("identity_file", "${HOME}/id_ed25519"),
+        ] {
+            let source = ssh_target(r#"user_policy = "same-as-auth-user""#).replace(
+                &format!(
+                    "{field} = {:?}",
+                    if field == "ssh_executable" {
+                        "/usr/bin/ssh"
+                    } else {
+                        "/etc/ttygate/id_ed25519"
+                    }
+                ),
+                &format!("{field} = {path:?}"),
+            );
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains(field), "{error:?} did not contain {field:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_target_fails_before_ssh_construction() {
+        let target = parsed_ssh(r#"user_policy = "same-as-auth-user""#);
+        assert_eq!(target.ssh_executable, PathBuf::from("/usr/bin/ssh"));
+        let allowlist = TargetAllowlist::new(vec![Target::Ssh(target)]).unwrap();
+
+        let error = allowlist.resolve("not-configured").unwrap_err();
+        assert_eq!(error.name(), "not-configured");
     }
 }
