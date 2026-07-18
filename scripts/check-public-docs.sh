@@ -97,7 +97,7 @@ require_text "$REWRITE_PLAN" 'Implemented in Chunk 2\.2.*Refs #9|Chunk 2\.2.*imp
 require_text "$REWRITE_PLAN" 'semantic HTTP field' 'rewrite-plan semantic HTTP field-value contract'
 require_text "$REWRITE_PLAN" 'optional whitespace.*(parser|framing)|parser.*optional whitespace' 'rewrite-plan HTTP optional-whitespace contract'
 
-if grep -Eini 'contract-only|does not yet trust( or consume)? the identity header|provider unavailable|trusted-proxy enforcement remains Chunk 2\.2|Future in Chunk 2\.2' \
+if grep -Eini 'contract-only|does not yet trust( or consume)? the identity header|provider unavailable|trusted-proxy enforcement remains Chunk 2\.2|Future in Chunk 2\.2|production authentication (and|is|remains)[^.]*planned' \
   "$README" "$THREAT_MODEL" "$ROADMAP" "$REWRITE_PLAN"; then
   fail 'public docs still describe trusted-proxy authentication as unavailable'
 fi
