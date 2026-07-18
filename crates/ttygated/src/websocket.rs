@@ -955,41 +955,208 @@ async fn cancelled(receiver: &mut watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
     use axum::extract::ws::Message;
+    use axum::http::{HeaderValue, header};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{self, client::IntoClientRequest},
+    };
 
     use crate::{
+        audit::AuditLog,
+        auth::{AuthProvider, DevAuthProvider},
         config::{SshTarget, SshUserPolicy, Target},
-        protocol::{CloseReason, ExitStatus, ServerControl},
+        origin::OriginPolicy,
+        protocol::{CloseReason, ExitStatus, ServerControl, decode_server_control},
+        server::{AppState, serve},
         session::{
             ChildOutcome, SessionCloseReason, SessionClosed, SessionError, SessionState,
             TimeoutKind,
         },
-        ticket::TicketError,
+        ssh::PreparedSshTargets,
+        ticket::{Identity, TicketError, TicketStore},
     };
 
     use super::{
         BRIDGE_CHANNEL_CAPACITY, HANDSHAKE_MAX_BYTES, HandshakeError, SendCompletion,
         close_or_cancel, parse_handshake, race_send_with_completion, resolve_session_operation,
-        safe_session_error, safe_ticket_error, send_bounded, stop_input_before,
-        supports_redeemed_target, terminal_controls, terminal_operation_result,
+        safe_session_error, safe_ticket_error, send_bounded, stop_input_before, terminal_controls,
+        terminal_operation_result,
     };
 
-    #[test]
-    fn websocket_admits_configured_ssh_targets_without_new_authority_fields() {
+    #[tokio::test]
+    async fn websocket_admits_configured_ssh_targets_without_new_authority_fields() {
+        const ORIGIN: &str = "https://ttygate.local:7681";
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let executable = directory.path().join("ssh-path-secret");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-E\" ]; then log=$2; break; fi\n  shift\ndone\nprintf 'No ED25519 host key is known for host-secret.example and you have requested strict checking.\\n' > \"$log\"\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let target = Target::Ssh(SshTarget {
             name: "production".into(),
-            host: "ssh.example.test".into(),
+            host: "host-secret.example".into(),
             port: 22,
-            ssh_executable: "/usr/bin/ssh".into(),
-            identity_file: "/run/ttygate/id_ed25519".into(),
-            known_hosts: "/run/ttygate/known_hosts".into(),
-            user_policy: SshUserPolicy::Fixed("operator".into()),
+            ssh_executable: executable.clone(),
+            identity_file: executable.clone(),
+            known_hosts: executable.clone(),
+            user_policy: SshUserPolicy::Fixed("user-secret".into()),
             read_only: false,
         });
+        let Target::Ssh(ssh_target) = &target else {
+            unreachable!();
+        };
+        let prepared = PreparedSshTargets::from_session_test_target(ssh_target);
+        let audit_path = directory.path().join("audit.jsonl");
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
+        let limits = crate::config::Limits {
+            max_sessions: 1,
+            max_sessions_per_user: 1,
+            idle_timeout: Duration::from_secs(2),
+            absolute_timeout: Duration::from_secs(2),
+            session_requests_per_window: 10,
+            session_request_window: Duration::from_secs(60),
+            authentication_failures_per_window: 20,
+            authentication_failure_window: Duration::from_secs(60),
+        };
+        let state = AppState::new_for_test(
+            OriginPolicy::new(ORIGIN).unwrap(),
+            auth,
+            crate::config::TargetAllowlist::new(vec![target.clone()]).unwrap(),
+            TicketStore::new(Duration::from_secs(10), 1),
+            limits,
+            audit,
+        )
+        .with_prepared_ssh(std::slice::from_ref(&target), prepared)
+        .unwrap();
+        let identity = Identity::new("developer").unwrap();
+        let reservation = state
+            .sessions()
+            .reserve(
+                &identity,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let ticket = state
+            .tickets()
+            .issue(identity, target, reservation)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            serve(listener, state).await.unwrap();
+        });
 
-        assert!(supports_redeemed_target(&target));
+        let mut identity_stream = TcpStream::connect(address).await.unwrap();
+        identity_stream
+            .write_all(
+                format!(
+                    "POST /api/identity HTTP/1.1\r\nHost: {address}\r\nOrigin: {ORIGIN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        identity_stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let cookie = response
+            .lines()
+            .find_map(|line| line.strip_prefix("set-cookie: "))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+
+        let mut request = format!("ws://{address}/api/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static(ORIGIN));
+        request
+            .headers_mut()
+            .insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        let start = format!(r#"{{"ticket":"{ticket}"}}"#);
+        let start_value: serde_json::Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(
+            start_value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["ticket"]
+        );
+        socket
+            .send(tungstenite::Message::Text(start.into()))
+            .await
+            .unwrap();
+        let control = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                if let tungstenite::Message::Text(text) = message {
+                    break decode_server_control(text.as_bytes()).unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let ServerControl::Error(error) = control else {
+            panic!("expected curated SSH error");
+        };
+        assert_eq!(error.code, "ssh-host-key-failed");
+        assert_eq!(
+            error.message,
+            "The SSH host identity could not be verified."
+        );
+        let rendered = format!("{error:?}");
+        for sentinel in [
+            "host-secret.example",
+            "user-secret",
+            "ssh-path-secret",
+            "No ED25519 host key",
+            "-o",
+        ] {
+            assert!(!rendered.contains(sentinel), "{rendered}");
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let contents = fs::read_to_string(&audit_path).unwrap();
+                if contents.contains(r#""reason":"unknown-host-key""#) {
+                    break contents;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let contents = fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(
+            contents.matches(r#""event_type":"access-denied""#).count(),
+            1
+        );
+        assert!(!contents.contains(r#""event_type":"session-started""#));
+        assert!(!contents.contains(r#""event_type":"session-ended""#));
+        for sentinel in [
+            "host-secret.example",
+            "user-secret",
+            "ssh-path-secret",
+            "No ED25519 host key",
+        ] {
+            assert!(!contents.contains(sentinel), "{contents}");
+        }
+        server.abort();
     }
 
     #[test]
