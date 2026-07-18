@@ -76,6 +76,19 @@ export class ResizeCoalescer {
     });
   }
 
+  sendNow(size: TerminalSize): void {
+    if (this.#disposed) throw new Error("resize coalescer is disposed");
+    validateSize(size);
+    this.#pending = undefined;
+    if (this.#timer !== undefined) {
+      this.#scheduler.clear(this.#timer);
+      this.#timer = undefined;
+    }
+    if (sameSize(size, this.#lastSent)) return;
+    this.#lastSent = { ...size };
+    this.#send(size);
+  }
+
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;

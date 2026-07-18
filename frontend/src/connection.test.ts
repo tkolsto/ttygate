@@ -232,6 +232,11 @@ test("ticket is the first socket message then discarded before input becomes act
   socket.open();
 
   assert.equal(socket.sent[0], JSON.stringify({ ticket: "opaque-ticket-secret" }));
+  assert.equal(
+    socket.sent[1],
+    '{"version":1,"type":"resize","cols":80,"rows":24}',
+    "the measured initial resize precedes terminal input",
+  );
   assert.equal(setup.grants[0]?.ticket, "", "grant no longer retains the ticket");
   assert.equal(setup.states.at(-1)?.phase, "active");
   assert.equal(setup.terminal.dataHandlers.size, 1);

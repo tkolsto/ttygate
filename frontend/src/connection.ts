@@ -274,7 +274,7 @@ export class TerminalConnectionController {
     this.#inputDisposers.push(this.#dependencies.terminal.onResize((size) => {
       if (this.#isCurrent(generation)) this.#resize?.offer(size);
     }));
-    this.#resize.offer(this.#dependencies.terminal.size());
+    this.#resize.sendNow(this.#dependencies.terminal.size());
 
     if (!target.readOnly) {
       this.#inputDisposers.push(this.#dependencies.terminal.onData((data) => {

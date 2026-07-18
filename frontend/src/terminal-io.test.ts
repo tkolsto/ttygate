@@ -103,6 +103,18 @@ test("resize coalescing validates dimensions and sends only the latest distinct 
   }
 });
 
+test("initial resize can be sent immediately and suppresses an identical observer event", () => {
+  const scheduler = new ManualScheduler();
+  const sent: Array<{ cols: number; rows: number }> = [];
+  const resize = new ResizeCoalescer((size) => sent.push(size), scheduler);
+
+  resize.sendNow({ cols: 80, rows: 24 });
+  resize.offer({ cols: 80, rows: 24 });
+
+  assert.deepEqual(sent, [{ cols: 80, rows: 24 }]);
+  assert.equal(scheduler.pending.size, 0);
+});
+
 test("disposing resize coalescing removes its timer and prevents late sends", () => {
   const scheduler = new ManualScheduler();
   const sent: Array<{ cols: number; rows: number }> = [];

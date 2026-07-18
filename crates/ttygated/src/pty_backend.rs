@@ -141,31 +141,26 @@ impl PtyChild {
         grace: std::time::Duration,
         mut signal: impl FnMut(Pid, Signal) -> Result<(), BackendError>,
     ) -> Result<std::process::ExitStatus, BackendError> {
-        let mut cleanup_failed = signal(self.process_group, Signal::SIGHUP).is_err();
+        // A failed graceful signal is recoverable only if the mandatory final
+        // group cleanup succeeds. The final signal therefore owns the result.
+        let _ = signal(self.process_group, Signal::SIGHUP);
         let grace_deadline = tokio::time::Instant::now() + grace;
         match tokio::time::timeout_at(grace_deadline, self.inner.wait()).await {
             Ok(result) => {
                 let status = result.map_err(|_| BackendError::Unavailable);
                 tokio::time::sleep_until(grace_deadline).await;
-                cleanup_failed |= signal(self.process_group, Signal::SIGKILL).is_err();
-                if cleanup_failed {
-                    Err(BackendError::Unavailable)
-                } else {
-                    status
-                }
+                signal(self.process_group, Signal::SIGKILL)?;
+                status
             }
             Err(_) => {
-                cleanup_failed |= signal(self.process_group, Signal::SIGKILL).is_err();
+                let cleanup = signal(self.process_group, Signal::SIGKILL);
                 let status = self
                     .inner
                     .wait()
                     .await
                     .map_err(|_| BackendError::Unavailable);
-                if cleanup_failed {
-                    Err(BackendError::Unavailable)
-                } else {
-                    status
-                }
+                cleanup?;
+                status
             }
         }
     }
@@ -174,14 +169,9 @@ impl PtyChild {
         &self,
         grace: std::time::Duration,
     ) -> Result<(), BackendError> {
-        let mut cleanup_failed = signal_group(self.process_group, Signal::SIGHUP).is_err();
+        let _ = signal_group(self.process_group, Signal::SIGHUP);
         tokio::time::sleep(grace).await;
-        cleanup_failed |= kill_group_if_present(self.process_group).is_err();
-        if cleanup_failed {
-            Err(BackendError::Unavailable)
-        } else {
-            Ok(())
-        }
+        kill_group_if_present(self.process_group)
     }
 
     #[cfg(test)]
@@ -300,7 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signal_error_still_waits_for_and_reaps_the_child() {
+    async fn graceful_signal_error_is_recovered_by_successful_final_cleanup() {
         let running = PtyProcessBackend::spawn(&target(&[]), Resize::new(80, 24).unwrap())
             .expect("spawn fixture");
         let (mut reader, _writer, mut child) = running.into_parts();
@@ -313,6 +303,32 @@ mod tests {
                 signal_group(group, signal)?;
                 if first && signal == Signal::SIGHUP {
                     first = false;
+                    Err(BackendError::Unavailable)
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            kill(Pid::from_raw(pid.as_raw()), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn final_signal_error_is_reported_after_reaping_the_child() {
+        let running =
+            PtyProcessBackend::spawn(&target(&["ignore-hup"]), Resize::new(80, 24).unwrap())
+                .expect("spawn fixture");
+        let (mut reader, _writer, mut child) = running.into_parts();
+        let mut output = Vec::new();
+        read_until(&mut reader, &mut output, b"READY").await;
+        let pid = child.process_group;
+        let result = child
+            .terminate_with(Duration::from_millis(100), |group, signal| {
+                signal_group(group, signal)?;
+                if signal == Signal::SIGKILL {
                     Err(BackendError::Unavailable)
                 } else {
                     Ok(())

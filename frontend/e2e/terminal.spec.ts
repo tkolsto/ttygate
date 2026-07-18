@@ -12,9 +12,34 @@ test.afterAll(async () => {
   await server.stop();
 });
 
+test("desktop terminal layout remains viewport-bounded after xterm fitting", async ({ page }) => {
+  await page.goto(server.origin);
+  await expect(page.getByRole("status")).toHaveText("Ready. Choose a configured target.");
+
+  await expect.poll(async () => page.evaluate(() => ({
+    viewport: window.innerHeight,
+    document: document.documentElement.scrollHeight,
+    shell: document.getElementById("terminal-shell")?.getBoundingClientRect().height ?? 0,
+  }))).toEqual(expect.objectContaining({
+    viewport: 800,
+    document: 800,
+  }));
+  const shellHeight = await page.locator("#terminal-shell").evaluate(
+    (element) => element.getBoundingClientRect().height,
+  );
+  expect(shellHeight).toBeGreaterThan(240);
+  expect(shellHeight).toBeLessThan(650);
+});
+
 test("real browser connects to a PTY, resizes, pastes, closes, and observes natural exit", async ({
   page,
 }) => {
+  const serverControls: string[] = [];
+  page.on("websocket", (socket) => {
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload === "string") serverControls.push(payload);
+    });
+  });
   await page.goto(server.origin);
   await expect(page.getByRole("status")).toHaveText("Ready. Choose a configured target.");
   await expect(page.getByLabel("Configured target")).toHaveValue("interactive");
@@ -50,6 +75,10 @@ test("real browser connects to a PTY, resizes, pastes, closes, and observes natu
   await page.locator(".xterm-helper-textarea").focus();
   await page.keyboard.type("exit");
   await page.keyboard.press("Enter");
+  await expect.poll(() => serverControls.slice(-2)).toEqual([
+    '{"version":1,"type":"exit-status","status":{"kind":"code","code":0}}',
+    '{"version":1,"type":"close","reason":"exited"}',
+  ]);
   await expect(page.getByRole("status")).toHaveText("The terminal process exited with code 0.");
 
   const current = new URL(page.url());
