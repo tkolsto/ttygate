@@ -3,9 +3,12 @@ use std::{
     fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
+use http::HeaderName;
+use ipnet::IpNet;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -23,6 +26,7 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub mode: ServerMode,
     pub public_url: String,
+    pub transport: ServerTransport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -33,15 +37,27 @@ pub enum ServerMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthConfig {
-    pub provider: AuthProvider,
-    pub user: String,
+pub enum ServerTransport {
+    Plaintext,
+    DirectTls(TlsConfig),
+    TrustedProxy(TrustedProxyConfig),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AuthProvider {
-    Dev,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedProxyConfig {
+    pub trusted_sources: Vec<IpNet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthConfig {
+    Dev { user: String },
+    TrustedProxy { identity_header: HeaderName },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,13 +225,43 @@ struct RawServer {
     bind: SocketAddr,
     mode: ServerMode,
     public_url: String,
+    #[serde(default)]
+    tls: Option<RawTls>,
+    #[serde(default)]
+    trusted_proxy: Option<RawTrustedProxy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    #[serde(default)]
+    certificate: Option<PathBuf>,
+    #[serde(default)]
+    private_key: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTrustedProxy {
+    #[serde(default)]
+    trusted_sources: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAuth {
-    provider: AuthProvider,
-    user: String,
+    provider: RawAuthProvider,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    identity_header: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawAuthProvider {
+    Dev,
+    TrustedProxy,
 }
 
 #[derive(Deserialize)]
@@ -272,6 +318,8 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
         toml::from_str(source).map_err(|error: toml::de::Error| ConfigError::Parse {
             message: error.message().to_owned(),
         })?;
+    let transport = convert_transport(raw.server.tls, raw.server.trusted_proxy)?;
+    let auth = convert_auth(raw.auth)?;
     let targets = raw
         .targets
         .into_iter()
@@ -280,7 +328,6 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
         .collect::<Result<Vec<_>, _>>()?;
 
     validate_literal_path(&raw.audit.path, "audit.path")?;
-    validate_nonempty(&raw.auth.user, "auth.user", "must not be empty")?;
     validate_nonempty(
         &raw.server.public_url,
         "server.public_url",
@@ -294,11 +341,9 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
             bind: raw.server.bind,
             mode: raw.server.mode,
             public_url: raw.server.public_url,
+            transport,
         },
-        auth: AuthConfig {
-            provider: raw.auth.provider,
-            user: raw.auth.user,
-        },
+        auth,
         audit: AuditConfig {
             format: raw.audit.format,
             path: raw.audit.path,
@@ -312,6 +357,106 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
         },
         targets,
     })
+}
+
+fn convert_transport(
+    tls: Option<RawTls>,
+    trusted_proxy: Option<RawTrustedProxy>,
+) -> Result<ServerTransport, ConfigError> {
+    match (tls, trusted_proxy) {
+        (None, None) => Ok(ServerTransport::Plaintext),
+        (Some(_), Some(_)) => Err(validation(
+            "server.transport".into(),
+            "direct TLS and trusted proxy cannot both be configured",
+        )),
+        (Some(tls), None) => {
+            let certificate = tls.certificate.ok_or_else(|| {
+                validation(
+                    "server.tls.certificate".into(),
+                    "is required when direct TLS is configured",
+                )
+            })?;
+            let private_key = tls.private_key.ok_or_else(|| {
+                validation(
+                    "server.tls.private_key".into(),
+                    "is required when direct TLS is configured",
+                )
+            })?;
+            validate_literal_path(&certificate, "server.tls.certificate")?;
+            validate_literal_path(&private_key, "server.tls.private_key")?;
+            Ok(ServerTransport::DirectTls(TlsConfig {
+                certificate,
+                private_key,
+            }))
+        }
+        (None, Some(proxy)) => {
+            let sources = proxy.trusted_sources.ok_or_else(|| {
+                validation(
+                    "server.trusted_proxy.trusted_sources".into(),
+                    "is required when trusted proxy is configured",
+                )
+            })?;
+            if sources.is_empty() {
+                return Err(validation(
+                    "server.trusted_proxy.trusted_sources".into(),
+                    "must contain at least one trusted source CIDR",
+                ));
+            }
+            let trusted_sources = sources
+                .iter()
+                .map(|source| {
+                    IpNet::from_str(source).map_err(|_| {
+                        validation(
+                            "server.trusted_proxy.trusted_sources".into(),
+                            "contains an invalid CIDR",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ServerTransport::TrustedProxy(TrustedProxyConfig {
+                trusted_sources,
+            }))
+        }
+    }
+}
+
+fn convert_auth(raw: RawAuth) -> Result<AuthConfig, ConfigError> {
+    match raw.provider {
+        RawAuthProvider::Dev => {
+            if raw.identity_header.is_some() {
+                return Err(validation(
+                    "auth.identity_header".into(),
+                    "is only valid for trusted-proxy authentication",
+                ));
+            }
+            let user = raw.user.ok_or_else(|| {
+                validation("auth.user".into(), "is required for dev authentication")
+            })?;
+            validate_nonempty(&user, "auth.user", "must not be empty")?;
+            Ok(AuthConfig::Dev { user })
+        }
+        RawAuthProvider::TrustedProxy => {
+            if raw.user.is_some() {
+                return Err(validation(
+                    "auth.user".into(),
+                    "is only valid for dev authentication",
+                ));
+            }
+            let identity_header = raw.identity_header.ok_or_else(|| {
+                validation(
+                    "auth.identity_header".into(),
+                    "is required for trusted-proxy authentication",
+                )
+            })?;
+            let identity_header = HeaderName::from_str(&identity_header).map_err(|_| {
+                validation(
+                    "auth.identity_header".into(),
+                    "must be a valid HTTP header name",
+                )
+            })?;
+            Ok(AuthConfig::TrustedProxy { identity_header })
+        }
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -621,8 +766,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        AuditFormat, AuthProvider, ConfigError, PtyTarget, ServerMode, SshTarget, SshUserPolicy,
-        Target, TargetAllowlist, load, parse,
+        AuditFormat, AuthConfig, ConfigError, PtyTarget, ServerMode, ServerTransport, SshTarget,
+        SshUserPolicy, Target, TargetAllowlist, load, parse,
     };
 
     const COMPLETE_CONFIG: &str = r#"
@@ -667,7 +812,11 @@ user_policy = "same-as-auth-user"
 
         assert_eq!(config.server.mode, ServerMode::Dev);
         assert_eq!(config.server.bind.to_string(), "127.0.0.1:7681");
-        assert_eq!(config.auth.provider, AuthProvider::Dev);
+        assert!(matches!(
+            config.auth,
+            AuthConfig::Dev { ref user } if user == "local"
+        ));
+        assert_eq!(config.server.transport, ServerTransport::Plaintext);
         assert_eq!(config.audit.format, AuditFormat::Json);
         assert_eq!(config.limits.max_sessions, 8);
         assert_eq!(config.targets.len(), 2);
@@ -1191,9 +1340,122 @@ user_mapping = { alice = "one", alice = "two" }"#,
     }
 
     #[test]
-    fn production_mode_parses_without_chunk_2_1_gating() {
-        let source = COMPLETE_CONFIG.replace("mode = \"dev\"", "mode = \"production\"");
-        assert_eq!(parse(&source).unwrap().server.mode, ServerMode::Production);
+    fn parses_typed_plaintext_direct_tls_and_trusted_proxy_contracts() {
+        let plaintext = parse(COMPLETE_CONFIG).unwrap();
+        assert_eq!(plaintext.server.transport, ServerTransport::Plaintext);
+
+        let direct_tls = COMPLETE_CONFIG.replace(
+            "public_url = \"http://127.0.0.1:7681\"",
+            r#"public_url = "https://127.0.0.1:7681"
+
+[server.tls]
+certificate = "/etc/ttygate/tls/certificate.pem"
+private_key = "/etc/ttygate/tls/private-key.pem""#,
+        );
+        let direct_tls = parse(&direct_tls).unwrap();
+        assert!(matches!(
+            direct_tls.server.transport,
+            ServerTransport::DirectTls(ref tls)
+                if tls.certificate == PathBuf::from("/etc/ttygate/tls/certificate.pem")
+                    && tls.private_key == PathBuf::from("/etc/ttygate/tls/private-key.pem")
+        ));
+
+        let trusted_proxy = COMPLETE_CONFIG
+            .replace("mode = \"dev\"", "mode = \"production\"")
+            .replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                r#"public_url = "https://terminal.example.test"
+
+[server.trusted_proxy]
+trusted_sources = ["127.0.0.1/32", "::1/128"]"#,
+            )
+            .replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"",
+            );
+        let trusted_proxy = parse(&trusted_proxy).unwrap();
+        assert!(matches!(
+            trusted_proxy.auth,
+            AuthConfig::TrustedProxy { ref identity_header }
+                if identity_header.as_str() == "x-authenticated-user"
+        ));
+        assert!(matches!(
+            trusted_proxy.server.transport,
+            ServerTransport::TrustedProxy(ref proxy)
+                if proxy.trusted_sources.iter().map(ToString::to_string).collect::<Vec<_>>()
+                    == ["127.0.0.1/32", "::1/128"]
+        ));
+    }
+
+    #[test]
+    fn provider_specific_missing_and_stray_fields_fail_closed() {
+        let cases = [
+            COMPLETE_CONFIG.replace("user = \"local\"\n", ""),
+            COMPLETE_CONFIG.replace(
+                "user = \"local\"",
+                "user = \"local\"\nidentity_header = \"x-user\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"x-user\"\nuser = \"stray\"",
+            ),
+        ];
+        for source in cases {
+            assert!(parse(&source).is_err(), "provider-specific fields accepted");
+        }
+    }
+
+    #[test]
+    fn partial_tls_and_proxy_sections_have_actionable_field_errors() {
+        let cases = [
+            (
+                COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"",
+                ),
+                "server.tls.private_key",
+            ),
+            (
+                COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://127.0.0.1:7681\"\n[server.trusted_proxy]\ntrusted_sources = []",
+                ),
+                "server.trusted_proxy.trusted_sources",
+            ),
+        ];
+        for (source, field) in cases {
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains(field), "{error:?} did not contain {field:?}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_and_identity_header_are_typed_and_canonical() {
+        let source = COMPLETE_CONFIG
+            .replace("mode = \"dev\"", "mode = \"production\"")
+            .replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"10.0.0.0/8\"]",
+            )
+            .replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"X-Authenticated-User\"",
+            );
+        let config = parse(&source).unwrap();
+        assert!(matches!(
+            config.auth,
+            AuthConfig::TrustedProxy { ref identity_header }
+                if identity_header.as_str() == "x-authenticated-user"
+        ));
+        assert!(matches!(
+            config.server.transport,
+            ServerTransport::TrustedProxy(ref proxy)
+                if proxy.trusted_sources[0].to_string() == "10.0.0.0/8"
+        ));
     }
 
     #[test]

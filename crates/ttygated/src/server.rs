@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 
 use crate::{
     auth::{AuthContext, AuthProvider, DevAuthProvider},
-    config::{Config, Limits, TargetAllowlist},
+    config::{AuthConfig, Config, Limits, TargetAllowlist},
     origin::OriginPolicy,
     protocol::MAX_BINARY_BYTES,
     session::SessionManager,
@@ -57,10 +57,14 @@ impl AppState {
     pub fn from_config(config: &Config) -> Result<Self, ServerBuildError> {
         let origin =
             OriginPolicy::new(&config.server.public_url).map_err(|_| ServerBuildError::Origin)?;
-        let auth = Arc::new(
-            DevAuthProvider::new(config.auth.user.clone())
-                .map_err(|_| ServerBuildError::Identity)?,
-        );
+        let auth = match &config.auth {
+            AuthConfig::Dev { user } => Arc::new(
+                DevAuthProvider::new(user.clone()).map_err(|_| ServerBuildError::Identity)?,
+            ) as Arc<dyn AuthProvider>,
+            AuthConfig::TrustedProxy { .. } => {
+                return Err(ServerBuildError::AuthenticationUnavailable);
+            }
+        };
         let targets =
             TargetAllowlist::new(config.targets.clone()).map_err(|_| ServerBuildError::Targets)?;
         Ok(Self::new(
@@ -89,6 +93,8 @@ pub enum ServerBuildError {
     Identity,
     #[error("configured target allowlist is invalid")]
     Targets,
+    #[error("configured authentication provider is not implemented")]
+    AuthenticationUnavailable,
 }
 
 pub fn build_router(state: AppState) -> Router {
