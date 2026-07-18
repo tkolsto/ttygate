@@ -372,6 +372,57 @@ test("curated server errors and malformed frames fail into stable distinct state
   assert.ok(!JSON.stringify(malformed.states.at(-1)).includes("credential"));
 });
 
+test("frontend_exposes_stable_distinct_ssh_failure_states", async () => {
+  for (const [code, expected] of [
+    ["ssh-host-key-failed", "ssh-host-key-failed"],
+    ["ssh-connection-failed", "ssh-connection-failed"],
+    ["ssh-authentication-failed", "ssh-authentication-failed"],
+    ["ssh-policy-denied", "ssh-policy-denied"],
+    ["ssh-failed", "ssh-failed"],
+  ] as const) {
+    const setup = harness();
+    await setup.controller.start();
+    await setup.controller.connect("shell");
+    const socket = setup.sockets[0]!;
+    socket.open();
+    socket.message(encodeServerControl({
+      type: "error",
+      code,
+      message: "This server text must not select the frontend state.",
+    }));
+    assert.equal(setup.states.at(-1)?.phase, expected);
+    assert.ok(!JSON.stringify(setup.states.at(-1)).includes("server text"));
+  }
+});
+
+test("hostile_protocol_values_cannot_select_any_ssh_argument", async () => {
+  const sentinels = [
+    "-oProxyCommand=credential",
+    "root@host.example",
+    "/tmp/identity-secret",
+    "ssh.example.test",
+  ];
+
+  for (const sentinel of sentinels) {
+    const setup = harness();
+    await setup.controller.start();
+    await setup.controller.connect("shell");
+    const socket = setup.sockets[0]!;
+    socket.open();
+    socket.message(JSON.stringify({
+      version: 1,
+      type: "error",
+      code: "ssh-failed",
+      message: "The SSH session could not be established safely.",
+      sshArgument: sentinel,
+    }));
+
+    assert.equal(setup.states.at(-1)?.phase, "protocol-error");
+    assert.ok(socket.sent.every((value) => !String(value).includes(sentinel)));
+    assert.ok(!JSON.stringify(setup.states.at(-1)).includes(sentinel));
+  }
+});
+
 test("undrained terminal output fails closed instead of growing without bound", async () => {
   const setup = harness();
   await setup.controller.start();

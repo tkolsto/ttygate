@@ -105,11 +105,6 @@ fn safe_session_error(error: SessionError) -> BridgeFailure {
         SessionError::SpawnUnavailable
         | SessionError::BackendUnavailable
         | SessionError::AuditUnavailable
-        | SessionError::SshHostKeyFailed
-        | SessionError::SshConnectionFailed
-        | SessionError::SshAuthenticationFailed
-        | SessionError::SshPolicyDenied
-        | SessionError::SshFailed
         | SessionError::Closed
         | SessionError::InvalidTransition => BridgeFailure {
             error: error_control(
@@ -119,7 +114,48 @@ fn safe_session_error(error: SessionError) -> BridgeFailure {
             close_reason: CloseReason::InternalError,
             websocket_code: 1011,
         },
+        SessionError::SshHostKeyFailed => BridgeFailure {
+            error: error_control(
+                "ssh-host-key-failed",
+                "The SSH host identity could not be verified.",
+            ),
+            close_reason: CloseReason::InternalError,
+            websocket_code: 1011,
+        },
+        SessionError::SshConnectionFailed => BridgeFailure {
+            error: error_control(
+                "ssh-connection-failed",
+                "The SSH connection could not be established.",
+            ),
+            close_reason: CloseReason::InternalError,
+            websocket_code: 1011,
+        },
+        SessionError::SshAuthenticationFailed => BridgeFailure {
+            error: error_control(
+                "ssh-authentication-failed",
+                "SSH authentication was rejected.",
+            ),
+            close_reason: CloseReason::Policy,
+            websocket_code: 1008,
+        },
+        SessionError::SshPolicyDenied => BridgeFailure {
+            error: error_control("ssh-policy-denied", "SSH access was denied by policy."),
+            close_reason: CloseReason::Policy,
+            websocket_code: 1008,
+        },
+        SessionError::SshFailed => BridgeFailure {
+            error: error_control(
+                "ssh-failed",
+                "The SSH session could not be established safely.",
+            ),
+            close_reason: CloseReason::InternalError,
+            websocket_code: 1011,
+        },
     }
+}
+
+fn supports_redeemed_target(target: &Target) -> bool {
+    matches!(target, Target::Pty(_) | Target::Ssh(_))
 }
 
 fn terminal_controls(closed: SessionClosed) -> Vec<ServerControl> {
@@ -262,7 +298,7 @@ pub async fn accept_upgrade(
         }
     };
     let (target, reservation) = grant.into_parts();
-    if !matches!(target, Target::Pty(_)) {
+    if !supports_redeemed_target(&target) {
         if record_session_denial(
             &audit,
             &identity,
@@ -924,6 +960,7 @@ mod tests {
     use axum::extract::ws::Message;
 
     use crate::{
+        config::{SshTarget, SshUserPolicy, Target},
         protocol::{CloseReason, ExitStatus, ServerControl},
         session::{
             ChildOutcome, SessionCloseReason, SessionClosed, SessionError, SessionState,
@@ -935,9 +972,85 @@ mod tests {
     use super::{
         BRIDGE_CHANNEL_CAPACITY, HANDSHAKE_MAX_BYTES, HandshakeError, SendCompletion,
         close_or_cancel, parse_handshake, race_send_with_completion, resolve_session_operation,
-        safe_session_error, safe_ticket_error, send_bounded, stop_input_before, terminal_controls,
-        terminal_operation_result,
+        safe_session_error, safe_ticket_error, send_bounded, stop_input_before,
+        supports_redeemed_target, terminal_controls, terminal_operation_result,
     };
+
+    #[test]
+    fn websocket_admits_configured_ssh_targets_without_new_authority_fields() {
+        let target = Target::Ssh(SshTarget {
+            name: "production".into(),
+            host: "ssh.example.test".into(),
+            port: 22,
+            ssh_executable: "/usr/bin/ssh".into(),
+            identity_file: "/run/ttygate/id_ed25519".into(),
+            known_hosts: "/run/ttygate/known_hosts".into(),
+            user_policy: SshUserPolicy::Fixed("operator".into()),
+            read_only: false,
+        });
+
+        assert!(supports_redeemed_target(&target));
+    }
+
+    #[test]
+    fn websocket_maps_unknown_and_mismatched_keys_to_safe_host_key_failure() {
+        let unknown = safe_session_error(SessionError::SshHostKeyFailed);
+        let mismatched = safe_session_error(SessionError::SshHostKeyFailed);
+
+        for failure in [unknown, mismatched] {
+            assert_eq!(failure.websocket_code, 1011);
+            assert_eq!(failure.close_reason, CloseReason::InternalError);
+            assert!(matches!(
+                failure.error,
+                ServerControl::Error(ref message)
+                    if message.code == "ssh-host-key-failed"
+                        && message.message == "The SSH host identity could not be verified."
+            ));
+        }
+    }
+
+    #[test]
+    fn websocket_distinguishes_ssh_connection_authentication_policy_and_generic_failures() {
+        for (error, code, message, close_reason, websocket_code) in [
+            (
+                SessionError::SshConnectionFailed,
+                "ssh-connection-failed",
+                "The SSH connection could not be established.",
+                CloseReason::InternalError,
+                1011,
+            ),
+            (
+                SessionError::SshAuthenticationFailed,
+                "ssh-authentication-failed",
+                "SSH authentication was rejected.",
+                CloseReason::Policy,
+                1008,
+            ),
+            (
+                SessionError::SshPolicyDenied,
+                "ssh-policy-denied",
+                "SSH access was denied by policy.",
+                CloseReason::Policy,
+                1008,
+            ),
+            (
+                SessionError::SshFailed,
+                "ssh-failed",
+                "The SSH session could not be established safely.",
+                CloseReason::InternalError,
+                1011,
+            ),
+        ] {
+            let failure = safe_session_error(error);
+            assert_eq!(failure.websocket_code, websocket_code);
+            assert_eq!(failure.close_reason, close_reason);
+            assert!(matches!(
+                failure.error,
+                ServerControl::Error(ref error)
+                    if error.code == code && error.message == message
+            ));
+        }
+    }
 
     #[test]
     fn websocket_dependency_surface_compiles() {
