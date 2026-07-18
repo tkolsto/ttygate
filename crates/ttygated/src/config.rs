@@ -78,6 +78,13 @@ impl Target {
             Self::Ssh(target) => &target.name,
         }
     }
+
+    pub fn read_only(&self) -> bool {
+        match self {
+            Self::Pty(target) => target.read_only,
+            Self::Ssh(target) => target.read_only,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +112,10 @@ impl TargetAllowlist {
         self.targets
             .get(name)
             .ok_or_else(|| UnknownTarget(name.to_owned()))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Target> {
+        self.targets.values()
     }
 }
 

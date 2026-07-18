@@ -354,7 +354,81 @@ async fn session_creation_rejects_origin_identity_target_and_bad_bodies_safely()
 }
 
 #[tokio::test]
-async fn successful_session_creation_returns_only_an_opaque_ticket() {
+async fn target_catalog_exposes_only_configured_presentation_metadata() {
+    let app = app();
+    let cookie = provision_cookie(&app).await;
+    let response = response(
+        &app,
+        "POST",
+        "/api/targets",
+        Some(ORIGIN),
+        Some(&cookie),
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json(response).await;
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "targets": [
+                {
+                    "name": "shell",
+                    "readOnly": false
+                }
+            ]
+        })
+    );
+    let serialized = value.to_string();
+    for forbidden in [
+        "/bin/sh",
+        "argv",
+        "executable",
+        "credential",
+        "cookie",
+        "identity",
+        "known_hosts",
+        "host",
+        "ticket",
+    ] {
+        assert!(!serialized.contains(forbidden), "{forbidden} leaked");
+    }
+}
+
+#[tokio::test]
+async fn target_catalog_rejects_unauthorized_and_nonempty_requests() {
+    let app = app();
+    assert_eq!(
+        response(&app, "POST", "/api/targets", None, None, "",)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        response(&app, "POST", "/api/targets", Some(ORIGIN), None, "",)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let cookie = provision_cookie(&app).await;
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/targets",
+            Some(ORIGIN),
+            Some(&cookie),
+            r#"{"authority":"browser-controlled"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn successful_session_creation_returns_only_ticket_bound_presentation_metadata() {
     let app = app();
     let cookie = provision_cookie(&app).await;
     let response = response(
@@ -370,9 +444,29 @@ async fn successful_session_creation_returns_only_an_opaque_ticket() {
     let value = json(response).await;
     assert_eq!(
         value.as_object().unwrap().keys().collect::<Vec<_>>(),
-        vec!["ticket"]
+        vec!["target", "ticket"]
     );
     assert_eq!(value["ticket"].as_str().unwrap().len(), 43);
+    assert_eq!(
+        value["target"],
+        serde_json::json!({
+            "name": "shell",
+            "readOnly": false
+        })
+    );
+    let serialized = value.to_string();
+    for forbidden in [
+        "/bin/sh",
+        "argv",
+        "executable",
+        "credential",
+        "cookie",
+        "identity",
+        "known_hosts",
+        "host",
+    ] {
+        assert!(!serialized.contains(forbidden), "{forbidden} leaked");
+    }
 }
 
 #[tokio::test]
