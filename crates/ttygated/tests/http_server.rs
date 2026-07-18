@@ -16,6 +16,7 @@ use ipnet::IpNet;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 use ttygated::{
+    audit::AuditLog,
     auth::{
         AuthContext, AuthError, AuthProvider, DevAuthProvider, ProvisionedIdentity,
         SESSION_COOKIE_NAME, TrustedProxyAuthProvider,
@@ -39,6 +40,11 @@ fn limits() -> Limits {
         authentication_failures_per_window: 20,
         authentication_failure_window: std::time::Duration::from_secs(60),
     }
+}
+
+fn test_audit() -> AuditLog {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    AuditLog::open(&directory.path().join("audit.jsonl")).unwrap()
 }
 
 struct PeerRecordingAuthProvider {
@@ -114,6 +120,7 @@ fn app_with_auth_limits_and_ticket_ttl(
         TargetAllowlist::new(vec![target]).unwrap(),
         TicketStore::new(ticket_ttl, 32),
         limits,
+        test_audit(),
     ))
 }
 
@@ -141,6 +148,7 @@ fn trusted_proxy_app_with_limits(limits: Limits) -> axum::Router {
         TargetAllowlist::new(vec![target]).unwrap(),
         TicketStore::new(std::time::Duration::from_secs(10), 32),
         limits,
+        test_audit(),
     ))
 }
 
@@ -1237,6 +1245,7 @@ async fn listener_injects_the_actual_peer_into_authentication_context() {
             TargetAllowlist::new(vec![target]).unwrap(),
             TicketStore::new(std::time::Duration::from_secs(10), 32),
             limits(),
+            test_audit(),
         ),
     ));
 

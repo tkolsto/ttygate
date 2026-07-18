@@ -65,7 +65,7 @@ impl TlsTestServer {
     }
 
     async fn start_with_capacity(max_sessions: usize, max_sessions_per_user: usize) -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let certificate_path = directory.path().join("certificate.pem");
         let private_key_path = directory.path().join("private-key.pem");
         let marker = directory.path().join("fixture-pids");
@@ -95,7 +95,8 @@ impl TlsTestServer {
             startup::start_with(
                 &config,
                 ttygated::tls::load,
-                ttygated::server::AppState::from_config,
+                ttygated::audit::AuditLog::open,
+                ttygated::server::AppState::from_config_with_audit,
                 move |prepared| async move {
                     let startup::PreparedTransport::DirectTls(tls) = prepared.transport else {
                         unreachable!("TLS fixture parsed a non-TLS transport")
@@ -282,6 +283,7 @@ fn configuration(
     max_sessions: usize,
     max_sessions_per_user: usize,
 ) -> String {
+    let audit_path = marker.with_file_name("audit.jsonl");
     format!(
         r#"
 [server]
@@ -296,7 +298,7 @@ provider = "dev"
 user = "tls-test"
 [audit]
 format = "json"
-path = "./unused-tls-test-audit.jsonl"
+path = {audit_path:?}
 recording = false
 [limits]
 max_sessions = {max_sessions}

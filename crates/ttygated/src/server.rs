@@ -18,6 +18,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
+    audit::AuditLog,
     auth::{AuthContext, AuthProvider, DevAuthProvider, TrustedProxyAuthProvider},
     config::{AuthConfig, Config, Limits, ServerTransport, TargetAllowlist},
     origin::OriginPolicy,
@@ -47,6 +48,7 @@ enum AuthHttpError {
 
 #[derive(Clone)]
 pub struct AppState {
+    audit: Arc<AuditLog>,
     origin: Arc<OriginPolicy>,
     auth: Arc<dyn AuthProvider>,
     targets: Arc<TargetAllowlist>,
@@ -63,6 +65,7 @@ impl AppState {
         targets: TargetAllowlist,
         tickets: TicketStore,
         limits: Limits,
+        audit: AuditLog,
     ) -> Self {
         let authentication_failures = Arc::new(FixedWindowLimiter::new(
             limits.authentication_failures_per_window,
@@ -76,6 +79,7 @@ impl AppState {
         ));
         let sessions = SessionManager::new(limits, targets.clone());
         Self {
+            audit: Arc::new(audit),
             origin: Arc::new(origin),
             auth,
             targets: Arc::new(targets),
@@ -87,6 +91,15 @@ impl AppState {
     }
 
     pub fn from_config(config: &Config) -> Result<Self, ServerBuildError> {
+        let audit =
+            AuditLog::open(&config.audit.path).map_err(|_| ServerBuildError::AuditUnavailable)?;
+        Self::from_config_with_audit(config, audit)
+    }
+
+    pub fn from_config_with_audit(
+        config: &Config,
+        audit: AuditLog,
+    ) -> Result<Self, ServerBuildError> {
         let origin =
             OriginPolicy::new(&config.server.public_url).map_err(|_| ServerBuildError::Origin)?;
         let auth = match &config.auth {
@@ -114,6 +127,7 @@ impl AppState {
             targets,
             TicketStore::new(TICKET_TTL, TICKET_CAPACITY),
             config.limits.clone(),
+            audit,
         ))
     }
 
@@ -123,6 +137,10 @@ impl AppState {
 
     pub fn sessions(&self) -> Arc<SessionManager> {
         Arc::clone(&self.sessions)
+    }
+
+    pub fn audit(&self) -> Arc<AuditLog> {
+        Arc::clone(&self.audit)
     }
 }
 
@@ -136,6 +154,8 @@ pub enum ServerBuildError {
     Targets,
     #[error("configured authentication provider could not be constructed")]
     Authentication,
+    #[error("configured audit control could not be constructed")]
+    AuditUnavailable,
 }
 
 pub fn build_router(state: AppState) -> Router {

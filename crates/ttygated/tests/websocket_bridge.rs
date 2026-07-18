@@ -23,6 +23,7 @@ use tokio_tungstenite::{
     },
 };
 use ttygated::{
+    audit::AuditLog,
     auth::{AuthContext, AuthError, AuthProvider, DevAuthProvider, ProvisionedIdentity},
     config::{Limits, PtyTarget, SshTarget, SshUserPolicy, Target, TargetAllowlist},
     origin::OriginPolicy,
@@ -58,6 +59,11 @@ fn limits() -> Limits {
         authentication_failures_per_window: 20,
         authentication_failure_window: Duration::from_secs(60),
     }
+}
+
+fn test_audit() -> AuditLog {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    AuditLog::open(&directory.path().join("audit.jsonl")).unwrap()
 }
 
 fn target() -> Target {
@@ -103,6 +109,7 @@ fn state_with_all(
         TargetAllowlist::new(vec![target]).unwrap(),
         tickets,
         limits,
+        test_audit(),
     )
 }
 
