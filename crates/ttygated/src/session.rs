@@ -994,6 +994,10 @@ mod tests {
             max_sessions_per_user: per_identity,
             idle_timeout: Duration::from_secs(60),
             absolute_timeout: Duration::from_secs(600),
+            session_requests_per_window: 10,
+            session_request_window: Duration::from_secs(60),
+            authentication_failures_per_window: 20,
+            authentication_failure_window: Duration::from_secs(60),
         }
     }
 

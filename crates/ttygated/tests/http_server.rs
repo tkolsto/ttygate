@@ -34,6 +34,10 @@ fn limits() -> Limits {
         max_sessions_per_user: 4,
         idle_timeout: std::time::Duration::from_secs(5),
         absolute_timeout: std::time::Duration::from_secs(10),
+        session_requests_per_window: 10,
+        session_request_window: std::time::Duration::from_secs(60),
+        authentication_failures_per_window: 20,
+        authentication_failure_window: std::time::Duration::from_secs(60),
     }
 }
 

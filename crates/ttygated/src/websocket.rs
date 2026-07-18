@@ -1038,6 +1038,10 @@ mod tests {
                 max_sessions_per_user: 1,
                 idle_timeout: Duration::from_secs(2),
                 absolute_timeout: Duration::from_secs(2),
+                session_requests_per_window: 10,
+                session_request_window: Duration::from_secs(60),
+                authentication_failures_per_window: 20,
+                authentication_failure_window: Duration::from_secs(60),
             },
             crate::config::TargetAllowlist::new(vec![target]).unwrap(),
         );

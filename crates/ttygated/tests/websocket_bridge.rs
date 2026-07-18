@@ -53,6 +53,10 @@ fn limits() -> Limits {
         max_sessions_per_user: 4,
         idle_timeout: Duration::from_secs(5),
         absolute_timeout: Duration::from_secs(10),
+        session_requests_per_window: 10,
+        session_request_window: Duration::from_secs(60),
+        authentication_failures_per_window: 20,
+        authentication_failure_window: Duration::from_secs(60),
     }
 }
 
@@ -1055,6 +1059,10 @@ async fn connected_non_reader_backpressures_the_real_producer_until_timeout_reap
             max_sessions_per_user: 4,
             idle_timeout: Duration::from_secs(5),
             absolute_timeout: Duration::from_secs(2),
+            session_requests_per_window: 10,
+            session_request_window: Duration::from_secs(60),
+            authentication_failures_per_window: 20,
+            authentication_failure_window: Duration::from_secs(60),
         },
     );
     let ticket = state
