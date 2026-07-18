@@ -72,8 +72,9 @@ An attacker may control all browser request fields and protocol frames but must 
 Mitigations remain planned unless this document or a completed roadmap chunk
 records them as implemented and tested. Chunk 2.1 implements transport and
 startup gating. Chunk 2.2 implements the trusted reverse-proxy authentication
-boundary (Refs #9), but later rate, audit, SSH, recording, reconnect, packaging,
-and release controls remain incomplete.
+boundary (Refs #9). Chunk 2.3 implements bounded rate and ticket-time
+concurrency enforcement (Refs #24), but later audit, SSH, recording, reconnect,
+packaging, and release controls remain incomplete.
 
 | Threat | Security consequence | Required mitigation and validation |
 |---|---|---|
@@ -88,7 +89,7 @@ and release controls remain incomplete.
 | Transport interception or modification | Credentials, cookies, tickets, terminal data, or identity headers are exposed or altered. | Chunk 2.1 defaults development identity to loopback, refuses unsafe production combinations, preserves secure cookies and exact HTTPS/WSS Origin checks, and serves direct rustls without plaintext fallback. Chunk 2.2 supports a mutually exclusive trusted-proxy mode where the proxy terminates public TLS and the protected backend listener is plaintext. The proxy must be the only component able to reach the backend from a trusted CIDR. |
 | Secret leakage through URLs or logs | Tickets, commands, passwords, or terminal contents persist in histories, proxies, analytics, browser storage, DOM attributes, or lifecycle logs. | Keep tickets in a short-lived closure until the first WebSocket message, then overwrite them; use a fixed same-origin WebSocket URL with no query, fragment, credential, or subprotocol authority; avoid terminal input and output in lifecycle audit events; redact authentication failures; make output recording explicit and off by default. Test URL/DOM/storage/error exclusion and prove typed input does not enter audit logs. |
 | Sensitive or overexposed recordings | Output recordings reveal tokens, command output, personal data, or typed characters echoed by a program. | Treat recordings as sensitive even when nominally output-only. Keep them disabled by default, use restrictive permissions, document retention and access controls, and warn that shell echo makes input/output distinctions incomplete. |
-| Session floods, authentication floods, output floods, or orphan children | Memory, CPU, processes, file descriptors, or disk are exhausted. | Rate-limit session creation and auth failures; enforce global and per-user concurrency, idle and absolute timeouts, frame limits, and bounded output buffers with backpressure. Terminate and reap children on every close path. Test output floods and dropped WebSockets. |
+| Session floods, authentication floods, output floods, or orphan children | Memory, CPU, processes, file descriptors, or disk are exhausted. | Chunk 2.3 rate-limits session creation by authenticated identity and authentication failures by the actual listener peer IP using bounded monotonic fixed windows. `Forwarded`, `X-Forwarded-For`, and `X-Real-IP` are never rate-limit authority. It atomically reserves global and per-user concurrency at ticket issuance and transfers one reservation into the live session. Existing idle/absolute timeouts, frame limits, backpressure, and process teardown remain enforced. Distributed sources and upstream/host exhaustion remain residual risks. |
 | Unsafe administrator configuration | A public unauthenticated plaintext terminal is exposed unintentionally. | Chunk 2.1 makes loopback and development identity the development boundary, blocks public development identity even with TLS, rejects public production plaintext and contradictory transport/provider contracts, and returns stable startup errors before application construction or listener binding. Chunk 2.2 constructs the real trusted-proxy provider only from the paired typed auth/transport configuration and fails closed on peer or header violations. |
 | Dependency or CI compromise | Malicious code enters the browser, daemon, or release artifacts. | Pin dependency resolution, review updates, run `cargo deny`, CodeQL, dependency review, Rust lint/tests, frontend type checks/builds, and least-privilege CI. Release provenance and SBOM work belongs to the packaging milestone. |
 
@@ -114,8 +115,8 @@ Production mode must additionally:
 - reject the development identity provider (implemented in Chunk 2.1);
 - require direct TLS or an explicitly configured trusted reverse proxy (structural gating implemented in Chunk 2.1; actual socket-peer and identity enforcement implemented in Chunk 2.2);
 - reject public binding without the required transport and authentication boundary (implemented in Chunk 2.1);
-- rate-limit authentication failures and session creation;
-- enforce global and per-user concurrency limits;
+- rate-limit authentication failures and session creation (implemented in Chunk 2.3);
+- enforce global and per-user concurrency limits at ticket issuance (implemented in Chunk 2.3);
 - produce structured lifecycle events containing user, target, source, start, end, outcome, and denial reason; and
 - avoid terminal input and output in lifecycle logs unless an administrator separately enables sensitive recording.
 
@@ -152,7 +153,7 @@ The following are intentionally prohibited for v0.1:
 
 ## Validation strategy
 
-Security claims require rejection-path evidence. Unit tests cover configuration rejection, TLS path/permission/PEM validation, fail-before-bind startup ordering, allowlist resolution, ticket expiry/reuse/identity binding, trusted-proxy CIDR and semantic identity grammar, protocol parsing, frontend stale-event and ticket lifecycle, bounded UTF-8 input chunking, state transitions, read-only input handling, and limit enforcement. Integration tests cover verified direct HTTPS/WSS, wrong-Origin requests, plaintext and invalid-certificate rejection, unticketed WebSockets, real-browser identity/ticket/WebSocket/PTY flow, secret-free URLs, PTY lifecycle and resize, child teardown, bounded output, trusted and untrusted real proxy peers, cookie and ticket identity binding, and proxy WSS-to-PTY propagation. Rate limiting, audit persistence, SSH, recording, reconnect, packaging, and release hardening remain future work with their own negative tests.
+Security claims require rejection-path evidence. Unit tests cover configuration rejection, TLS path/permission/PEM validation, fail-before-bind startup ordering, allowlist resolution, ticket expiry/reuse/identity binding, trusted-proxy CIDR and semantic identity grammar, protocol parsing, frontend stale-event and ticket lifecycle, bounded UTF-8 input chunking, state transitions, read-only input handling, and bounded atomic rate/concurrency enforcement. Integration tests cover verified direct HTTPS/WSS, wrong-Origin requests, plaintext and invalid-certificate rejection, unticketed WebSockets, real-browser identity/ticket/WebSocket/PTY flow, secret-free URLs, PTY lifecycle and resize, child teardown, bounded output, trusted and untrusted real proxy peers, cookie and ticket identity binding, proxy WSS-to-PTY propagation, rate floods, ticket-time capacity, expiry, abandonment, wrong-identity redemption, and recovery. Audit persistence, SSH, recording, reconnect, packaging, and release hardening remain future work with their own negative tests.
 
 CI runs formatting, warning-free linting, tests, dependency policy, frontend checks, CodeQL, and dependency review. Manual release checks cover localhost-only defaults, reverse-proxy examples, fail-closed unsafe configurations, logs, packaging, and rendered public documentation. Passing one layer does not substitute for testing the others.
 
@@ -167,7 +168,7 @@ Even after the planned controls are implemented, v0.1 retains important risks:
 - **Endpoint or host compromise.** Malware in the browser, a vulnerable terminal emulator, or compromise of the daemon host can bypass application-level controls.
 - **Denial of service.** Limits and backpressure bound individual paths but cannot guarantee availability under host exhaustion, distributed traffic, or expensive allowlisted commands.
 - **Audit metadata.** Lifecycle logs exclude terminal contents by default but still reveal identities, targets, addresses, timing, and outcomes.
-- **Pre-release immaturity.** Interfaces and assumptions may change. M1's local terminal controls, Chunk 2.1's transport/startup gating, and Chunk 2.2's trusted-proxy authentication are implemented, but rate limiting, audit persistence, SSH execution, recording, reconnect, packaging, and deployment hardening remain incomplete. The current build must not be deployed as a terminal gateway.
+- **Pre-release immaturity.** Interfaces and assumptions may change. M1's local terminal controls, Chunk 2.1's transport/startup gating, Chunk 2.2's trusted-proxy authentication, and Chunk 2.3's rate/concurrency enforcement are implemented, but audit persistence, SSH execution, recording, reconnect, packaging, and deployment hardening remain incomplete. The current build must not be deployed as a terminal gateway.
 
 ## Maintaining this model
 

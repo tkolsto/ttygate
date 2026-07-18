@@ -319,7 +319,7 @@ Exit criteria (tests):
 
 - **Implemented in Chunk 2.1 (Refs #8):** dev vs production startup checks; rejection of development identity outside loopback and in production; rejection of public production plaintext and contradictory/incomplete transport contracts; fail-before-build/bind ordering; and one direct TLS listener with no HTTP fallback.
 - **Implemented in Chunk 2.2 (Refs #9):** trusted reverse-proxy authentication enforces actual socket-peer CIDRs, the single-header identity grammar, opaque secure browser sessions, ticket binding, and WSS-to-PTY identity propagation. The proxy remains responsible for upstream authentication, client-header stripping, canonical injection, TLS termination, and exclusive backend reachability.
-- Rate limits on session creation and auth failures; per-user/global concurrency limits.
+- **Implemented in Chunk 2.3 (Refs #24):** bounded monotonic fixed-window rate limits protect session creation by authenticated identity and authentication failures by actual listener peer IP. Ticket issuance atomically reserves global/per-user concurrency, and ticket redemption transfers the reservation exactly once to the live session. HTTP 503 responses distinguish `global-session-limit` from `identity-session-limit`; HTTP 429 responses include a positive `Retry-After`.
 - Structured JSON audit logs for session lifecycle.
 
 Exit criteria (tests):
