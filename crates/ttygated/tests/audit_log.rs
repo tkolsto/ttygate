@@ -1,10 +1,16 @@
 use std::{
+    fs,
     net::SocketAddr,
+    sync::{Arc, Barrier},
+    thread,
     time::{Duration, SystemTime},
 };
 
 use ttygated::{
-    audit::{AuditEvent, AuditTimestamp, CorrelationId, DenialCategory, DenialReason, SessionId},
+    audit::{
+        AuditError, AuditEvent, AuditLog, AuditTimestamp, CorrelationId, DenialCategory,
+        DenialReason, SessionId,
+    },
     ticket::Identity,
 };
 
@@ -117,4 +123,138 @@ fn audit_event_types_have_no_terminal_or_secret_fields() {
             assert!(!object.contains_key(forbidden), "{forbidden}");
         }
     }
+}
+
+fn denial(sequence: u8) -> AuditEvent {
+    AuditEvent::access_denied(
+        CorrelationId::from_bytes([sequence; 16]),
+        DenialCategory::Authentication,
+        DenialReason::IdentityRequired,
+        None,
+        None,
+        Some("127.0.0.1:4000".parse().unwrap()),
+        timestamp(u64::from(sequence)),
+    )
+}
+
+#[test]
+fn audit_open_creates_restrictive_literal_destination() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("literal-audit.jsonl");
+    let log = AuditLog::open(&path).unwrap();
+
+    log.record(&denial(1)).unwrap();
+
+    assert!(path.exists());
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let contents = fs::read_to_string(path).unwrap();
+    assert!(contents.ends_with('\n'));
+    assert_eq!(contents.lines().count(), 1);
+    assert!(serde_json::from_str::<serde_json::Value>(contents.trim_end()).is_ok());
+}
+
+#[test]
+fn audit_open_rejects_directory_symlink_special_and_incomplete_destinations() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let target = directory.path().join("target.jsonl");
+    fs::write(&target, b"{}\n").unwrap();
+    let symlink_path = directory.path().join("symlink.jsonl");
+    symlink(&target, &symlink_path).unwrap();
+    let incomplete = directory.path().join("incomplete.jsonl");
+    fs::write(&incomplete, b"{\"complete\":false}").unwrap();
+    fs::set_permissions(&incomplete, fs::Permissions::from_mode(0o600)).unwrap();
+    let missing_parent = directory.path().join("missing").join("audit.jsonl");
+
+    for path in [
+        directory.path(),
+        symlink_path.as_path(),
+        incomplete.as_path(),
+        missing_parent.as_path(),
+        std::path::Path::new("/dev/null"),
+    ] {
+        assert!(AuditLog::open(path).is_err(), "accepted {}", path.display());
+    }
+}
+
+#[test]
+fn audit_open_never_weakens_existing_permissions() {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("audit.jsonl");
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o644)
+        .open(&path)
+        .unwrap();
+
+    assert!(matches!(
+        AuditLog::open(&path),
+        Err(AuditError::UnsafeDestination)
+    ));
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn audit_append_preserves_complete_records_across_restart() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("audit.jsonl");
+    fs::write(&path, b"{\"existing\":true}\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    AuditLog::open(&path).unwrap().record(&denial(2)).unwrap();
+    drop(AuditLog::open(&path).unwrap());
+
+    let contents = fs::read_to_string(path).unwrap();
+    let lines = contents.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], r#"{"existing":true}"#);
+    assert!(serde_json::from_str::<serde_json::Value>(lines[1]).is_ok());
+}
+
+#[test]
+fn concurrent_audit_writers_produce_individually_parseable_jsonl() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("audit.jsonl");
+    let log = Arc::new(AuditLog::open(&path).unwrap());
+    let barrier = Arc::new(Barrier::new(17));
+    let mut writers = Vec::new();
+
+    for worker in 0_u8..16 {
+        let log = Arc::clone(&log);
+        let barrier = Arc::clone(&barrier);
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            for offset in 0_u8..16 {
+                log.record(&denial(worker.wrapping_mul(16).wrapping_add(offset)))
+                    .unwrap();
+            }
+        }));
+    }
+    barrier.wait();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    let contents = fs::read_to_string(path).unwrap();
+    assert!(contents.ends_with('\n'));
+    let lines = contents.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 256);
+    assert!(
+        lines
+            .iter()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
 }
