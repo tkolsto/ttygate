@@ -37,5 +37,6 @@ http-body-util = "0.1"
 rcgen = "0.14"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
