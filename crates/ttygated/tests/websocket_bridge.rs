@@ -114,7 +114,7 @@ fn state_with_all_and_audit(
     limits: Limits,
     audit: AuditLog,
 ) -> AppState {
-    AppState::new(
+    AppState::new_for_test(
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),

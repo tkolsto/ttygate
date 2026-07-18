@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     future::Future,
     io::Read,
@@ -77,6 +77,8 @@ pub enum SshPreparationError {
     CapabilityUnsupported,
     #[error("configured SSH material changed after startup preparation")]
     MaterialChanged,
+    #[error("prepared SSH targets do not exactly match the configured allowlist")]
+    PreparedTargetSetMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +157,62 @@ impl PreparedSshTargets {
 
     pub fn iter(&self) -> impl Iterator<Item = &PreparedSshTarget> {
         self.targets.values()
+    }
+
+    pub(crate) fn validate_for_targets(
+        &self,
+        targets: &[Target],
+    ) -> Result<(), SshPreparationError> {
+        let configured = targets
+            .iter()
+            .filter_map(|target| match target {
+                Target::Ssh(target) => Some(target.name.as_str()),
+                Target::Pty(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let prepared = self
+            .targets
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if configured == prepared {
+            Ok(())
+        } else {
+            Err(SshPreparationError::PreparedTargetSetMismatch)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_names<const N: usize>(names: [&str; N]) -> Self {
+        let snapshot = FileSnapshot {
+            device: 0,
+            inode: 0,
+            uid: 0,
+            mode: 0,
+            size: 0,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+            changed_seconds: 0,
+            changed_nanoseconds: 0,
+        };
+        let targets = names
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    PreparedSshTarget {
+                        name: name.to_owned(),
+                        executable: "/test/ssh".into(),
+                        executable_snapshot: snapshot.clone(),
+                        known_hosts: "/test/known-hosts".into(),
+                        known_hosts_snapshot: snapshot.clone(),
+                        identity: "/test/identity".into(),
+                        identity_snapshot: snapshot.clone(),
+                    },
+                )
+            })
+            .collect();
+        Self { targets }
     }
 }
 
@@ -239,14 +297,14 @@ pub async fn probe_capabilities(executable: &Path) -> Result<(), SshPreparationE
     let mut child = command
         .spawn()
         .map_err(|_| SshPreparationError::CapabilityUnsupported)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or(SshPreparationError::CapabilityUnsupported)?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(SshPreparationError::CapabilityUnsupported)?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_and_reap(&mut child).await;
+        return Err(SshPreparationError::CapabilityUnsupported);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_and_reap(&mut child).await;
+        return Err(SshPreparationError::CapabilityUnsupported);
+    };
     let completed = timeout(PROBE_TIMEOUT, async {
         let stdout_read = async {
             let mut bytes = Vec::new();
@@ -267,21 +325,36 @@ pub async fn probe_capabilities(executable: &Path) -> Result<(), SshPreparationE
         let (status, stdout, stderr) = tokio::join!(child.wait(), stdout_read, stderr_read);
         (status, stdout, stderr)
     })
-    .await
-    .map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    .await;
+    let completed = match completed {
+        Ok(completed) => completed,
+        Err(_) => {
+            terminate_and_reap(&mut child).await;
+            return Err(SshPreparationError::CapabilityUnsupported);
+        }
+    };
     let (status, stdout, stderr) = completed;
-    let status = status.map_err(|_| SshPreparationError::CapabilityUnsupported)?;
+    let status = match status {
+        Ok(status) => status,
+        Err(_) => {
+            terminate_and_reap(&mut child).await;
+            return Err(SshPreparationError::CapabilityUnsupported);
+        }
+    };
     let stdout = stdout.map_err(|_| SshPreparationError::CapabilityUnsupported)?;
     let stderr = stderr.map_err(|_| SshPreparationError::CapabilityUnsupported)?;
-    if !status.success()
-        || stdout.len() as u64 > MAX_PROBE_OUTPUT_BYTES
-        || stderr.len() as u64 > MAX_PROBE_OUTPUT_BYTES
+    if stdout.len() as u64 > MAX_PROBE_OUTPUT_BYTES || stderr.len() as u64 > MAX_PROBE_OUTPUT_BYTES
     {
+        terminate_and_reap(&mut child).await;
+        return Err(SshPreparationError::CapabilityUnsupported);
+    }
+    if !status.success() {
         return Err(SshPreparationError::CapabilityUnsupported);
     }
     let output =
         std::str::from_utf8(&stdout).map_err(|_| SshPreparationError::CapabilityUnsupported)?;
     let normalized = output.to_ascii_lowercase();
+    let values = parse_probe_output(&normalized)?;
     let required_values = [
         ("batchmode", &["yes", "true"][..]),
         ("clearallforwardings", &["yes", "true"][..]),
@@ -309,22 +382,34 @@ pub async fn probe_capabilities(executable: &Path) -> Result<(), SshPreparationE
         ("userknownhostsfile", &["/dev/null"][..]),
         ("globalknownhostsfile", &["/dev/null"][..]),
     ];
-    if required_values
-        .iter()
-        .any(|(key, values)| !has_probe_value(&normalized, key, values))
+    if required_values.iter().any(|(key, allowed)| {
+        values
+            .get(*key)
+            .is_none_or(|value| !allowed.contains(value))
+    }) || values.contains_key("proxycommand")
+        || values.contains_key("proxyjump")
     {
         return Err(SshPreparationError::CapabilityUnsupported);
     }
     Ok(())
 }
 
-fn has_probe_value(output: &str, key: &str, allowed_values: &[&str]) -> bool {
-    output.lines().any(|line| {
-        line.split_once(char::is_whitespace)
-            .is_some_and(|(found_key, value)| {
-                found_key == key && allowed_values.contains(&value.trim())
-            })
-    })
+async fn terminate_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+fn parse_probe_output(output: &str) -> Result<BTreeMap<&str, &str>, SshPreparationError> {
+    let mut values = BTreeMap::new();
+    for line in output.lines() {
+        let (key, value) = line
+            .split_once(char::is_whitespace)
+            .ok_or(SshPreparationError::CapabilityUnsupported)?;
+        if value.trim().is_empty() || values.insert(key, value.trim()).is_some() {
+            return Err(SshPreparationError::CapabilityUnsupported);
+        }
+    }
+    Ok(values)
 }
 
 #[derive(Clone, Copy)]
@@ -462,7 +547,11 @@ fn validate_identity(bytes: &[u8]) -> Result<(), SshPreparationError> {
         return Err(SshPreparationError::IdentityUnsafe);
     }
     let mut public_blob = take_ssh_string(&mut remaining)?;
-    let mut private_block = take_ssh_string(&mut remaining)?;
+    let private_block = take_ssh_string(&mut remaining)?;
+    if private_block.len() % 8 != 0 {
+        return Err(SshPreparationError::IdentityUnsafe);
+    }
+    let mut private_block = private_block;
     if !remaining.is_empty() {
         return Err(SshPreparationError::IdentityUnsafe);
     }
@@ -477,6 +566,8 @@ fn validate_identity(bytes: &[u8]) -> Result<(), SshPreparationError> {
     let inner_public = take_ssh_string(&mut private_block)?;
     let private_key = take_ssh_string(&mut private_block)?;
     let comment = take_ssh_string(&mut private_block)?;
+    // This is bounded envelope validation, not an independent credential
+    // implementation. OpenSSH derives and verifies the Ed25519 key material.
     if first_check != second_check
         || key_type != b"ssh-ed25519"
         || inner_public.len() != 32
@@ -493,7 +584,7 @@ fn validate_identity(bytes: &[u8]) -> Result<(), SshPreparationError> {
 
 fn canonical_padding(bytes: &[u8]) -> bool {
     !bytes.is_empty()
-        && bytes.len() <= u8::MAX as usize
+        && bytes.len() <= 8
         && bytes
             .iter()
             .copied()
@@ -507,13 +598,18 @@ fn take_ssh_string<'a>(remaining: &mut &'a [u8]) -> Result<&'a [u8], SshPreparat
         .and_then(|bytes| bytes.try_into().ok())
         .map(u32::from_be_bytes)
         .ok_or(SshPreparationError::IdentityUnsafe)? as usize;
+    let end = checked_string_end(4, length).ok_or(SshPreparationError::IdentityUnsafe)?;
     let value = remaining
-        .get(4..4 + length)
+        .get(4..end)
         .ok_or(SshPreparationError::IdentityUnsafe)?;
     *remaining = remaining
-        .get(4 + length..)
+        .get(end..)
         .ok_or(SshPreparationError::IdentityUnsafe)?;
     Ok(value)
+}
+
+fn checked_string_end(start: usize, length: usize) -> Option<usize> {
+    start.checked_add(length)
 }
 
 fn take_u32(remaining: &mut &[u8]) -> Result<u32, SshPreparationError> {
@@ -640,7 +736,7 @@ mod tests {
         .into_bytes()
     }
 
-    fn unencrypted_identity() -> Vec<u8> {
+    fn unencrypted_identity_with_padding(padding: &[u8]) -> Vec<u8> {
         let public = [0x42; 32];
         let mut binary = b"openssh-key-v1\0".to_vec();
         string(&mut binary, b"none");
@@ -659,9 +755,13 @@ mod tests {
         private_key[32..].copy_from_slice(&public);
         string(&mut private, &private_key);
         string(&mut private, b"synthetic-non-secret");
-        private.extend_from_slice(&[1, 2, 3, 4]);
+        private.extend_from_slice(padding);
         string(&mut binary, &private);
         pem_identity(&binary)
+    }
+
+    fn unencrypted_identity() -> Vec<u8> {
+        unencrypted_identity_with_padding(&[1])
     }
 
     fn incomplete_identity() -> Vec<u8> {
@@ -1111,6 +1211,122 @@ requesttty force\n"
                 SshPreparationError::CapabilityUnsupported,
                 "probe accepted output missing {omitted}"
             );
+        }
+    }
+
+    fn assert_process_absent_and_reaped(pid: i32) {
+        let pid = nix::unistd::Pid::from_raw(pid);
+        assert_eq!(
+            nix::sys::signal::kill(pid, None).unwrap_err(),
+            nix::errno::Errno::ESRCH
+        );
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)).unwrap_err(),
+            nix::errno::Errno::ECHILD
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_probe_timeout_kills_and_reaps_child() {
+        let material = Material::new();
+        let pid_path = material.directory.path().join("hanging-probe.pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nwhile :; do :; done\n",
+            pid_path.display()
+        );
+        write(&material.executable, script.as_bytes(), 0o700);
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            probe_capabilities(&material.executable).await.unwrap_err(),
+            SshPreparationError::CapabilityUnsupported
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        let pid = fs::read_to_string(pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_process_absent_and_reaped(pid);
+    }
+
+    #[tokio::test]
+    async fn capability_probe_output_limit_kills_and_reaps_flooding_child() {
+        let material = Material::new();
+        let pid_path = material.directory.path().join("flooding-probe.pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ntrap '' PIPE\nwhile :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; printf 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2; done\n",
+            pid_path.display()
+        );
+        write(&material.executable, script.as_bytes(), 0o700);
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            probe_capabilities(&material.executable).await.unwrap_err(),
+            SshPreparationError::CapabilityUnsupported
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        let pid = fs::read_to_string(pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_process_absent_and_reaped(pid);
+    }
+
+    #[test]
+    fn cipher_none_padding_requires_exact_aligned_openssh_block() {
+        assert!(super::validate_identity(&unencrypted_identity_with_padding(&[1])).is_ok());
+        for padding in [
+            Vec::new(),
+            vec![1, 2],
+            (1u8..=9).collect::<Vec<_>>(),
+            vec![2],
+        ] {
+            assert_eq!(
+                super::validate_identity(&unencrypted_identity_with_padding(&padding)).unwrap_err(),
+                SshPreparationError::IdentityUnsafe
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_string_maximal_length_prefix_uses_checked_bounds() {
+        assert!(super::checked_string_end(usize::MAX, 1).is_none());
+        let bytes = u32::MAX.to_be_bytes();
+        let mut remaining = bytes.as_slice();
+        assert_eq!(
+            super::take_ssh_string(&mut remaining).unwrap_err(),
+            SshPreparationError::IdentityUnsafe
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_probe_rejects_duplicate_contradictory_and_unsafe_proxy_transcripts() {
+        let material = Material::new();
+        for suffix in [
+            "batchmode no\n",
+            "proxycommand /tmp/unsafe\n",
+            "proxyjump unsafe.example\n",
+        ] {
+            let output = format!("{}{suffix}", strict_probe_output());
+            let script = format!("#!/bin/sh\nprintf '%s' '{output}'\n");
+            write(&material.executable, script.as_bytes(), 0o700);
+            assert_eq!(
+                probe_capabilities(&material.executable).await.unwrap_err(),
+                SshPreparationError::CapabilityUnsupported
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_openssh_accepts_required_capability_policy_when_available() {
+        let executable = Path::new("/usr/bin/ssh");
+        match fs::metadata(executable) {
+            Ok(metadata) if metadata.is_file() => probe_capabilities(executable).await.unwrap(),
+            Ok(_) => panic!("supported /usr/bin/ssh path is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("supported OpenSSH executable is unavailable; explicit skip")
+            }
+            Err(error) => panic!("could not inspect supported OpenSSH executable: {error}"),
         }
     }
 

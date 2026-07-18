@@ -23,6 +23,7 @@ For key-authenticated targets, pin at least:
 - `-F /dev/null`;
 - `-o StrictHostKeyChecking=yes`;
 - `-o UserKnownHostsFile=<literal configured path>`;
+- `-o GlobalKnownHostsFile=/dev/null`;
 - `-o BatchMode=yes`;
 - `-o IdentitiesOnly=yes` with an explicit identity policy; and
 - explicit host, port, and resolved username.
@@ -70,6 +71,11 @@ commands, observations, cleanup, and limitations are in
   Chunk 3.1.
 - Known-host files and private keys are sensitive policy material. Require
   literal server-configured paths and restrictive filesystem permissions.
+  `O_NOFOLLOW` protects only the final path component; administrator-controlled
+  parent namespaces remain part of the trust boundary.
+- A local PTY target running as the daemon UID can read identities readable by
+  that UID. PTY supervision is not OS-level credential isolation; use separate
+  UIDs or a stronger sandbox for less-trusted local commands.
 - Killing only ssh may leave remote work running after network loss. Local
   teardown must kill/reap ssh; remote command termination depends on sshd and
   remote process behavior and remains a documented distributed-systems limit.
