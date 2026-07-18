@@ -2344,7 +2344,7 @@ requesttty force\n"
     #[tokio::test]
     async fn ssh_admission_uses_private_fifo_and_never_raw_stderr() {
         let material = Material::new();
-        let script = b"#!/bin/sh\nwhile [ \"$1\" != \"-E\" ]; do shift; done\nlog=$2\nsleep 1\nprintf 'debug1: setup continues\\n' > \"$log\"\nprintf 'Authenticated to host.example using \"publickey\".\\n' >&2\nsleep 1\nprintf 'Authenticated to host.example using \"publickey\".\\n' > \"$log\"\n";
+        let script = b"#!/bin/sh\nwhile [ \"$1\" != \"-E\" ]; do shift; done\nlog=$2\nprintf 'READY\\n'\nread first\nprintf 'debug1: setup continues\\n' > \"$log\"\nprintf 'Authenticated to host.example using \"publickey\".\\n' >&2\nprintf 'PHASE2\\n'\nread second\nprintf 'Authenticated to host.example using \"publickey\".\\n' > \"$log\"\n";
         write(&material.executable, script, 0o700);
         let (_target, prepared) = prepared_runtime_fixture(&material).await;
         let spec = super::SshSpawnSpec::build(&prepared, "ignored").unwrap();
@@ -2361,29 +2361,79 @@ requesttty force\n"
         );
 
         let running = super::spawn(spec, crate::protocol::Resize::new(80, 24).unwrap()).unwrap();
-        let (_terminal, _writer, mut child, mut raw_stderr, client_log) = running.into_parts();
+        let (mut terminal, mut writer, mut child, mut raw_stderr, client_log) =
+            running.into_parts();
+        let wait = std::time::Duration::from_secs(10);
         let mut trusted = vec![0; 256];
-        let setup_count = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client_log.read(&mut trusted),
+        let mut terminal_bytes = Vec::new();
+        let mut terminal_buffer = [0_u8; 256];
+        while !terminal_bytes.windows(5).any(|window| window == b"READY") {
+            let count = tokio::time::timeout(
+                wait,
+                tokio::io::AsyncReadExt::read(&mut terminal, &mut terminal_buffer),
+            )
+            .await
+            .expect("terminal phase marker timed out")
+            .unwrap();
+            terminal_bytes.extend_from_slice(&terminal_buffer[..count]);
+        }
+        let mut pending_read = Box::pin(client_log.read(&mut trusted));
+        assert!(matches!(
+            futures_util::poll!(&mut pending_read),
+            std::task::Poll::Pending
+        ));
+        drop(pending_read);
+        tokio::time::timeout(
+            wait,
+            tokio::io::AsyncWriteExt::write_all(&mut writer, b"first\n"),
         )
         .await
-        .unwrap()
+        .expect("first phase signal timed out")
         .unwrap();
+        let setup_count = tokio::time::timeout(wait, client_log.read(&mut trusted))
+            .await
+            .expect("setup client-log line timed out")
+            .unwrap();
         let mut classifier = classifier_for_test("host.example");
         classifier.push(&trusted[..setup_count]);
         assert_eq!(classifier.classification(), None);
         let mut raw = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut raw_stderr, &mut raw)
+        let mut raw_buffer = [0_u8; 256];
+        while !raw.windows(17).any(|window| window == b"Authenticated to ") {
+            let count = tokio::time::timeout(
+                wait,
+                tokio::io::AsyncReadExt::read(&mut raw_stderr, &mut raw_buffer),
+            )
             .await
+            .expect("raw stderr marker timed out")
             .unwrap();
+            raw.extend_from_slice(&raw_buffer[..count]);
+        }
         assert!(raw.windows(17).any(|window| window == b"Authenticated to "));
-        assert!(child.wait().await.unwrap().success());
-        let count = client_log.read(&mut trusted).await.unwrap();
+        tokio::time::timeout(
+            wait,
+            tokio::io::AsyncWriteExt::write_all(&mut writer, b"second\n"),
+        )
+        .await
+        .expect("second phase signal timed out")
+        .unwrap();
+        let count = tokio::time::timeout(wait, client_log.read(&mut trusted))
+            .await
+            .expect("authenticated client-log line timed out")
+            .unwrap();
         classifier.push(&trusted[..count]);
         assert_eq!(
             classifier.classification(),
             Some(super::SshDiagnosticClass::Authenticated)
+        );
+        drop(writer);
+        drop(terminal);
+        assert!(
+            tokio::time::timeout(wait, child.wait())
+                .await
+                .expect("fixture child exit timed out")
+                .unwrap()
+                .success()
         );
         drop(client_log);
         assert!(!fifo_path.exists());
