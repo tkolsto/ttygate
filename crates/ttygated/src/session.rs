@@ -638,16 +638,9 @@ impl SessionManager {
         let target = match self.resolve_backend_target(&identity, target_name) {
             Ok(target) => target,
             Err(error) => {
-                if error == SessionError::SshPolicyDenied
-                    && self
-                        .record_denial(
-                            &identity,
-                            target_name,
-                            remote_address,
-                            DenialCategory::Target,
-                            DenialReason::SshUserPolicyDenied,
-                        )
-                        .is_err()
+                if self
+                    .record_backend_resolution_denial(&identity, target_name, remote_address, error)
+                    .is_err()
                 {
                     return Err(SessionError::AuditUnavailable);
                 }
@@ -717,16 +710,9 @@ impl SessionManager {
         let target = match self.resolve_backend_target(&identity, target_name) {
             Ok(target) => target,
             Err(error) => {
-                if error == SessionError::SshPolicyDenied
-                    && self
-                        .record_denial(
-                            &identity,
-                            target_name,
-                            remote_address,
-                            DenialCategory::Target,
-                            DenialReason::SshUserPolicyDenied,
-                        )
-                        .is_err()
+                if self
+                    .record_backend_resolution_denial(&identity, target_name, remote_address, error)
+                    .is_err()
                 {
                     return Err(SessionError::AuditUnavailable);
                 }
@@ -913,6 +899,27 @@ impl SessionManager {
                 occurred_at,
             ))
             .map_err(|_| ())
+    }
+
+    fn record_backend_resolution_denial(
+        &self,
+        identity: &Identity,
+        target_name: &str,
+        remote_address: Option<SocketAddr>,
+        error: SessionError,
+    ) -> Result<(), ()> {
+        let reason = match error {
+            SessionError::SshPolicyDenied => DenialReason::SshUserPolicyDenied,
+            SessionError::SpawnUnavailable => DenialReason::SessionUnavailable,
+            _ => return Ok(()),
+        };
+        self.record_denial(
+            identity,
+            target_name,
+            remote_address,
+            DenialCategory::Target,
+            reason,
+        )
     }
 
     pub async fn shutdown(&self) {
@@ -1831,6 +1838,7 @@ async fn join_worker(mut worker: JoinHandle<()>) {
 mod tests {
     use std::{
         fs,
+        future::Future,
         os::unix::process::ExitStatusExt,
         sync::{
             Arc, Barrier, Mutex as StdMutex,
@@ -1846,7 +1854,7 @@ mod tests {
         protocol::{MAX_BINARY_BYTES, Resize},
         ticket::{Identity, TicketGrant, TicketStore},
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
     use tokio::time::Instant;
 
     use super::{
@@ -2242,7 +2250,7 @@ mod tests {
     struct ScriptedSshBackend {
         script: SshAdmissionScript,
         spawn_count: AtomicUsize,
-        spawned: tokio::sync::Notify,
+        spawned: watch::Sender<bool>,
         admission: StdMutex<Option<mpsc::UnboundedSender<crate::ssh::SshDiagnosticClass>>>,
         reaped: Arc<AtomicBool>,
     }
@@ -2279,7 +2287,7 @@ mod tests {
                     *self.admission.lock().unwrap() = Some(admission_tx);
                 }
             }
-            self.spawned.notify_waiters();
+            self.spawned.send_replace(true);
             Ok(super::SpawnedBackend::TestSsh(running, admission_rx))
         }
     }
@@ -2288,6 +2296,7 @@ mod tests {
         backend: Arc<ScriptedSshBackend>,
         audit: Arc<AuditLog>,
         audit_path: std::path::PathBuf,
+        material_path: std::path::PathBuf,
         _directory: tempfile::TempDir,
     }
 
@@ -2304,19 +2313,23 @@ mod tests {
             let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
             let audit_path = directory.path().join("audit.jsonl");
             let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+            let material_path = directory.path().join("ssh-material");
+            fs::copy(fixture_target(false).executable, &material_path).unwrap();
             if failing_audit {
                 audit.fail_for_test();
             }
+            let (spawned, _) = watch::channel(false);
             Self {
                 backend: Arc::new(ScriptedSshBackend {
                     script,
                     spawn_count: AtomicUsize::new(0),
-                    spawned: tokio::sync::Notify::new(),
+                    spawned,
                     admission: StdMutex::new(None),
                     reaped: Arc::new(AtomicBool::new(false)),
                 }),
                 audit,
                 audit_path,
+                material_path,
                 _directory: directory,
             }
         }
@@ -2326,7 +2339,7 @@ mod tests {
         }
 
         fn manager_with_policy(&self, user_policy: SshUserPolicy) -> SessionManager {
-            let fixture = fixture_target(false).executable;
+            let fixture = self.material_path.clone();
             let target = SshTarget {
                 name: "remote".to_owned(),
                 host: "host.example".to_owned(),
@@ -2353,9 +2366,15 @@ mod tests {
         }
 
         async fn wait_spawned(&self) {
-            while self.spawn_count() == 0 {
-                self.backend.spawned.notified().await;
-            }
+            let mut spawned = self.backend.spawned.subscribe();
+            tokio::time::timeout(Duration::from_secs(3), spawned.wait_for(|spawned| *spawned))
+                .await
+                .expect("scripted SSH spawn timed out")
+                .expect("scripted SSH spawn signal closed");
+        }
+
+        fn invalidate_material(&self) {
+            fs::write(&self.material_path, b"changed after preparation").unwrap();
         }
 
         fn admit(&self) {
@@ -2402,13 +2421,15 @@ mod tests {
         let manager = fixture.manager();
         let mut lifecycle = manager.subscribe_events();
         assert!(matches!(
-            manager
-                .start(
+            fixture_deadline(
+                manager.start(
                     Identity::new("alice").unwrap(),
                     "remote",
                     Resize::new(80, 24).unwrap(),
-                )
-                .await,
+                ),
+                "SSH setup denial",
+            )
+            .await,
             Err(error) if error == expected_error
         ));
         fixture.wait_reaped().await;
@@ -2428,6 +2449,12 @@ mod tests {
                     && event["event_type"] != "session-ended")
         );
         assert_eq!(manager.capacity.active(), (0, 0));
+    }
+
+    async fn fixture_deadline<F: Future>(future: F, phase: &'static str) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(3), future)
+            .await
+            .unwrap_or_else(|_| panic!("{phase} timed out"))
     }
 
     #[tokio::test]
@@ -2454,6 +2481,54 @@ mod tests {
         assert_eq!(events[0]["event_type"], "access-denied");
         assert_eq!(events[0]["category"], "target");
         assert_eq!(events[0]["reason"], "ssh-user-policy-denied");
+    }
+
+    #[tokio::test]
+    async fn ssh_pre_spawn_build_failure_has_one_denial_and_no_session_lifecycle() {
+        for reserved in [false, true] {
+            let fixture = SshAdmissionFixture::new(SshAdmissionScript::Authenticated);
+            let manager = fixture.manager();
+            let mut lifecycle = manager.subscribe_events();
+            let identity = Identity::new("alice").unwrap();
+            let reservation = if reserved {
+                Some(
+                    manager
+                        .reserve(&identity, Instant::now() + Duration::from_secs(3))
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            fixture.invalidate_material();
+
+            let result = match reservation {
+                Some(reservation) => {
+                    manager
+                        .start_reserved(
+                            reservation,
+                            identity,
+                            "remote",
+                            Resize::new(80, 24).unwrap(),
+                        )
+                        .await
+                }
+                None => {
+                    manager
+                        .start(identity, "remote", Resize::new(80, 24).unwrap())
+                        .await
+                }
+            };
+            assert!(matches!(result, Err(SessionError::SpawnUnavailable)));
+            assert_eq!(fixture.spawn_count(), 0);
+            assert_eq!(manager.capacity.active(), (0, 0));
+            assert!(lifecycle.try_recv().is_err());
+            let events = fixture.audit_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event_type"], "access-denied");
+            assert_eq!(events[0]["category"], "target");
+            assert_eq!(events[0]["reason"], "session-unavailable");
+        }
     }
 
     #[tokio::test]
@@ -2530,13 +2605,22 @@ mod tests {
         assert_eq!(fixture.audit_events().len(), 0);
 
         fixture.admit();
-        let mut session = starting.await.unwrap().unwrap();
+        let mut session = fixture_deadline(starting, "authenticated start join")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            events.recv().await.unwrap().transition,
+            fixture_deadline(events.recv(), "created lifecycle event")
+                .await
+                .unwrap()
+                .transition,
             LifecycleTransition::Created
         ));
         assert!(matches!(
-            events.recv().await.unwrap().transition,
+            fixture_deadline(events.recv(), "running lifecycle event")
+                .await
+                .unwrap()
+                .transition,
             LifecycleTransition::Running
         ));
         let audit = fixture.audit_events();
@@ -2547,7 +2631,9 @@ mod tests {
                 .count(),
             1
         );
-        session.close().await.unwrap();
+        fixture_deadline(session.close(), "authenticated session close")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2570,6 +2656,10 @@ mod tests {
             fixture.wait_spawned().await;
             assert_eq!(manager.supervisor_count_for_test(), 1);
             starting.abort();
+            let join_error = fixture_deadline(starting, "cancelled start join")
+                .await
+                .expect_err("aborted start task must be cancelled");
+            assert!(join_error.is_cancelled());
             fixture.wait_reaped().await;
             assert_eq!(manager.capacity.active(), (0, 0));
             assert_eq!(manager.supervisor_count_for_test(), 0);
@@ -2594,9 +2684,11 @@ mod tests {
                 })
             };
             fixture.wait_spawned().await;
-            manager.shutdown().await;
+            fixture_deadline(manager.shutdown(), "connecting manager shutdown").await;
             assert!(matches!(
-                starting.await.unwrap(),
+                fixture_deadline(starting, "shutdown start join")
+                    .await
+                    .unwrap(),
                 Err(SessionError::ManagerClosed)
             ));
             assert!(fixture.was_reaped());
@@ -2623,7 +2715,9 @@ mod tests {
         fixture.wait_spawned().await;
         fixture.admit();
         assert!(matches!(
-            starting.await.unwrap(),
+            fixture_deadline(starting, "audit failure start join")
+                .await
+                .unwrap(),
             Err(SessionError::AuditUnavailable)
         ));
         fixture.wait_reaped().await;
@@ -2635,15 +2729,19 @@ mod tests {
     async fn ssh_remote_exit_status_is_not_connection_setup_failure() {
         let fixture = SshAdmissionFixture::new(SshAdmissionScript::AuthenticatedThenExit(23));
         let manager = fixture.manager();
-        let mut session = manager
-            .start(
+        let mut session = fixture_deadline(
+            manager.start(
                 Identity::new("alice").unwrap(),
                 "remote",
                 Resize::new(80, 24).unwrap(),
-            )
+            ),
+            "authenticated remote-exit start",
+        )
+        .await
+        .unwrap();
+        let closed = fixture_deadline(session.wait_closed(), "authenticated remote exit")
             .await
             .unwrap();
-        let closed = session.wait_closed().await.unwrap();
         assert_eq!(closed.reason, SessionCloseReason::ChildExited);
         assert_eq!(closed.outcome, Some(ChildOutcome::Code(23)));
         assert!(
