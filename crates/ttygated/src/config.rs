@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -336,7 +336,7 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
     validate_limits(&raw.limits)?;
     TargetAllowlist::new(targets.clone())?;
 
-    Ok(Config {
+    let config = Config {
         server: ServerConfig {
             bind: raw.server.bind,
             mode: raw.server.mode,
@@ -356,7 +356,85 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
             absolute_timeout: Duration::from_secs(raw.limits.absolute_timeout_seconds),
         },
         targets,
-    })
+    };
+    validate_startup_contract(&config)?;
+    Ok(config)
+}
+
+pub fn validate_startup_contract(config: &Config) -> Result<(), ConfigError> {
+    let public_url = url::Url::parse(&config.server.public_url).map_err(|_| {
+        validation(
+            "server.public_url".into(),
+            "must be an absolute HTTP or HTTPS origin URL",
+        )
+    })?;
+    if !public_url.username().is_empty()
+        || public_url.password().is_some()
+        || public_url.host().is_none()
+        || public_url.path() != "/"
+        || public_url.query().is_some()
+        || public_url.fragment().is_some()
+    {
+        return Err(validation(
+            "server.public_url".into(),
+            "must contain only an HTTP or HTTPS origin without credentials, path, query, or fragment",
+        ));
+    }
+
+    let expected_scheme = match config.server.transport {
+        ServerTransport::Plaintext => "http",
+        ServerTransport::DirectTls(_) | ServerTransport::TrustedProxy(_) => "https",
+    };
+    if public_url.scheme() != expected_scheme {
+        return Err(validation(
+            "server.public_url".into(),
+            "scheme must match the configured transport boundary",
+        ));
+    }
+
+    if matches!(config.auth, AuthConfig::Dev { .. }) && !config.server.bind.ip().is_loopback() {
+        return Err(validation(
+            "server.bind".into(),
+            "development authentication requires a loopback listener",
+        ));
+    }
+
+    if config.server.mode == ServerMode::Production
+        && !config.server.bind.ip().is_loopback()
+        && matches!(config.server.transport, ServerTransport::Plaintext)
+    {
+        return Err(validation(
+            "server.transport".into(),
+            "public production binding requires direct TLS or a complete trusted-proxy contract",
+        ));
+    }
+
+    if config.server.mode == ServerMode::Production && matches!(config.auth, AuthConfig::Dev { .. })
+    {
+        return Err(validation(
+            "auth.provider".into(),
+            "development authentication is not allowed in production",
+        ));
+    }
+
+    match (&config.auth, &config.server.transport) {
+        (AuthConfig::TrustedProxy { .. }, ServerTransport::TrustedProxy(_)) => {}
+        (AuthConfig::TrustedProxy { .. }, _) => {
+            return Err(validation(
+                "auth.provider".into(),
+                "trusted-proxy authentication requires the trusted-proxy transport contract",
+            ));
+        }
+        (AuthConfig::Dev { .. }, ServerTransport::TrustedProxy(_)) => {
+            return Err(validation(
+                "auth.provider".into(),
+                "trusted-proxy transport requires trusted-proxy authentication",
+            ));
+        }
+        (AuthConfig::Dev { .. }, _) => {}
+    }
+
+    Ok(())
 }
 
 fn convert_transport(
@@ -402,15 +480,30 @@ fn convert_transport(
                     "must contain at least one trusted source CIDR",
                 ));
             }
+            let mut canonical = BTreeSet::new();
             let trusted_sources = sources
                 .iter()
                 .map(|source| {
-                    IpNet::from_str(source).map_err(|_| {
+                    let network = IpNet::from_str(source).map_err(|_| {
                         validation(
                             "server.trusted_proxy.trusted_sources".into(),
                             "contains an invalid CIDR",
                         )
-                    })
+                    })?;
+                    let network = network.trunc();
+                    if network.to_string() != *source {
+                        return Err(validation(
+                            "server.trusted_proxy.trusted_sources".into(),
+                            "must contain canonical CIDRs",
+                        ));
+                    }
+                    if !canonical.insert(network) {
+                        return Err(validation(
+                            "server.trusted_proxy.trusted_sources".into(),
+                            "must not contain duplicate CIDRs",
+                        ));
+                    }
+                    Ok(network)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ServerTransport::TrustedProxy(TrustedProxyConfig {
@@ -1456,6 +1549,277 @@ trusted_sources = ["127.0.0.1/32", "::1/128"]"#,
             ServerTransport::TrustedProxy(ref proxy)
                 if proxy.trusted_sources[0].to_string() == "10.0.0.0/8"
         ));
+    }
+
+    #[test]
+    fn production_validation_matrix_fails_closed() {
+        struct Case {
+            name: &'static str,
+            source: String,
+            error_field: Option<&'static str>,
+        }
+
+        let tls_server = r#"public_url = "https://127.0.0.1:7681"
+
+[server.tls]
+certificate = "/etc/ttygate/tls/certificate.pem"
+private_key = "/etc/ttygate/tls/private-key.pem""#;
+        let proxy_server = r#"public_url = "https://terminal.example.test"
+
+[server.trusted_proxy]
+trusted_sources = ["127.0.0.1/32"]"#;
+        let proxy_auth = "provider = \"trusted-proxy\"\nidentity_header = \"x-authenticated-user\"";
+
+        let cases = [
+            Case {
+                name: "valid loopback plaintext development",
+                source: COMPLETE_CONFIG.to_owned(),
+                error_field: None,
+            },
+            Case {
+                name: "valid loopback direct TLS development",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    tls_server,
+                ),
+                error_field: None,
+            },
+            Case {
+                name: "valid production trusted proxy contract",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        proxy_server,
+                    )
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: None,
+            },
+            Case {
+                name: "production plaintext development identity",
+                source: COMPLETE_CONFIG.replace("mode = \"dev\"", "mode = \"production\""),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "production direct TLS development identity",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        tls_server,
+                    ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "production proxy development identity",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        proxy_server,
+                    ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "development identity on IPv4 wildcard",
+                source: COMPLETE_CONFIG.replace("127.0.0.1:7681", "0.0.0.0:7681"),
+                error_field: Some("server.bind"),
+            },
+            Case {
+                name: "development identity on IPv6 wildcard with TLS",
+                source: COMPLETE_CONFIG
+                    .replace("bind = \"127.0.0.1:7681\"", "bind = \"[::]:7681\"")
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        tls_server,
+                    ),
+                error_field: Some("server.bind"),
+            },
+            Case {
+                name: "public production plaintext",
+                source: COMPLETE_CONFIG
+                    .replace("mode = \"dev\"", "mode = \"production\"")
+                    .replace("bind = \"127.0.0.1:7681\"", "bind = \"0.0.0.0:7681\"")
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: Some("server.transport"),
+            },
+            Case {
+                name: "plaintext with HTTPS public URL",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "https://127.0.0.1:7681",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "direct TLS with HTTP public URL",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"http://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "trusted proxy with HTTP public URL",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"http://127.0.0.1:7681\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\"]",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "trusted proxy auth without proxy transport",
+                source: COMPLETE_CONFIG.replace(
+                    "provider = \"dev\"\nuser = \"local\"",
+                    proxy_auth,
+                ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "proxy transport without trusted proxy auth",
+                source: COMPLETE_CONFIG.replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    proxy_server,
+                ),
+                error_field: Some("auth.provider"),
+            },
+            Case {
+                name: "duplicate trusted proxy CIDRs",
+                source: COMPLETE_CONFIG
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.1/32\", \"127.0.0.1/32\"]",
+                    )
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: Some("server.trusted_proxy.trusted_sources"),
+            },
+            Case {
+                name: "noncanonical trusted proxy CIDR",
+                source: COMPLETE_CONFIG
+                    .replace(
+                        "public_url = \"http://127.0.0.1:7681\"",
+                        "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"127.0.0.42/8\"]",
+                    )
+                    .replace("provider = \"dev\"\nuser = \"local\"", proxy_auth),
+                error_field: Some("server.trusted_proxy.trusted_sources"),
+            },
+            Case {
+                name: "public URL credentials",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://operator:secret@127.0.0.1:7681",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "public URL path",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://127.0.0.1:7681/terminal",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "public URL query",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://127.0.0.1:7681/?secret=value",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "public URL fragment",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "http://127.0.0.1:7681/#fragment",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "unsupported public URL scheme",
+                source: COMPLETE_CONFIG.replace(
+                    "http://127.0.0.1:7681",
+                    "ftp://127.0.0.1:7681",
+                ),
+                error_field: Some("server.public_url"),
+            },
+            Case {
+                name: "missing public URL host",
+                source: COMPLETE_CONFIG
+                    .replace("http://127.0.0.1:7681", "http://"),
+                error_field: Some("server.public_url"),
+            },
+        ];
+
+        for case in cases {
+            match case.error_field {
+                None => {
+                    parse(&case.source).unwrap_or_else(|error| panic!("{}: {error}", case.name));
+                }
+                Some(field) => {
+                    let error = match parse(&case.source) {
+                        Ok(_) => panic!("{} unexpectedly validated", case.name),
+                        Err(error) => error.to_string(),
+                    };
+                    assert!(
+                        error.contains(field),
+                        "{}: {error:?} did not contain {field:?}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn development_identity_never_validates_for_non_loopback_exposure_even_with_tls() {
+        for bind in ["0.0.0.0:7681", "192.0.2.10:7681", "[::]:7681"] {
+            let source = COMPLETE_CONFIG
+                .replace("bind = \"127.0.0.1:7681\"", &format!("bind = \"{bind}\""))
+                .replace(
+                    "public_url = \"http://127.0.0.1:7681\"",
+                    "public_url = \"https://terminal.example.test\"\n[server.tls]\ncertificate = \"/cert.pem\"\nprivate_key = \"/key.pem\"",
+                );
+            let error = parse(&source).unwrap_err().to_string();
+            assert!(error.contains("server.bind"), "{bind}: {error}");
+        }
+    }
+
+    #[test]
+    fn startup_contract_errors_do_not_reflect_hostile_values() {
+        let sentinels = [
+            "operator-secret",
+            "private-path-sentinel",
+            "hostile-header-sentinel",
+            "cidr-sentinel",
+        ];
+        let cases = [
+            COMPLETE_CONFIG.replace(
+                "http://127.0.0.1:7681",
+                "http://operator-secret@127.0.0.1:7681",
+            ),
+            COMPLETE_CONFIG.replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://127.0.0.1:7681\"\n[server.tls]\ncertificate = \"/private-path-sentinel/cert.pem\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "provider = \"dev\"\nuser = \"local\"",
+                "provider = \"trusted-proxy\"\nidentity_header = \"hostile header sentinel\"",
+            ),
+            COMPLETE_CONFIG.replace(
+                "public_url = \"http://127.0.0.1:7681\"",
+                "public_url = \"https://terminal.example.test\"\n[server.trusted_proxy]\ntrusted_sources = [\"cidr-sentinel\"]",
+            ),
+        ];
+        for source in cases {
+            let message = parse(&source).unwrap_err().to_string();
+            for sentinel in sentinels {
+                assert!(
+                    !message.contains(sentinel),
+                    "{message:?} reflected {sentinel}"
+                );
+            }
+        }
     }
 
     #[test]
