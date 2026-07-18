@@ -342,45 +342,50 @@ impl SshDiagnosticClassifier {
     }
 
     pub(crate) fn finish(self) -> SshDiagnosticClass {
+        self.classification()
+            .unwrap_or(SshDiagnosticClass::GenericFailure)
+    }
+
+    pub(crate) fn classification(&self) -> Option<SshDiagnosticClass> {
         if self.invalid {
-            return SshDiagnosticClass::GenericFailure;
+            return Some(SshDiagnosticClass::GenericFailure);
         }
         let Ok(diagnostics) = std::str::from_utf8(&self.bytes) else {
-            return SshDiagnosticClass::GenericFailure;
+            return None;
         };
         classify_diagnostics(diagnostics)
     }
 }
 
 #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
-fn classify_diagnostics(diagnostics: &str) -> SshDiagnosticClass {
+fn classify_diagnostics(diagnostics: &str) -> Option<SshDiagnosticClass> {
     if diagnostics.contains("REMOTE HOST IDENTIFICATION HAS CHANGED!")
         || diagnostics.contains("Offending ") && diagnostics.contains(" key in ")
     {
-        SshDiagnosticClass::HostKeyMismatch
+        Some(SshDiagnosticClass::HostKeyMismatch)
     } else if diagnostics.contains("No ED25519 host key is known for ")
         || diagnostics.contains("No ECDSA host key is known for ")
         || diagnostics.contains("No RSA host key is known for ")
         || diagnostics.contains("Host key verification failed.")
     {
-        SshDiagnosticClass::UnknownHostKey
+        Some(SshDiagnosticClass::UnknownHostKey)
     } else if diagnostics.contains("Authenticated to ")
         && diagnostics.contains(" using \"publickey\"")
     {
-        SshDiagnosticClass::Authenticated
+        Some(SshDiagnosticClass::Authenticated)
     } else if diagnostics.contains("Permission denied (publickey")
         || diagnostics.contains("No more authentication methods to try.")
     {
-        SshDiagnosticClass::AuthenticationFailed
+        Some(SshDiagnosticClass::AuthenticationFailed)
     } else if diagnostics.contains("ssh: connect to host ")
         || diagnostics.contains("Could not resolve hostname ")
         || diagnostics.contains("Connection closed by ")
         || diagnostics.contains("Connection reset by ")
         || diagnostics.contains("Connection timed out")
     {
-        SshDiagnosticClass::ConnectionFailed
+        Some(SshDiagnosticClass::ConnectionFailed)
     } else {
-        SshDiagnosticClass::GenericFailure
+        None
     }
 }
 
@@ -1887,6 +1892,68 @@ requesttty force\n"
             classifier.push(diagnostic);
             assert_eq!(classifier.finish(), expected);
         }
+    }
+
+    #[test]
+    fn ssh_classifier_exposes_live_setup_classification_before_eof() {
+        use super::SshDiagnosticClass::{
+            Authenticated, AuthenticationFailed, ConnectionFailed, GenericFailure, HostKeyMismatch,
+            UnknownHostKey,
+        };
+
+        for (diagnostic, expected) in [
+            (
+                b"Authenticated to host.example ([192.0.2.1]:22) using \"publickey\".\n".as_slice(),
+                Authenticated,
+            ),
+            (
+                b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n".as_slice(),
+                HostKeyMismatch,
+            ),
+            (
+                b"No ED25519 host key is known for host.example and you have requested strict checking.\n"
+                    .as_slice(),
+                UnknownHostKey,
+            ),
+            (
+                b"ssh: connect to host host.example port 22: Connection refused\n".as_slice(),
+                ConnectionFailed,
+            ),
+            (
+                b"operator@host.example: Permission denied (publickey).\n".as_slice(),
+                AuthenticationFailed,
+            ),
+        ] {
+            let mut classifier = super::SshDiagnosticClassifier::new();
+            classifier.push(diagnostic);
+            assert_eq!(classifier.classification(), Some(expected));
+            assert_eq!(classifier.classification(), Some(expected));
+        }
+
+        let mut precedence = super::SshDiagnosticClassifier::new();
+        precedence.push(b"Authenticated to host.example using \"publickey\".\n");
+        assert_eq!(precedence.classification(), Some(Authenticated));
+        precedence.push(b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n");
+        assert_eq!(precedence.classification(), Some(HostKeyMismatch));
+
+        let mut partial = super::SshDiagnosticClassifier::new();
+        partial.push(b"Authenticated to host.example using \"public");
+        assert_eq!(partial.classification(), None);
+
+        let mut split_utf8 = super::SshDiagnosticClassifier::new();
+        split_utf8.push(b"setup caf\xc3");
+        assert_eq!(split_utf8.classification(), None);
+        split_utf8.push(b"\xa9\n");
+        assert_eq!(split_utf8.classification(), None);
+
+        let mut unrecognized = super::SshDiagnosticClassifier::new();
+        unrecognized.push(b"debug1: setup continues\n");
+        assert_eq!(unrecognized.classification(), None);
+        assert_eq!(unrecognized.finish(), GenericFailure);
+
+        let mut bounded = super::SshDiagnosticClassifier::new();
+        bounded.push(&[b'x'; super::MAX_SSH_DIAGNOSTIC_BYTES + 1]);
+        assert_eq!(bounded.classification(), Some(GenericFailure));
     }
 
     #[test]
