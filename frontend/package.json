@@ -6,13 +6,15 @@
   "scripts": {
     "check": "tsc --noEmit",
     "build": "node build.mjs",
-    "test": "node --import tsx --test src/*.test.ts"
+    "test": "node --import tsx --test src/*.test.ts",
+    "test:e2e": "npm run build && playwright test"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^26.1.1",
     "esbuild": "^0.25.0",
     "tsx": "^4.23.0",

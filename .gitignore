@@ -1,6 +1,8 @@
 .worktrees/
 /target
 node_modules/
+/frontend/playwright-report/
+/frontend/test-results/
 /frontend/dist/index.html
 /spikes/**/target/
 /spikes/**/.tmp/
