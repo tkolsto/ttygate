@@ -60,6 +60,10 @@ impl Drop for TlsTestServer {
 }
 
 impl TlsTestServer {
+    fn audit_path(&self) -> PathBuf {
+        self.marker.with_file_name("audit.jsonl")
+    }
+
     async fn start() -> Self {
         Self::start_with_capacity(4, 4).await
     }
@@ -464,6 +468,132 @@ async fn https_exact_origin_creates_session_and_wss_ticket_reaches_real_pty() {
         })
     })
     .await;
+}
+
+async fn assert_reconstructable_secret_free_direct_tls_audit() {
+    with_tls_test(|server| {
+        Box::pin(async move {
+            let header_sentinel = "https://HEADER-SENTINEL.invalid";
+            let query_sentinel = "QUERY-SENTINEL";
+            assert_eq!(
+                server
+                    .request("POST", "/api/identity", Some(header_sentinel), None, b"",)
+                    .await
+                    .unwrap()
+                    .status,
+                403
+            );
+            assert_eq!(
+                server
+                    .request(
+                        "GET",
+                        &format!("/healthz?probe={query_sentinel}"),
+                        None,
+                        None,
+                        b"",
+                    )
+                    .await
+                    .unwrap()
+                    .status,
+                200
+            );
+            let cookie = server.provision_cookie().await;
+            let ticket = server.issue_ticket(&cookie).await;
+            let mut socket = server.websocket(&server.origin, &cookie).await.unwrap();
+            socket
+                .send(tungstenite::Message::Text(
+                    format!(r#"{{"ticket":"{ticket}"}}"#).into(),
+                ))
+                .await
+                .unwrap();
+            collect_binary_until(&mut socket, b"READY").await;
+            let terminal_sentinel = b"TLS-TERMINAL-INPUT-SENTINEL";
+            socket
+                .send(tungstenite::Message::Binary(
+                    [terminal_sentinel.as_slice(), b"\r"].concat().into(),
+                ))
+                .await
+                .unwrap();
+            collect_binary_until(&mut socket, terminal_sentinel).await;
+            socket.close(None).await.unwrap();
+
+            let events = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let events = fs::read_to_string(server.audit_path())
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                        .collect::<Vec<_>>();
+                    if events
+                        .iter()
+                        .any(|event| event["event_type"] == "session-ended")
+                    {
+                        break events;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("TLS audit completion timed out");
+            let started = events
+                .iter()
+                .find(|event| event["event_type"] == "session-started")
+                .unwrap();
+            let ended = events
+                .iter()
+                .find(|event| event["event_type"] == "session-ended")
+                .unwrap();
+            assert_eq!(started["identity"], "tls-test");
+            assert_eq!(started["target"], "shell");
+            assert_eq!(started["session_id"], ended["session_id"]);
+            assert_eq!(ended["close_reason"], "websocket-disconnect");
+            assert!(
+                events
+                    .iter()
+                    .filter_map(|event| event["remote_address"].as_str())
+                    .all(|address| address.starts_with("127.0.0.1:"))
+            );
+
+            let bytes = fs::read(server.audit_path()).unwrap();
+            for forbidden in [
+                cookie.as_bytes(),
+                ticket.as_bytes(),
+                terminal_sentinel.as_slice(),
+                header_sentinel.as_bytes(),
+                query_sentinel.as_bytes(),
+                PTY_FIXTURE.as_bytes(),
+                server.marker.to_string_lossy().as_bytes(),
+            ] {
+                assert!(
+                    !bytes
+                        .windows(forbidden.len())
+                        .any(|window| window == forbidden),
+                    "audit contained a credential, terminal, command, or environment sentinel"
+                );
+            }
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn audit_log_reconstructs_who_opened_which_target_and_when() {
+    assert_reconstructable_secret_free_direct_tls_audit().await;
+}
+
+#[tokio::test]
+async fn direct_tls_authority_audit_uses_listener_socket_address() {
+    assert_reconstructable_secret_free_direct_tls_audit().await;
+}
+
+#[tokio::test]
+async fn typed_terminal_input_sentinel_never_appears_in_audit_jsonl() {
+    assert_reconstructable_secret_free_direct_tls_audit().await;
+}
+
+#[tokio::test]
+async fn cookie_ticket_header_query_command_environment_and_output_sentinels_never_appear() {
+    assert_reconstructable_secret_free_direct_tls_audit().await;
 }
 
 #[tokio::test]

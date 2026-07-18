@@ -334,8 +334,7 @@ async fn authentication_failure_and_rate_limit_emit_stable_peer_attribution() {
     );
 }
 
-#[tokio::test]
-async fn successful_development_authentication_uses_listener_peer_only() {
+async fn assert_development_authentication_uses_listener_peer_only() {
     let audited = audited_app(limits());
     let peer: SocketAddr = "127.0.0.1:42345".parse().unwrap();
     let mut request = Request::builder()
@@ -366,6 +365,16 @@ async fn successful_development_authentication_uses_listener_peer_only() {
     ] {
         assert!(!contents.contains(sentinel), "{sentinel}");
     }
+}
+
+#[tokio::test]
+async fn successful_development_authentication_uses_listener_peer_only() {
+    assert_development_authentication_uses_listener_peer_only().await;
+}
+
+#[tokio::test]
+async fn development_authority_audit_uses_listener_socket_address() {
+    assert_development_authentication_uses_listener_peer_only().await;
 }
 
 #[tokio::test]
