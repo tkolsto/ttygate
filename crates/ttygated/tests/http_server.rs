@@ -1,7 +1,9 @@
 use std::{
+    fs,
     io::{Read, Write},
     net::SocketAddr,
     net::TcpStream,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -45,6 +47,45 @@ fn limits() -> Limits {
 fn test_audit() -> AuditLog {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     AuditLog::open(&directory.path().join("audit.jsonl")).unwrap()
+}
+
+struct AuditedApp {
+    app: axum::Router,
+    path: PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+fn audited_app(mut configured: Limits) -> AuditedApp {
+    configured.max_sessions = configured.max_sessions.max(1);
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let path = directory.path().join("audit.jsonl");
+    let audit = AuditLog::open(&path).unwrap();
+    let target = Target::Pty(PtyTarget {
+        name: "shell".into(),
+        executable: "/bin/sh".into(),
+        argv: Vec::new(),
+        read_only: false,
+    });
+    AuditedApp {
+        app: build_router(AppState::new(
+            OriginPolicy::new(ORIGIN).unwrap(),
+            Arc::new(DevAuthProvider::new("developer").unwrap()),
+            TargetAllowlist::new(vec![target]).unwrap(),
+            TicketStore::new(std::time::Duration::from_secs(10), 32),
+            configured,
+            audit,
+        )),
+        path,
+        _directory: directory,
+    }
+}
+
+fn audit_values(path: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 struct PeerRecordingAuthProvider {
@@ -224,6 +265,202 @@ async fn provision_cookie(app: &axum::Router) -> String {
         .next()
         .unwrap()
         .to_owned()
+}
+
+#[tokio::test]
+async fn wrong_origin_emits_stable_denial_without_hostile_origin() {
+    let audited = audited_app(limits());
+    let hostile = "https://hostile-origin-sentinel.invalid";
+
+    let denied = response(
+        &audited.app,
+        "POST",
+        "/api/sessions",
+        Some(hostile),
+        Some("cookie-sentinel"),
+        r#"{"target":"body-sentinel"}"#,
+    )
+    .await;
+
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let values = audit_values(&audited.path);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["event_type"], "access-denied");
+    assert_eq!(values[0]["category"], "origin");
+    assert_eq!(values[0]["reason"], "origin-denied");
+    let contents = fs::read_to_string(&audited.path).unwrap();
+    for sentinel in [hostile, "cookie-sentinel", "body-sentinel"] {
+        assert!(!contents.contains(sentinel), "{sentinel}");
+    }
+}
+
+#[tokio::test]
+async fn authentication_failure_and_rate_limit_emit_stable_peer_attribution() {
+    let mut configured = limits();
+    configured.authentication_failures_per_window = 1;
+    let audited = audited_app(configured);
+    let peer: SocketAddr = "192.0.2.44:41234".parse().unwrap();
+
+    for expected in [StatusCode::UNAUTHORIZED, StatusCode::TOO_MANY_REQUESTS] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/targets")
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::COOKIE, "ttgate_session=invalid-sentinel")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            audited.app.clone().oneshot(request).await.unwrap().status(),
+            expected
+        );
+    }
+
+    let values = audit_values(&audited.path);
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0]["category"], "authentication");
+    assert_eq!(values[0]["reason"], "identity-required");
+    assert_eq!(values[1]["category"], "rate-limit");
+    assert_eq!(values[1]["reason"], "authentication-rate-limited");
+    assert!(
+        values
+            .iter()
+            .all(|value| value["remote_address"] == peer.to_string())
+    );
+    assert!(
+        !fs::read_to_string(&audited.path)
+            .unwrap()
+            .contains("invalid-sentinel")
+    );
+}
+
+#[tokio::test]
+async fn successful_development_authentication_uses_listener_peer_only() {
+    let audited = audited_app(limits());
+    let peer: SocketAddr = "127.0.0.1:42345".parse().unwrap();
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/identity?query-address-sentinel")
+        .header(header::ORIGIN, ORIGIN)
+        .header("forwarded", "for=forwarded-address-sentinel")
+        .header("x-forwarded-for", "forwarded-for-sentinel")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(peer));
+
+    assert_eq!(
+        audited.app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let values = audit_values(&audited.path);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["event_type"], "authentication-succeeded");
+    assert_eq!(values[0]["identity"], "developer");
+    assert_eq!(values[0]["remote_address"], peer.to_string());
+    let contents = fs::read_to_string(&audited.path).unwrap();
+    for sentinel in [
+        "query-address-sentinel",
+        "forwarded-address-sentinel",
+        "forwarded-for-sentinel",
+    ] {
+        assert!(!contents.contains(sentinel), "{sentinel}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_target_denial_never_reflects_hostile_target() {
+    let audited = audited_app(limits());
+    let cookie = provision_cookie(&audited.app).await;
+    let hostile_target = "unknown-target-sentinel";
+
+    let denied = response(
+        &audited.app,
+        "POST",
+        "/api/sessions",
+        Some(ORIGIN),
+        Some(&cookie),
+        &format!(r#"{{"target":"{hostile_target}"}}"#),
+    )
+    .await;
+
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    let values = audit_values(&audited.path);
+    let denial = values.last().unwrap();
+    assert_eq!(denial["category"], "target");
+    assert_eq!(denial["reason"], "target-not-found");
+    assert_eq!(denial["identity"], "developer");
+    assert!(denial.get("target").is_none());
+    assert!(
+        !fs::read_to_string(&audited.path)
+            .unwrap()
+            .contains(hostile_target)
+    );
+}
+
+#[tokio::test]
+async fn session_rate_and_capacity_denials_use_authenticated_identity() {
+    let mut capacity_limits = limits();
+    capacity_limits.max_sessions = 1;
+    capacity_limits.max_sessions_per_user = 2;
+    let capacity = audited_app(capacity_limits);
+    let cookie = provision_cookie(&capacity.app).await;
+    assert_eq!(
+        response(
+            &capacity.app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some(&cookie),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        response(
+            &capacity.app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some(&cookie),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let capacity_denial = audit_values(&capacity.path).pop().unwrap();
+    assert_eq!(capacity_denial["category"], "capacity");
+    assert_eq!(capacity_denial["reason"], "global-session-limit");
+    assert_eq!(capacity_denial["identity"], "developer");
+    assert_eq!(capacity_denial["target"], "shell");
+
+    let mut rate_limits = limits();
+    rate_limits.session_requests_per_window = 1;
+    let rate = audited_app(rate_limits);
+    let cookie = provision_cookie(&rate.app).await;
+    for expected in [StatusCode::NOT_FOUND, StatusCode::TOO_MANY_REQUESTS] {
+        assert_eq!(
+            response(
+                &rate.app,
+                "POST",
+                "/api/sessions",
+                Some(ORIGIN),
+                Some(&cookie),
+                r#"{"target":"missing"}"#,
+            )
+            .await
+            .status(),
+            expected
+        );
+    }
+    let rate_denial = audit_values(&rate.path).pop().unwrap();
+    assert_eq!(rate_denial["category"], "rate-limit");
+    assert_eq!(rate_denial["reason"], "session-rate-limited");
+    assert_eq!(rate_denial["identity"], "developer");
+    assert!(rate_denial.get("target").is_none());
 }
 
 #[tokio::test]

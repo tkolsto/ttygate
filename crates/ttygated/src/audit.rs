@@ -358,6 +358,14 @@ impl AuditLog {
             .failed
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .failed = true;
+    }
+
     fn from_writer(writer: impl Write + Send + 'static) -> Self {
         Self {
             inner: Arc::new(Mutex::new(AuditWriterState {
