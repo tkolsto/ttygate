@@ -53,6 +53,7 @@ pub struct AppState {
     tickets: Arc<TicketStore>,
     sessions: Arc<SessionManager>,
     authentication_failures: Arc<FixedWindowLimiter<PeerKey>>,
+    session_requests: Arc<FixedWindowLimiter<crate::ticket::Identity>>,
 }
 
 impl AppState {
@@ -68,6 +69,11 @@ impl AppState {
             limits.authentication_failure_window,
             LIMITER_KEY_CAPACITY,
         ));
+        let session_requests = Arc::new(FixedWindowLimiter::new(
+            limits.session_requests_per_window,
+            limits.session_request_window,
+            LIMITER_KEY_CAPACITY,
+        ));
         let sessions = SessionManager::new(limits, targets.clone());
         Self {
             origin: Arc::new(origin),
@@ -76,6 +82,7 @@ impl AppState {
             tickets: Arc::new(tickets),
             sessions: Arc::new(sessions),
             authentication_failures,
+            session_requests,
         }
     }
 
@@ -371,6 +378,17 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Ok(identity) => identity,
             Err(error) => return auth_error_response(error),
         };
+    let session_request = match state.session_requests.begin(identity.clone()) {
+        Ok(attempt) => attempt,
+        Err(LimitError::Exhausted { retry_after }) => {
+            return rate_error(
+                "session-rate-limited",
+                "Session requests are temporarily limited.",
+                retry_after,
+            );
+        }
+    };
+    session_request.commit();
     let is_json = request
         .headers()
         .get(header::CONTENT_TYPE)

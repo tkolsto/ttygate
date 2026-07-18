@@ -66,18 +66,40 @@ impl AuthProvider for PeerRecordingAuthProvider {
     }
 }
 
+struct CookieIdentityAuth;
+
+impl AuthProvider for CookieIdentityAuth {
+    fn establish(&self, _context: &AuthContext<'_>) -> Result<ProvisionedIdentity, AuthError> {
+        Err(AuthError::Unknown)
+    }
+
+    fn authenticate(
+        &self,
+        _context: &AuthContext<'_>,
+        cookie_header: Option<&str>,
+    ) -> Result<Identity, AuthError> {
+        cookie_header
+            .and_then(|cookie| cookie.strip_prefix("user="))
+            .ok_or(AuthError::Missing)
+            .and_then(|identity| Identity::new(identity).map_err(|_| AuthError::Unknown))
+    }
+}
+
 fn app() -> axum::Router {
     app_with_limits(limits())
 }
 
 fn app_with_limits(limits: Limits) -> axum::Router {
+    app_with_auth_and_limits(Arc::new(DevAuthProvider::new("developer").unwrap()), limits)
+}
+
+fn app_with_auth_and_limits(auth: Arc<dyn AuthProvider>, limits: Limits) -> axum::Router {
     let target = Target::Pty(PtyTarget {
         name: "shell".into(),
         executable: "/bin/sh".into(),
         argv: Vec::new(),
         read_only: false,
     });
-    let auth: Arc<dyn AuthProvider> = Arc::new(DevAuthProvider::new("developer").unwrap());
     build_router(AppState::new(
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
@@ -463,6 +485,209 @@ async fn wrong_origin_rejects_before_authentication_rate_authority() {
             .status(),
         StatusCode::TOO_MANY_REQUESTS
     );
+}
+
+#[tokio::test]
+async fn session_rate_allows_exact_first_and_last_request_then_rejects() {
+    let mut configured = limits();
+    configured.session_requests_per_window = 2;
+    let app = app_with_limits(configured);
+    let cookie = provision_cookie(&app).await;
+
+    for _ in 0..2 {
+        assert_eq!(
+            response(
+                &app,
+                "POST",
+                "/api/sessions",
+                Some(ORIGIN),
+                Some(&cookie),
+                r#"{"target":"shell"}"#,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+    }
+    let limited = response(
+        &app,
+        "POST",
+        "/api/sessions",
+        Some(ORIGIN),
+        Some(&cookie),
+        r#"{"target":"shell"}"#,
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json(limited).await["error"]["code"], "session-rate-limited");
+}
+
+#[tokio::test]
+async fn session_rate_is_independent_between_authenticated_identities() {
+    let mut configured = limits();
+    configured.session_requests_per_window = 1;
+    let app = app_with_auth_and_limits(Arc::new(CookieIdentityAuth), configured);
+    for cookie in ["user=alice", "user=bob"] {
+        assert_eq!(
+            response(
+                &app,
+                "POST",
+                "/api/sessions",
+                Some(ORIGIN),
+                Some(cookie),
+                r#"{"target":"shell"}"#,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_invalid_body_and_target_requests_consume_allowance() {
+    let mut configured = limits();
+    configured.session_requests_per_window = 2;
+    let app = app_with_limits(configured);
+    let cookie = provision_cookie(&app).await;
+    for (body, status) in [
+        ("not-json", StatusCode::BAD_REQUEST),
+        (r#"{"target":"missing"}"#, StatusCode::NOT_FOUND),
+    ] {
+        assert_eq!(
+            response(
+                &app,
+                "POST",
+                "/api/sessions",
+                Some(ORIGIN),
+                Some(&cookie),
+                body,
+            )
+            .await
+            .status(),
+            status
+        );
+    }
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some(&cookie),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn concurrent_session_requests_have_exactly_the_configured_winners() {
+    let mut configured = limits();
+    configured.session_requests_per_window = 8;
+    let app = app_with_limits(configured);
+    let cookie = provision_cookie(&app).await;
+    let tasks = (0..32)
+        .map(|_| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            tokio::spawn(async move {
+                response(
+                    &app,
+                    "POST",
+                    "/api/sessions",
+                    Some(ORIGIN),
+                    Some(&cookie),
+                    r#"{"target":"shell"}"#,
+                )
+                .await
+                .status()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut created = 0;
+    let mut limited = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::CREATED => created += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            status => panic!("unexpected session-request status {status}"),
+        }
+    }
+    assert_eq!((created, limited), (8, 24));
+}
+
+#[tokio::test]
+async fn session_rate_errors_are_stable_and_non_reflecting() {
+    let mut configured = limits();
+    configured.session_requests_per_window = 1;
+    let app = app_with_auth_and_limits(Arc::new(CookieIdentityAuth), configured);
+    for _ in 0..1 {
+        let _ = response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some("user=hostile-identity-sentinel"),
+            r#"{"target":"shell"}"#,
+        )
+        .await;
+    }
+    let limited = response(
+        &app,
+        "POST",
+        "/api/sessions",
+        Some(ORIGIN),
+        Some("user=hostile-identity-sentinel"),
+        r#"{"target":"hostile-target-sentinel"}"#,
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers()[header::RETRY_AFTER], "60");
+    let body = json(limited).await;
+    assert_eq!(body["error"]["code"], "session-rate-limited");
+    assert_eq!(
+        body["error"]["message"],
+        "Session requests are temporarily limited."
+    );
+    for sentinel in ["hostile-identity-sentinel", "hostile-target-sentinel"] {
+        assert!(!body.to_string().contains(sentinel));
+    }
+}
+
+#[tokio::test]
+async fn session_rate_never_uses_peer_or_forwarded_header_as_identity() {
+    let mut configured = limits();
+    configured.session_requests_per_window = 1;
+    let app = app_with_auth_and_limits(Arc::new(CookieIdentityAuth), configured);
+    for (peer, forwarded, expected) in [
+        ("127.0.0.1:41000", Some("198.51.100.1"), StatusCode::CREATED),
+        (
+            "127.0.0.2:42000",
+            Some("203.0.113.9"),
+            StatusCode::TOO_MANY_REQUESTS,
+        ),
+    ] {
+        assert_eq!(
+            proxy_response(
+                &app,
+                ProxyRequest {
+                    uri: "/api/sessions",
+                    origin: Some(ORIGIN),
+                    cookie: Some("user=alice"),
+                    identities: &[],
+                    peer: peer.parse().unwrap(),
+                    forwarded_for: forwarded,
+                    body: r#"{"target":"shell"}"#,
+                },
+            )
+            .await
+            .status(),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
