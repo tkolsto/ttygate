@@ -51,8 +51,7 @@ use ttygated::{
 const WAIT: Duration = Duration::from_secs(10);
 const USER: &str = "integration-user";
 const TARGET: &str = "real-ssh";
-const IMAGE: &str = "ttygate-sshd-integration:local";
-const BANNER_MARKER: &str = "debug1: Authentication succeeded (publickey).";
+const BANNER_MARKER: &str = "Authenticated to 127.0.0.1 using \"publickey\".";
 const SENTINEL_KNOWN_HOSTS: &str = "KNOWN_HOSTS_PATH_SENTINEL_943a";
 const SENTINEL_IDENTITY: &str = "IDENTITY_PATH_SENTINEL_329f";
 const SENTINEL_KNOWN_HOSTS_CONTENT: &str = "KNOWN_HOSTS_CONTENT_SENTINEL_617d";
@@ -65,14 +64,20 @@ const SENTINEL_INNER_KEY: &str = "TTYGATE_SECRET_TEST_INNER";
 
 static FIXTURE_SERIAL: OnceLock<AsyncMutex<()>> = OnceLock::new();
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static FIXTURE_IMAGE_ID: OnceLock<String> = OnceLock::new();
 
 struct RealSshdFixture {
+    relay: ContainerGuard,
     container: ContainerGuard,
-    directory: TempDir,
+    network: NetworkGuard,
+    _directory: TempDir,
     _serial: AsyncMutexGuard<'static, ()>,
+    client_directory: PathBuf,
+    server_directory: PathBuf,
     port: u16,
     audit_path: PathBuf,
     ssh_executable: PathBuf,
+    image_id: String,
 }
 
 struct WebsocketDenial {
@@ -90,48 +95,77 @@ impl RealSshdFixture {
     }
 
     async fn start_paused_after_container(
-        started: tokio::sync::oneshot::Sender<(String, PathBuf)>,
+        started: tokio::sync::oneshot::Sender<(String, String, String, PathBuf)>,
     ) -> Self {
         Self::start_inner(Some(started)).await
     }
 
-    async fn start_inner(started: Option<tokio::sync::oneshot::Sender<(String, PathBuf)>>) -> Self {
+    async fn start_inner(
+        started: Option<tokio::sync::oneshot::Sender<(String, String, String, PathBuf)>>,
+    ) -> Self {
         let serial = FIXTURE_SERIAL
             .get_or_init(|| AsyncMutex::new(()))
             .lock()
             .await;
-        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap())
-            .expect("create private sshd fixture directory");
+        let fixture_root = std::env::current_dir().unwrap().join("target/ssh-fixtures");
+        fs::create_dir_all(&fixture_root).expect("create ignored SSH fixture root");
+        fs::set_permissions(
+            &fixture_root,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let directory =
+            tempfile::tempdir_in(fixture_root).expect("create private sshd fixture directory");
         fs::set_permissions(
             directory.path(),
             <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .unwrap();
-        generate_key(directory.path().join("client_key"));
-        generate_key(directory.path().join("wrong_client_key"));
+        let client_directory = directory.path().join("client");
+        let server_directory = directory.path().join("server");
+        fs::create_dir(&client_directory).unwrap();
+        fs::create_dir(&server_directory).unwrap();
+        for path in [&client_directory, &server_directory] {
+            fs::set_permissions(
+                path,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        generate_key(client_directory.join("client_key"));
+        generate_key(client_directory.join("wrong_client_key"));
         generate_key_with_comment(
-            directory.path().join(SENTINEL_IDENTITY),
+            client_directory.join(SENTINEL_IDENTITY),
             SENTINEL_PRIVATE_KEY_COMMENT,
         );
-        generate_key(directory.path().join("ssh_host_ed25519_key"));
-        generate_key(directory.path().join("wrong_host_key"));
+        generate_key(client_directory.join("ssh_host_ed25519_key"));
+        fs::rename(
+            client_directory.join("ssh_host_ed25519_key"),
+            server_directory.join("ssh_host_ed25519_key"),
+        )
+        .unwrap();
+        fs::copy(
+            client_directory.join("client_key.pub"),
+            server_directory.join("accepted_client_key.pub"),
+        )
+        .unwrap();
+        generate_key(client_directory.join("wrong_host_key"));
         fs::write(
-            directory.path().join("banner"),
+            server_directory.join("banner"),
             format!("{BANNER_MARKER}\n"),
         )
         .unwrap();
-        let container = format!(
-            "ttygate-sshd-{}-{}",
-            std::process::id(),
-            FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sshd");
+        assert_server_fixture_allowlist(&server_directory);
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let network_name = format!("ttygate-sshd-net-{}-{sequence}", std::process::id());
         command_ok(
-            Command::new("docker")
-                .args(["build", "-q", "-t", IMAGE])
-                .arg(&fixture_dir),
-            "build disposable sshd image",
+            Command::new("docker").args(["network", "create", "--internal", &network_name]),
+            "create isolated sshd network",
         );
+        let network = NetworkGuard { name: network_name };
+        let container = format!("ttygate-sshd-{}-{sequence}", std::process::id(),);
+        let relay = format!("ttygate-sshd-relay-{}-{sequence}", std::process::id());
+        let image_id = fixture_image_id();
         command_ok(
             Command::new("docker")
                 .args([
@@ -139,59 +173,123 @@ impl RealSshdFixture {
                     "-d",
                     "--name",
                     &container,
-                    "-e",
-                    "TTYGATE_FIXTURE_SENTINEL=ENVIRONMENT_SENTINEL_60bd",
-                    "-p",
-                    "127.0.0.1::2222",
+                    "--network",
+                    &network.name,
+                    "--network-alias",
+                    "sshd",
+                    "--read-only",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--cap-drop",
+                    "ALL",
+                    "--cap-add",
+                    "CHOWN",
+                    "--cap-add",
+                    "SETGID",
+                    "--cap-add",
+                    "SETUID",
+                    "--cap-add",
+                    "SYS_CHROOT",
+                    "--pids-limit",
+                    "64",
+                    "--tmpfs",
+                    "/run:rw,nosuid,nodev,noexec,size=1m,mode=755",
+                    "--tmpfs",
+                    "/home/ttygate/.ssh:rw,nosuid,nodev,noexec,size=1m,mode=700",
                     "-v",
                 ])
-                .arg(format!("{}:/fixture:ro", directory.path().display()))
-                .arg(IMAGE),
+                .arg(format!("{}:/fixture:ro", server_directory.display()))
+                .arg(&image_id),
             "start disposable sshd",
         );
         // Arm cleanup before the first readiness await. Dropping or cancelling
         // fixture construction can therefore never strand the container.
         let container = ContainerGuard { name: container };
+        command_ok(
+            Command::new("docker")
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    &relay,
+                    "--read-only",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--cap-drop",
+                    "ALL",
+                    "--pids-limit",
+                    "32",
+                    "-p",
+                    "127.0.0.1::2222",
+                    "--entrypoint",
+                    "/usr/bin/socat",
+                ])
+                .arg(&image_id)
+                .args(["TCP-LISTEN:2222,fork,reuseaddr", "TCP:sshd:2222"]),
+            "start loopback-only sshd relay",
+        );
+        let relay = ContainerGuard { name: relay };
+        command_ok(
+            Command::new("docker").args([
+                "network",
+                "connect",
+                "--alias",
+                "relay",
+                &network.name,
+                &relay.name,
+            ]),
+            "connect relay to isolated sshd network",
+        );
         if let Some(started) = started {
-            let _ = started.send((container.name.clone(), directory.path().to_owned()));
+            let _ = started.send((
+                relay.name.clone(),
+                container.name.clone(),
+                network.name.clone(),
+                directory.path().to_owned(),
+            ));
             std::future::pending::<()>().await;
             unreachable!("paused fixture construction resumes only through cancellation");
         }
-        let port = wait_for_port(&container.name).await;
-        let host_public = public_key_fields(&directory.path().join("ssh_host_ed25519_key.pub"));
-        let wrong_public = public_key_fields(&directory.path().join("wrong_host_key.pub"));
+        let port = wait_for_port(&relay.name, &container.name).await;
+        let host_public = public_key_fields(&client_directory.join("ssh_host_ed25519_key.pub"));
+        let wrong_public = public_key_fields(&client_directory.join("wrong_host_key.pub"));
         fs::write(
-            directory.path().join("known_hosts"),
+            client_directory.join("known_hosts"),
             format!("[127.0.0.1]:{port} {} {}\n", host_public.0, host_public.1),
         )
         .unwrap();
         fs::write(
-            directory.path().join("mismatch_known_hosts"),
+            client_directory.join("mismatch_known_hosts"),
             format!("[127.0.0.1]:{port} {} {}\n", wrong_public.0, wrong_public.1),
         )
         .unwrap();
         fs::write(
-            directory.path().join(SENTINEL_KNOWN_HOSTS),
+            client_directory.join(SENTINEL_KNOWN_HOSTS),
             format!(
                 "[localhost]:{port} {} {} {SENTINEL_KNOWN_HOSTS_CONTENT}\n",
                 host_public.0, host_public.1
             ),
         )
         .unwrap();
-        fs::write(directory.path().join("empty_known_hosts"), b"").unwrap();
-        let audit_path = directory.path().join(SENTINEL_AUDIT_PATH);
+        fs::write(client_directory.join("empty_known_hosts"), b"").unwrap();
+        let audit_path = client_directory.join(SENTINEL_AUDIT_PATH);
         let ssh_executable = PathBuf::from("/usr/bin/ssh");
         assert!(
             ssh_executable.is_file(),
             "system OpenSSH client is required"
         );
         Self {
+            relay,
             container,
-            directory,
+            network,
+            _directory: directory,
             _serial: serial,
+            client_directory,
+            server_directory,
             port,
             audit_path,
             ssh_executable,
+            image_id,
         }
     }
 
@@ -201,8 +299,8 @@ impl RealSshdFixture {
             host: "127.0.0.1".to_owned(),
             port: self.port,
             ssh_executable: self.ssh_executable.clone(),
-            identity_file: self.directory.path().join(identity),
-            known_hosts: self.directory.path().join(known_hosts),
+            identity_file: self.client_directory.join(identity),
+            known_hosts: self.client_directory.join(known_hosts),
             user_policy: SshUserPolicy::Fixed("ttygate".to_owned()),
             read_only: false,
         }
@@ -212,7 +310,7 @@ impl RealSshdFixture {
         let mut target = self.target("known_hosts", "client_key");
         target.port = unused_loopback_port();
         let host_public =
-            public_key_fields(&self.directory.path().join("ssh_host_ed25519_key.pub"));
+            public_key_fields(&self.client_directory.join("ssh_host_ed25519_key.pub"));
         fs::write(
             &target.known_hosts,
             format!(
@@ -439,8 +537,8 @@ impl RealSshdFixture {
     }
 
     async fn assert_sentinel_secrecy(&self) {
-        let identity_path = self.directory.path().join(SENTINEL_IDENTITY);
-        let known_hosts_path = self.directory.path().join(SENTINEL_KNOWN_HOSTS);
+        let identity_path = self.client_directory.join(SENTINEL_IDENTITY);
+        let known_hosts_path = self.client_directory.join(SENTINEL_KNOWN_HOSTS);
         let private_key = fs::read_to_string(&identity_path).unwrap();
         let known_hosts = fs::read_to_string(&known_hosts_path).unwrap();
         let mut sentinel_target = self.target(SENTINEL_KNOWN_HOSTS, SENTINEL_IDENTITY);
@@ -475,36 +573,41 @@ impl RealSshdFixture {
         let known_hosts_argv = format!("UserKnownHostsFile={}", known_hosts_path.display());
         let identity_argv = format!("IdentityFile={}", identity_path.display());
         let mut sentinels = vec![
-            denial.cookie.as_str(),
-            denial.ticket.as_str(),
-            SENTINEL_KNOWN_HOSTS,
-            SENTINEL_IDENTITY,
-            SENTINEL_KNOWN_HOSTS_CONTENT,
-            SENTINEL_PRIVATE_KEY_COMMENT,
-            SENTINEL_HEADER,
-            SENTINEL_ENVIRONMENT,
-            known_hosts_argv.as_str(),
-            identity_argv.as_str(),
-            "StrictHostKeyChecking=yes",
-            "ProxyCommand=none",
-            "LANG=C",
-            "LC_ALL=C",
-            "TERM=xterm-256color",
-            BANNER_MARKER,
-            "localhost",
-            "ttygate",
-            known_host_public_data,
-            known_hosts_path.to_str().unwrap(),
-            identity_path.to_str().unwrap(),
-            self.audit_path.to_str().unwrap(),
+            ("cookie", denial.cookie.as_str()),
+            ("ticket", denial.ticket.as_str()),
+            ("known-hosts-path-marker", SENTINEL_KNOWN_HOSTS),
+            ("identity-path-marker", SENTINEL_IDENTITY),
+            ("known-hosts-content", SENTINEL_KNOWN_HOSTS_CONTENT),
+            ("private-key-comment", SENTINEL_PRIVATE_KEY_COMMENT),
+            ("request-header", SENTINEL_HEADER),
+            ("ambient-environment", SENTINEL_ENVIRONMENT),
+            ("known-hosts-argv", known_hosts_argv.as_str()),
+            ("identity-argv", identity_argv.as_str()),
+            ("strict-host-key-option", "StrictHostKeyChecking=yes"),
+            ("proxy-command-option", "ProxyCommand=none"),
+            ("client-lang", "LANG=C"),
+            ("client-lc-all", "LC_ALL=C"),
+            ("client-term", "TERM=xterm-256color"),
+            ("pre-auth-banner", BANNER_MARKER),
+            ("target-host", "localhost"),
+            ("target-user", "ttygate"),
+            ("known-host-public-data", known_host_public_data),
+            ("known-hosts-path", known_hosts_path.to_str().unwrap()),
+            ("identity-path", identity_path.to_str().unwrap()),
+            ("audit-path", self.audit_path.to_str().unwrap()),
         ];
-        sentinels.extend(private_key.lines().filter(|line| line.len() > 20));
-        for sentinel in sentinels {
-            assert!(
-                !complete_audit.contains(sentinel),
-                "audit leaked {sentinel}"
+        sentinels.extend(
+            private_key
+                .lines()
+                .filter(|line| line.len() > 20)
+                .map(|line| ("private-key-line", line)),
+        );
+        for (label, sentinel) in sentinels {
+            assert_secret_absent(
+                label,
+                sentinel,
+                &[("audit", &complete_audit), ("frontend", &frontend)],
             );
-            assert!(!frontend.contains(sentinel), "frontend leaked {sentinel}");
         }
         assert_eq!(
             denial
@@ -799,9 +902,126 @@ impl RealSshdFixture {
             .unwrap_err();
         assert_eq!(error, SessionError::SshAuthenticationFailed);
         let audit = self.audit_text();
+        assert_eq!(audit.matches("\"event_type\":\"access-denied\"").count(), 1);
         assert!(!audit.contains("session-started"), "{audit}");
+        assert!(!audit.contains("session-ended"), "{audit}");
         assert!(!audit.contains(BANNER_MARKER), "{audit}");
         self.assert_no_session_children().await;
+    }
+
+    fn assert_runtime_hardening(&self) {
+        assert_server_fixture_allowlist(&self.server_directory);
+        let dockerfile = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sshd/Dockerfile"),
+        )
+        .unwrap();
+        for pinned in [
+            "FROM alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1",
+            "openssh-server=10.0_p1-r10",
+            "procps-ng=4.0.4-r3",
+            "socat=1.8.1.3-r0",
+        ] {
+            assert!(dockerfile.contains(pinned), "fixture supply pin missing");
+        }
+        let server = docker_inspect(&self.container.name);
+        assert_eq!(server["Image"], self.image_id);
+        assert_eq!(server["HostConfig"]["ReadonlyRootfs"], true);
+        assert_eq!(server["HostConfig"]["PidsLimit"], 64);
+        assert_eq!(server["HostConfig"]["CapDrop"], serde_json::json!(["ALL"]));
+        let mut cap_add = server["HostConfig"]["CapAdd"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        cap_add.sort_unstable();
+        assert_eq!(
+            cap_add,
+            ["CAP_CHOWN", "CAP_SETGID", "CAP_SETUID", "CAP_SYS_CHROOT"]
+        );
+        assert_eq!(
+            server["HostConfig"]["SecurityOpt"],
+            serde_json::json!(["no-new-privileges"])
+        );
+        let networks = server["NetworkSettings"]["Networks"].as_object().unwrap();
+        assert_eq!(networks.len(), 1);
+        assert!(networks.contains_key(&self.network.name));
+        let fixture_mount = server["Mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["Destination"] == "/fixture")
+            .unwrap();
+        assert_eq!(
+            fixture_mount["Source"],
+            self.server_directory.to_str().unwrap()
+        );
+        assert_eq!(fixture_mount["RW"], false);
+        let mounted = command_ok(
+            Command::new("docker").args([
+                "exec",
+                &self.container.name,
+                "sh",
+                "-c",
+                "find /fixture -mindepth 1 -maxdepth 1 -type f -exec basename {} \\; | sort",
+            ]),
+            "inspect server-only fixture mount",
+        );
+        assert_eq!(
+            String::from_utf8(mounted.stdout).unwrap(),
+            "accepted_client_key.pub\nbanner\nssh_host_ed25519_key\n"
+        );
+        let route = command_ok(
+            Command::new("docker").args(["exec", &self.container.name, "cat", "/proc/net/route"]),
+            "inspect isolated sshd routes",
+        );
+        assert!(
+            !String::from_utf8_lossy(&route.stdout)
+                .lines()
+                .skip(1)
+                .any(|line| line.split_whitespace().nth(1) == Some("00000000"))
+        );
+        let packages = command_ok(
+            Command::new("docker").args([
+                "exec",
+                &self.container.name,
+                "apk",
+                "list",
+                "--installed",
+            ]),
+            "inspect pinned fixture packages",
+        );
+        let packages = String::from_utf8(packages.stdout).unwrap();
+        for pinned in [
+            "openssh-server-10.0_p1-r10",
+            "procps-ng-4.0.4-r3",
+            "socat-1.8.1.3-r0",
+        ] {
+            assert!(packages.lines().any(|line| line.starts_with(pinned)));
+        }
+        let rootfs = Command::new("docker")
+            .args(["exec", &self.container.name, "touch", "/must-not-write"])
+            .output()
+            .unwrap();
+        assert!(!rootfs.status.success(), "sshd rootfs was writable");
+
+        let relay = docker_inspect(&self.relay.name);
+        assert_eq!(relay["Image"], self.image_id);
+        assert_eq!(relay["HostConfig"]["ReadonlyRootfs"], true);
+        assert_eq!(relay["HostConfig"]["PidsLimit"], 32);
+        assert_eq!(relay["HostConfig"]["CapDrop"], serde_json::json!(["ALL"]));
+        assert!(relay["HostConfig"]["CapAdd"].is_null());
+        assert_eq!(
+            relay["HostConfig"]["SecurityOpt"],
+            serde_json::json!(["no-new-privileges"])
+        );
+        assert!(relay["Mounts"].as_array().unwrap().is_empty());
+        let relay_networks = relay["NetworkSettings"]["Networks"].as_object().unwrap();
+        assert_eq!(relay_networks.len(), 2);
+        assert!(relay_networks.contains_key("bridge"));
+        assert!(relay_networks.contains_key(&self.network.name));
+        let binding = &relay["HostConfig"]["PortBindings"]["2222/tcp"][0];
+        assert_eq!(binding["HostIp"], "127.0.0.1");
     }
 
     async fn assert_no_session_children(&self) {
@@ -829,7 +1049,7 @@ impl RealSshdFixture {
     }
 
     fn local_ssh_pid(&self) -> i32 {
-        let needle = self.directory.path().join("client_key");
+        let needle = self.client_directory.join("client_key");
         let output = command_ok(
             Command::new("ps").args(["-eo", "pid=,command="]),
             "inspect local SSH fixture process",
@@ -904,6 +1124,10 @@ struct ContainerGuard {
     name: String,
 }
 
+struct NetworkGuard {
+    name: String,
+}
+
 impl std::ops::Deref for ContainerGuard {
     type Target = str;
 
@@ -925,6 +1149,91 @@ impl Drop for ContainerGuard {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+}
+
+impl Drop for NetworkGuard {
+    fn drop(&mut self) {
+        let output = Command::new("docker")
+            .args(["network", "rm", &self.name])
+            .output();
+        if !std::thread::panicking() {
+            let output = output.expect("remove disposable sshd network");
+            assert!(
+                output.status.success(),
+                "docker network cleanup failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+fn fixture_image_id() -> String {
+    FIXTURE_IMAGE_ID
+        .get_or_init(|| {
+            let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sshd");
+            let output = command_ok(
+                Command::new("docker")
+                    .args(["build", "-q"])
+                    .arg(&fixture_dir),
+                "build disposable sshd image",
+            );
+            let image_id = String::from_utf8(output.stdout).unwrap();
+            let image_id = image_id.lines().last().unwrap_or_default().trim();
+            assert!(
+                image_id.strip_prefix("sha256:").is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }),
+                "docker build did not return an immutable sha256 image ID"
+            );
+            image_id.to_owned()
+        })
+        .clone()
+}
+
+fn docker_inspect(name: &str) -> serde_json::Value {
+    let output = command_ok(
+        Command::new("docker").args(["inspect", name]),
+        "inspect disposable fixture runtime",
+    );
+    serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+fn assert_server_fixture_allowlist(server_directory: &Path) {
+    let mut entries = fs::read_dir(server_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(
+        entries,
+        ["accepted_client_key.pub", "banner", "ssh_host_ed25519_key"]
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(server_directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(server_directory.join("ssh_host_ed25519_key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+fn assert_secret_absent(label: &str, value: &str, surfaces: &[(&str, &str)]) {
+    for (surface_label, content) in surfaces {
+        assert!(
+            !content.contains(value),
+            "{surface_label} leaked secret class {label}"
+        );
     }
 }
 
@@ -958,11 +1267,11 @@ fn command_ok(command: &mut Command, context: &str) -> Output {
     output
 }
 
-async fn wait_for_port(container: &str) -> u16 {
+async fn wait_for_port(relay: &str, sshd: &str) -> u16 {
     timeout(WAIT, async {
         loop {
             let output = Command::new("docker")
-                .args(["port", container, "2222/tcp"])
+                .args(["port", relay, "2222/tcp"])
                 .output()
                 .expect("query sshd port");
             if output.status.success()
@@ -971,11 +1280,30 @@ async fn wait_for_port(container: &str) -> u16 {
                     .rsplit(':')
                     .next()
                     .and_then(|value| value.parse().ok())
-                && TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-                    .await
-                    .is_ok()
+                && let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await
             {
-                return port;
+                let mut banner = [0_u8; 4];
+                if timeout(Duration::from_secs(1), stream.read_exact(&mut banner))
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+                    && banner == *b"SSH-"
+                {
+                    return port;
+                }
+            }
+            let running = Command::new("docker")
+                .args(["inspect", "--format", "{{.State.Running}}", sshd])
+                .output()
+                .expect("inspect sshd readiness");
+            if running.status.success() && running.stdout == b"false\n" {
+                let logs = Command::new("docker")
+                    .args(["logs", sshd])
+                    .output()
+                    .expect("read failed sshd logs");
+                panic!(
+                    "sshd exited before readiness: {}",
+                    String::from_utf8_lossy(&logs.stderr)
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1171,10 +1499,29 @@ async fn ssh_secret_sentinels_never_reach_audit_or_frontend_errors() {
         .expect("self-spawn isolated SSH secrecy test");
     assert!(
         output.status.success(),
-        "isolated SSH secrecy test failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "isolated SSH secrecy child failed with status {}",
+        output.status
     );
+}
+
+#[test]
+fn secret_scan_failure_reports_label_not_value() {
+    let secret = "DO_NOT_RENDER_SECRET_2f4075";
+    let panic = std::panic::catch_unwind(|| {
+        assert_secret_absent(
+            "identity-private-key",
+            secret,
+            &[("audit", &format!("prefix {secret} suffix"))],
+        );
+    })
+    .unwrap_err();
+    let diagnostic = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap();
+    assert!(diagnostic.contains("identity-private-key"));
+    assert!(!diagnostic.contains(secret));
 }
 
 #[tokio::test]
@@ -1212,13 +1559,20 @@ async fn malicious_pre_auth_banner_cannot_forge_ssh_admission() {
 }
 
 #[tokio::test]
+async fn sshd_fixture_mount_and_runtime_are_minimal_and_isolated() {
+    let fixture = RealSshdFixture::start().await;
+    fixture.assert_runtime_hardening();
+}
+
+#[tokio::test]
 async fn cancelled_fixture_construction_removes_container_materials_and_releases_lock() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let construction = tokio::spawn(RealSshdFixture::start_paused_after_container(started_tx));
-    let (container, material_directory) = timeout(Duration::from_secs(60), started_rx)
-        .await
-        .expect("fixture did not arm cleanup")
-        .expect("fixture report was dropped");
+    let (relay, container, network, material_directory) =
+        timeout(Duration::from_secs(60), started_rx)
+            .await
+            .expect("fixture did not arm cleanup")
+            .expect("fixture report was dropped");
     construction.abort();
     assert!(matches!(
         construction.await,
@@ -1233,6 +1587,16 @@ async fn cancelled_fixture_construction_removes_container_materials_and_releases
         !inspect.status.success(),
         "cancelled fixture container survived"
     );
+    for absent in [relay, network] {
+        let inspect = Command::new("docker")
+            .args(["inspect", &absent])
+            .output()
+            .unwrap();
+        assert!(
+            !inspect.status.success(),
+            "cancelled fixture runtime object survived"
+        );
+    }
     timeout(Duration::from_secs(60), RealSshdFixture::start())
         .await
         .expect("cancelled fixture retained the serial lock");

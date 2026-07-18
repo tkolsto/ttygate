@@ -2413,9 +2413,13 @@ requesttty force\n"
     #[tokio::test]
     async fn ssh_admission_uses_private_fifo_and_never_raw_stderr() {
         let material = Material::new();
-        let script = b"#!/bin/sh\nwhile [ \"$1\" != \"-E\" ]; do shift; done\nlog=$2\nprintf 'READY\\n'\nread first\nprintf 'debug1: setup continues\\n' > \"$log\"\nprintf 'Authenticated to host.example using \"publickey\".\\n' >&2\nprintf 'PHASE2\\n'\nread second\nprintf 'Authenticated to host.example using \"publickey\".\\n' > \"$log\"\nprintf 'DONE\\n'\n";
+        let script = b"#!/bin/sh\nwhile [ \"$1\" != \"-E\" ]; do shift; done\nlog=$2\nprintf 'READY\\n'\nread first\nprintf 'debug1: setup continues\\n' > \"$log\"\nprintf 'Authenticated to 127.0.0.1 using \"publickey\".\\n' >&2\nprintf 'PHASE2\\n'\nread second\nprintf 'No more authentication methods to try.\\n' > \"$log\"\nprintf 'DONE\\n'\n";
         write(&material.executable, script, 0o700);
-        let (_target, prepared) = prepared_runtime_fixture(&material).await;
+        let mut target = material.target();
+        target.host = "127.0.0.1".to_owned();
+        let prepared = prepare_target_with_probe(&target, accept_probe)
+            .await
+            .unwrap();
         let spec = super::SshSpawnSpec::build(&prepared, "ignored").unwrap();
         let fifo_path = spec.client_log_path_for_test().to_owned();
         let metadata = fs::metadata(&fifo_path).unwrap();
@@ -2481,7 +2485,18 @@ requesttty force\n"
         .await
         .expect("raw stderr marker timed out")
         .unwrap();
-        assert!(raw.windows(17).any(|window| window == b"Authenticated to "));
+        let exact_banner = b"Authenticated to 127.0.0.1 using \"publickey\".\n";
+        assert!(
+            raw.windows(exact_banner.len())
+                .any(|window| window == exact_banner)
+        );
+        let mut raw_stderr_oracle = classifier_for_test("127.0.0.1");
+        raw_stderr_oracle.push(exact_banner);
+        assert_eq!(
+            raw_stderr_oracle.classification(),
+            Some(super::SshDiagnosticClass::Authenticated)
+        );
+        assert_eq!(classifier.classification(), None);
         tokio::time::timeout(
             wait,
             tokio::io::AsyncWriteExt::write_all(&mut writer, b"second\n"),
@@ -2489,14 +2504,20 @@ requesttty force\n"
         .await
         .expect("second phase signal timed out")
         .unwrap();
-        let count = tokio::time::timeout(wait, client_log.read(&mut trusted))
-            .await
-            .expect("authenticated client-log line timed out")
-            .unwrap();
-        classifier.push(&trusted[..count]);
+        tokio::time::timeout(wait, async {
+            while classifier.classification().is_none() {
+                let count = client_log.read(&mut trusted).await?;
+                assert_ne!(count, 0, "client log closed before authentication denial");
+                classifier.push(&trusted[..count]);
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .expect("authentication denial client-log line timed out")
+        .unwrap();
         assert_eq!(
             classifier.classification(),
-            Some(super::SshDiagnosticClass::Authenticated)
+            Some(super::SshDiagnosticClass::AuthenticationFailed)
         );
         let mut completion = Vec::new();
         tokio::time::timeout(

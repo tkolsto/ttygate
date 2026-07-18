@@ -1,8 +1,10 @@
 #!/bin/sh
 set -eu
 
-install -o ttygate -g ttygate -m 0600 \
-  /fixture/client_key.pub /home/ttygate/.ssh/authorized_keys
+cp /fixture/accepted_client_key.pub /home/ttygate/.ssh/authorized_keys
+chmod 0600 /home/ttygate/.ssh/authorized_keys
+chown ttygate:ttygate /home/ttygate/.ssh/authorized_keys
+chown ttygate:ttygate /home/ttygate/.ssh
 
 exec /usr/sbin/sshd -D -e \
   -p 2222 \
@@ -12,6 +14,5 @@ exec /usr/sbin/sshd -D -e \
   -o PubkeyAuthentication=yes \
   -o PermitRootLogin=no \
   -o AllowUsers=ttygate \
-  -o UsePAM=no \
   -o PrintMotd=no \
   -o Banner=/fixture/banner
