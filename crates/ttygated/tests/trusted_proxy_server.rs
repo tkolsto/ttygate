@@ -653,6 +653,7 @@ async fn raw_http_optional_whitespace_has_explicit_semantic_identity_behavior() 
             .tickets()
             .redeem(ticket, &alice)
             .unwrap()
+            .target()
             .name(),
         "shell"
     );
@@ -795,10 +796,10 @@ async fn proxy_strips_spoofed_identity_before_injecting_authenticated_identity()
         .to_owned();
     let ticket = proxy.issue_ticket(&cookie).await;
     let mallory = Identity::new("mallory").unwrap();
-    assert_eq!(
+    assert!(matches!(
         backend.state.tickets().redeem(&ticket, &mallory),
         Err(TicketError::WrongIdentity)
-    );
+    ));
     let alice = Identity::new("alice").unwrap();
     assert_eq!(
         backend
@@ -806,6 +807,7 @@ async fn proxy_strips_spoofed_identity_before_injecting_authenticated_identity()
             .tickets()
             .redeem(&ticket, &alice)
             .unwrap()
+            .target()
             .name(),
         "shell"
     );
@@ -887,10 +889,10 @@ async fn existing_cookie_identity_survives_proxy_account_switch() {
 
     let ticket = bob_proxy.issue_ticket(&alice_cookie).await;
     let bob = Identity::new("bob").unwrap();
-    assert_eq!(
+    assert!(matches!(
         backend.state.tickets().redeem(&ticket, &bob),
         Err(TicketError::WrongIdentity)
-    );
+    ));
     let alice = Identity::new("alice").unwrap();
     assert_eq!(
         backend
@@ -898,6 +900,7 @@ async fn existing_cookie_identity_survives_proxy_account_switch() {
             .tickets()
             .redeem(&ticket, &alice)
             .unwrap()
+            .target()
             .name(),
         "shell"
     );

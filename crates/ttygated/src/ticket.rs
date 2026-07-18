@@ -7,7 +7,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use thiserror::Error;
 
-use crate::config::Target;
+use crate::{config::Target, session::SessionReservation};
 
 const TOKEN_BYTES: usize = 32;
 const TOKEN_LENGTH: usize = 43;
@@ -86,6 +86,23 @@ struct Entry {
     identity: Identity,
     target: Target,
     expires_at: Instant,
+    reservation: SessionReservation,
+}
+
+#[derive(Debug)]
+pub struct TicketGrant {
+    target: Target,
+    reservation: SessionReservation,
+}
+
+impl TicketGrant {
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    pub fn into_parts(self) -> (Target, SessionReservation) {
+        (self.target, self.reservation)
+    }
 }
 
 pub struct TicketStore {
@@ -121,7 +138,16 @@ impl TicketStore {
         }
     }
 
-    pub fn issue(&self, identity: Identity, target: Target) -> Result<Ticket, TicketError> {
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    pub fn issue(
+        &self,
+        identity: Identity,
+        target: Target,
+        reservation: SessionReservation,
+    ) -> Result<Ticket, TicketError> {
         let now = self.clock.now();
         let mut entries = self
             .entries
@@ -141,6 +167,7 @@ impl TicketStore {
                         identity,
                         target,
                         expires_at: now + self.ttl,
+                        reservation,
                     },
                 );
                 return Ok(Ticket(token));
@@ -149,7 +176,7 @@ impl TicketStore {
         Err(TicketError::Generation)
     }
 
-    pub fn redeem(&self, ticket: &str, identity: &Identity) -> Result<Target, TicketError> {
+    pub fn redeem(&self, ticket: &str, identity: &Identity) -> Result<TicketGrant, TicketError> {
         if ticket.len() != TOKEN_LENGTH
             || !ticket
                 .bytes()
@@ -170,7 +197,18 @@ impl TicketStore {
         if &entry.identity != identity {
             return Err(TicketError::WrongIdentity);
         }
-        Ok(entries.remove(ticket).expect("entry was checked").target)
+        let entry = entries.remove(ticket).expect("entry was checked");
+        Ok(TicketGrant {
+            target: entry.target,
+            reservation: entry.reservation,
+        })
+    }
+
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }
 
@@ -185,7 +223,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::config::{PtyTarget, Target};
+    use crate::{
+        config::{PtyTarget, Target},
+        session::SessionReservation,
+    };
 
     use super::{Clock, Identity, TicketError, TicketGenerator, TicketStore};
 
@@ -236,21 +277,31 @@ mod tests {
         })
     }
 
+    fn reservation(identity: &Identity) -> SessionReservation {
+        SessionReservation::test_reservation(identity)
+    }
+
     #[test]
     fn tickets_are_opaque_target_bound_and_single_use() {
         let store = TicketStore::new(Duration::from_secs(10), 8);
         let alice = Identity::new("alice").unwrap();
-        let ticket = store.issue(alice.clone(), target("shell")).unwrap();
+        let ticket = store
+            .issue(alice.clone(), target("shell"), reservation(&alice))
+            .unwrap();
         assert_eq!(ticket.as_str().len(), 43);
         assert!(!ticket.as_str().contains("alice"));
         assert_eq!(
-            store.redeem(ticket.as_str(), &alice).unwrap().name(),
+            store
+                .redeem(ticket.as_str(), &alice)
+                .unwrap()
+                .target()
+                .name(),
             "shell"
         );
-        assert_eq!(
+        assert!(matches!(
             store.redeem(ticket.as_str(), &alice),
             Err(TicketError::Unknown)
-        );
+        ));
     }
 
     #[test]
@@ -258,13 +309,19 @@ mod tests {
         let store = TicketStore::new(Duration::from_secs(10), 8);
         let alice = Identity::new("alice").unwrap();
         let bob = Identity::new("bob").unwrap();
-        let ticket = store.issue(alice.clone(), target("shell")).unwrap();
-        assert_eq!(
+        let ticket = store
+            .issue(alice.clone(), target("shell"), reservation(&alice))
+            .unwrap();
+        assert!(matches!(
             store.redeem(ticket.as_str(), &bob),
             Err(TicketError::WrongIdentity)
-        );
+        ));
         assert_eq!(
-            store.redeem(ticket.as_str(), &alice).unwrap().name(),
+            store
+                .redeem(ticket.as_str(), &alice)
+                .unwrap()
+                .target()
+                .name(),
             "shell"
         );
     }
@@ -273,37 +330,46 @@ mod tests {
     fn malformed_unknown_and_expired_tickets_have_typed_errors() {
         let (store, clock) = controlled_store(Duration::from_millis(5), 8);
         let identity = Identity::new("dev").unwrap();
-        assert_eq!(
+        assert!(matches!(
             store.redeem("short", &identity),
             Err(TicketError::Malformed)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             store.redeem(&"x".repeat(10_000), &identity),
             Err(TicketError::Malformed)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             store.redeem(&"A".repeat(43), &identity),
             Err(TicketError::Unknown)
-        );
-        let ticket = store.issue(identity.clone(), target("shell")).unwrap();
+        ));
+        let ticket = store
+            .issue(identity.clone(), target("shell"), reservation(&identity))
+            .unwrap();
         clock.millis.store(5, Ordering::SeqCst);
-        assert_eq!(
+        assert!(matches!(
             store.redeem(ticket.as_str(), &identity),
             Err(TicketError::Expired)
-        );
+        ));
     }
 
     #[test]
     fn store_capacity_is_hard_bounded_and_expiry_releases_it() {
         let (store, clock) = controlled_store(Duration::from_millis(5), 1);
         let identity = Identity::new("dev").unwrap();
-        store.issue(identity.clone(), target("one")).unwrap();
+        store
+            .issue(identity.clone(), target("one"), reservation(&identity))
+            .unwrap();
         assert_eq!(
-            store.issue(identity.clone(), target("two")),
+            store.issue(identity.clone(), target("two"), reservation(&identity)),
             Err(TicketError::AtCapacity)
         );
         clock.millis.store(5, Ordering::SeqCst);
-        assert!(store.issue(identity, target("three")).is_ok());
+        let third_reservation = reservation(&identity);
+        assert!(
+            store
+                .issue(identity, target("three"), third_reservation)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -311,7 +377,7 @@ mod tests {
         let store = Arc::new(TicketStore::new(Duration::from_secs(10), 8));
         let identity = Identity::new("dev").unwrap();
         let ticket = store
-            .issue(identity.clone(), target("shell"))
+            .issue(identity.clone(), target("shell"), reservation(&identity))
             .unwrap()
             .as_str()
             .to_owned();
@@ -350,15 +416,17 @@ mod tests {
             Arc::new(FixedGenerator),
         );
         let identity = Identity::new("dev").unwrap();
-        let ticket = store.issue(identity.clone(), target("shell")).unwrap();
+        let ticket = store
+            .issue(identity.clone(), target("shell"), reservation(&identity))
+            .unwrap();
         assert_eq!(
-            store.issue(identity.clone(), target("other")),
+            store.issue(identity.clone(), target("other"), reservation(&identity)),
             Err(TicketError::Generation)
         );
         clock.millis.store(10, Ordering::SeqCst);
-        assert_eq!(
+        assert!(matches!(
             store.redeem(ticket.as_str(), &identity),
             Err(TicketError::Expired)
-        );
+        ));
     }
 }

@@ -94,6 +94,14 @@ fn app_with_limits(limits: Limits) -> axum::Router {
 }
 
 fn app_with_auth_and_limits(auth: Arc<dyn AuthProvider>, limits: Limits) -> axum::Router {
+    app_with_auth_limits_and_ticket_ttl(auth, limits, std::time::Duration::from_secs(10))
+}
+
+fn app_with_auth_limits_and_ticket_ttl(
+    auth: Arc<dyn AuthProvider>,
+    limits: Limits,
+    ticket_ttl: std::time::Duration,
+) -> axum::Router {
     let target = Target::Pty(PtyTarget {
         name: "shell".into(),
         executable: "/bin/sh".into(),
@@ -104,7 +112,7 @@ fn app_with_auth_and_limits(auth: Arc<dyn AuthProvider>, limits: Limits) -> axum
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
-        TicketStore::new(std::time::Duration::from_secs(10), 32),
+        TicketStore::new(ticket_ttl, 32),
         limits,
     ))
 }
@@ -587,6 +595,8 @@ async fn authenticated_invalid_body_and_target_requests_consume_allowance() {
 async fn concurrent_session_requests_have_exactly_the_configured_winners() {
     let mut configured = limits();
     configured.session_requests_per_window = 8;
+    configured.max_sessions = 32;
+    configured.max_sessions_per_user = 32;
     let app = app_with_limits(configured);
     let cookie = provision_cookie(&app).await;
     let tasks = (0..32)
@@ -688,6 +698,169 @@ async fn session_rate_never_uses_peer_or_forwarded_header_as_identity() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn global_capacity_is_reserved_at_ticket_issuance() {
+    let mut configured = limits();
+    configured.max_sessions = 2;
+    configured.max_sessions_per_user = 2;
+    let app = app_with_auth_and_limits(Arc::new(CookieIdentityAuth), configured);
+
+    for cookie in ["user=alice", "user=bob"] {
+        assert_eq!(
+            response(
+                &app,
+                "POST",
+                "/api/sessions",
+                Some(ORIGIN),
+                Some(cookie),
+                r#"{"target":"shell"}"#,
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+    }
+    let rejected = response(
+        &app,
+        "POST",
+        "/api/sessions",
+        Some(ORIGIN),
+        Some("user=carol"),
+        r#"{"target":"shell"}"#,
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json(rejected).await["error"]["code"],
+        "global-session-limit"
+    );
+}
+
+#[tokio::test]
+async fn per_identity_capacity_is_reserved_without_blocking_another_identity() {
+    let mut configured = limits();
+    configured.max_sessions = 2;
+    configured.max_sessions_per_user = 1;
+    let app = app_with_auth_and_limits(Arc::new(CookieIdentityAuth), configured);
+
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some("user=alice"),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    let rejected = response(
+        &app,
+        "POST",
+        "/api/sessions",
+        Some(ORIGIN),
+        Some("user=alice"),
+        r#"{"target":"shell"}"#,
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json(rejected).await["error"]["code"],
+        "identity-session-limit"
+    );
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some("user=bob"),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn concurrent_ticket_requests_have_exactly_configured_winners() {
+    let mut configured = limits();
+    configured.max_sessions = 4;
+    configured.max_sessions_per_user = 4;
+    configured.session_requests_per_window = 64;
+    let app = app_with_auth_and_limits(Arc::new(CookieIdentityAuth), configured);
+    let tasks = (0..32)
+        .map(|_| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                response(
+                    &app,
+                    "POST",
+                    "/api/sessions",
+                    Some(ORIGIN),
+                    Some("user=alice"),
+                    r#"{"target":"shell"}"#,
+                )
+                .await
+                .status()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut created = 0;
+    let mut rejected = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            StatusCode::CREATED => created += 1,
+            StatusCode::SERVICE_UNAVAILABLE => rejected += 1,
+            status => panic!("unexpected ticket issuance status {status}"),
+        }
+    }
+    assert_eq!((created, rejected), (4, 28));
+}
+
+#[tokio::test]
+async fn abandoned_ticket_expiry_recovers_capacity() {
+    let mut configured = limits();
+    configured.max_sessions = 1;
+    configured.max_sessions_per_user = 1;
+    let app = app_with_auth_limits_and_ticket_ttl(
+        Arc::new(CookieIdentityAuth),
+        configured,
+        std::time::Duration::from_millis(5),
+    );
+
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some("user=alice"),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(
+        response(
+            &app,
+            "POST",
+            "/api/sessions",
+            Some(ORIGIN),
+            Some("user=bob"),
+            r#"{"target":"shell"}"#,
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
 }
 
 #[tokio::test]

@@ -23,7 +23,7 @@ use crate::{
     origin::OriginPolicy,
     protocol::MAX_BINARY_BYTES,
     rate_limit::{Attempt, FixedWindowLimiter, LimitError},
-    session::SessionManager,
+    session::{SessionError, SessionManager},
     ticket::{TicketError, TicketStore},
     websocket,
 };
@@ -440,7 +440,35 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
         }
     };
     let presentation = TargetPresentation::from(&target);
-    match state.tickets.issue(identity, target) {
+    let reservation = match state
+        .sessions
+        .reserve(&identity, tokio::time::Instant::now() + state.tickets.ttl())
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(SessionError::GlobalLimit) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "global-session-limit",
+                "Global session capacity is unavailable.",
+            );
+        }
+        Err(SessionError::IdentityLimit) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity-session-limit",
+                "Identity session capacity is unavailable.",
+            );
+        }
+        Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session-unavailable",
+                "Session capacity is unavailable.",
+            );
+        }
+    };
+    match state.tickets.issue(identity, target, reservation) {
         Ok(ticket) => (
             StatusCode::CREATED,
             axum::Json(TicketResponse {

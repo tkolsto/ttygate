@@ -87,6 +87,7 @@ fn safe_session_error(error: SessionError) -> BridgeFailure {
         | SessionError::IdentityLimit
         | SessionError::TargetUnavailable
         | SessionError::ManagerClosed
+        | SessionError::ReservationUnavailable
         | SessionError::ReadOnly => BridgeFailure {
             error: error_control("session-denied", "The terminal session is not available."),
             close_reason: CloseReason::Policy,
@@ -182,13 +183,14 @@ pub async fn accept_upgrade(
             return;
         }
     };
-    let target = match tickets.redeem(&ticket, &identity) {
-        Ok(target) => target,
+    let grant = match tickets.redeem(&ticket, &identity) {
+        Ok(grant) => grant,
         Err(error) => {
             send_failure(&mut socket, safe_ticket_error(error)).await;
             return;
         }
     };
+    let (target, reservation) = grant.into_parts();
     if !matches!(target, Target::Pty(_)) {
         send_failure(
             &mut socket,
@@ -199,7 +201,10 @@ pub async fn accept_upgrade(
     }
     let size =
         Resize::new(INITIAL_COLS, INITIAL_ROWS).expect("the fixed initial terminal size is valid");
-    let session = match sessions.start(identity, target.name(), size).await {
+    let session = match sessions
+        .start_reserved(reservation, identity, target.name(), size)
+        .await
+    {
         Ok(session) => session,
         Err(error) => {
             send_failure(&mut socket, safe_session_error(error)).await;
@@ -813,6 +818,7 @@ mod tests {
             SessionError::IdentityLimit,
             SessionError::TargetUnavailable,
             SessionError::ManagerClosed,
+            SessionError::ReservationUnavailable,
             SessionError::ReadOnly,
         ];
         for error in policy {
@@ -844,6 +850,7 @@ mod tests {
             SessionError::SpawnUnavailable,
             SessionError::TargetUnavailable,
             SessionError::ManagerClosed,
+            SessionError::ReservationUnavailable,
             SessionError::BackendUnavailable,
             SessionError::Closed,
             SessionError::ReadOnly,
