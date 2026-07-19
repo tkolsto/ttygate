@@ -119,14 +119,18 @@ grep -q '^SESSION_READY$' "$fixture_log" ||
 main_pid=$(sudo systemctl show "$unit_name" --property MainPID --value)
 pgrep -P "$main_pid" >/dev/null ||
   fail "live service had no observable PTY child"
+control_group=$(sudo systemctl show "$unit_name" --property ControlGroup --value)
+[ -n "$control_group" ] || fail "active service has no control group"
+service_pids=$(sudo cat "/sys/fs/cgroup$control_group/cgroup.procs")
+[ "$(printf '%s\n' "$service_pids" | wc -w | tr -d ' ')" -ge 2 ] ||
+  fail "service control group did not contain the daemon and PTY child"
 sudo systemctl stop "$unit_name"
-attempt=0
-while kill -0 "$fixture_pid" >/dev/null 2>&1 && [ "$attempt" -lt 10 ]; do
-  attempt=$((attempt + 1))
-  sleep 1
+for service_pid in $service_pids; do
+  if sudo kill -0 "$service_pid" >/dev/null 2>&1; then
+    fail "service control-group process survived stop"
+  fi
 done
-kill -0 "$fixture_pid" >/dev/null 2>&1 &&
-  fail "session fixture survived service control-group teardown"
+kill "$fixture_pid"
 wait "$fixture_pid" >/dev/null 2>&1 || true
 fixture_pid=
 

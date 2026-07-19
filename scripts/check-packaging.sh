@@ -36,6 +36,7 @@ SYSTEMD_SYSUSERS=packaging/systemd/ttygate.sysusers
 SYSTEMD_TMPFILES=packaging/systemd/ttygate.tmpfiles
 SYSTEMD_CONFIG=packaging/systemd/ttygate.toml
 SYSTEMD_README=packaging/systemd/README.md
+CI_WORKFLOW=.github/workflows/ci.yml
 
 for file in \
   "$DOCKERFILE" \
@@ -65,6 +66,8 @@ require_text "$DOCKERFILE" 'snapshot\.debian\.org/archive/debian/[0-9]{8}T[0-9]{
 require_text "$DOCKERFILE" '^ARG SOURCE_DATE_EPOCH=1769990400$' 'the pinned Debian snapshot epoch'
 require_text "$DOCKERFILE" 'touch --no-dereference --date="@\$\{SOURCE_DATE_EPOCH\}"' 'generated-file timestamp normalization'
 require_text scripts/smoke-docker.sh 'rewrite-timestamp=true' 'layer timestamp normalization during OCI export'
+require_text scripts/smoke-docker.sh 'docker buildx build' 'portable BuildKit exporter invocation'
+require_text "$CI_WORKFLOW" 'docker/setup-buildx-action@[0-9a-f]{40}' 'a digest-pinned portable BuildKit builder'
 require_text "$DOCKERFILE" 'rm -f /etc/apt/sources\.list\.d/debian\.sources' 'removal of mutable Debian package sources'
 require_text "$DOCKERFILE" 'groupadd .*ttygate|addgroup .*ttygate' 'a dedicated runtime group'
 require_text "$DOCKERFILE" 'useradd .*ttygate|adduser .*ttygate' 'a dedicated runtime user'
@@ -151,5 +154,8 @@ require_text "$SYSTEMD_README" 'PrivateNetwork' 'network namespace exception'
 require_text "$SYSTEMD_README" 'PrivateUsers' 'user namespace exception'
 require_text "$SYSTEMD_README" 'owner|ownership' 'SSH and audit ownership contract'
 require_text "$SYSTEMD_README" 'systemd-analyze' 'unit verification command'
+# shellcheck disable=SC2016 # The dollar sign is literal script text in this regex.
+require_text scripts/smoke-systemd.sh '/sys/fs/cgroup\$control_group/cgroup\.procs' 'runtime service-cgroup PID capture'
+require_text scripts/smoke-systemd.sh 'service control-group process survived stop' 'runtime service-cgroup teardown assertion'
 
 printf 'All packaging contract checks passed.\n'

@@ -34,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-docker build \
+docker buildx build \
   --build-arg "CACHE_SCOPE=$run_id" \
   --build-arg SOURCE_DATE_EPOCH=1769990400 \
   --no-cache \
@@ -44,7 +44,7 @@ docker build \
   .
 first_index=$(tar -xOf "$archive_one" index.json)
 
-docker build \
+docker buildx build \
   --build-arg "CACHE_SCOPE=$run_id" \
   --build-arg SOURCE_DATE_EPOCH=1769990400 \
   --no-cache \
