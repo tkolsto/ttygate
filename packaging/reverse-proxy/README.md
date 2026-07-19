@@ -1,0 +1,312 @@
+# Reverse-proxy production deployment
+
+These examples put Caddy or Nginx in front of ttygate's implemented
+`trusted-proxy` authentication provider. They are pre-release examples, not a
+production-readiness claim. Chunk 4.3 release checks remain incomplete.
+
+The security boundary is:
+
+```text
+browser --HTTPS/WSS--> authenticating TLS proxy --private HTTP--> ttygate
+```
+
+The browser reaches the TLS proxy, never ttygate directly. Only the proxy can
+reach the backend listener. ttygate then verifies that the actual socket peer
+is in its configured trusted CIDR before it accepts a cookie or reads the
+identity header. `Forwarded`, `X-Forwarded-For`, `X-Real-IP`, Host, and similar
+headers do not establish ttygate identity or trusted-peer authority.
+
+A compromised trusted proxy can impersonate every user. Network source
+restrictions prevent direct header spoofing; they do not make a compromised
+proxy trustworthy.
+
+## Files and replacement tuple
+
+- [`Caddyfile`](Caddyfile) is the complete Caddy example.
+- [`nginx.conf`](nginx.conf) is the complete Nginx example.
+- [`ttygate.toml`](ttygate.toml) is their matching backend configuration.
+
+The committed files use `terminal.example.invalid` and `192.0.2.10/32`, values
+reserved for documentation. They cannot be valid production DNS or a
+production proxy address. Replace the following as one reviewed tuple:
+
+1. `terminal.example.invalid:8443` in the proxy and ttygate `public_url`;
+2. the proxy's external listeners and firewall policy;
+3. `192.0.2.10/32` with the exact address and prefix ttygate sees as the
+   proxy's backend socket source;
+4. `/etc/ttygate-proxy/tls/certificate.pem` and `private-key.pem`;
+5. `auth-gateway:9000` with the reviewed authentication service;
+6. `ttygated:7681` with the private backend address;
+7. the audit path, limits, PTY target, and optional SSH target material.
+
+Do not replace the trusted source with `0.0.0.0/0`, `::/0`, an entire
+convenience network, a Cloudflare public edge range, or a Tailscale range.
+Configure the actual immediate proxy peer. Preserve address families exactly:
+`127.0.0.1/32` does not trust `::1`, and ttygate does not silently convert an
+IPv4-mapped IPv6 peer into IPv4.
+
+The external authority must be HTTPS. `public_url` must exactly match the
+browser Origin, including a non-default port. The browser cookie remains
+`Secure`, `HttpOnly`, `SameSite=Strict`, and scoped to `/`. Session creation
+and WebSocket upgrade both enforce that Origin. WebSocket traffic follows the
+same authentication, proxy, actual-peer, cookie, ticket, target, and audit
+authority path as ordinary HTTP.
+
+## Authentication gateway contract
+
+Both examples make a fixed `/verify` subrequest before proxying. The
+authentication gateway must:
+
+- validate its own session, token, or mTLS credential;
+- return a non-2xx response when authentication is missing, expired,
+  ambiguous, or invalid;
+- on success, return exactly one `X-Authenticated-User` response header;
+- return an identity whose UTF-8 value is 1–128 bytes with no Unicode
+  whitespace or control character; and
+- never accept a client-selected identity header as proof of authentication.
+
+The proxy removes every client copy of `X-Authenticated-User`, injects the one
+canonical authenticated value, and removes `Authorization` before ttygate.
+ttygate rejects a missing, duplicate, malformed, or overlong identity. It does
+not trim, case-fold, or Unicode-normalize identities.
+
+This repository's synthetic auth server exists only in
+`scripts/fixtures/reverse-proxy-auth.mjs` for disposable smoke tests. It is not
+an authentication product or deployment example.
+
+## Backend isolation
+
+For a same-host systemd deployment, bind ttygate to a dedicated loopback
+address and set `trusted_sources` to the exact matching loopback `/32` or
+`/128`. Run the proxy on that host and use operating-system policy to prevent
+other service accounts from becoming an equivalent trusted proxy. Loopback
+limits network reachability but does not isolate a compromised same-host
+process.
+
+For containers, put the proxy and ttygate on a dedicated internal network,
+assign or discover the proxy's stable backend source address, and publish only
+the proxy's HTTPS port. Do not use `-p`, `--publish`, host networking, an
+ingress service, or a second network attachment for ttygate. The example
+backend binds `0.0.0.0:7681` only because its container network is the
+enforced private boundary; that bind is unsafe without the isolation.
+
+Cloudflare Access, Tailscale, a firewall, and an identity-aware proxy do not
+remove this requirement. A direct route to ttygate lets a client attempt to
+become the trusted peer or bypass proxy policy.
+
+## TLS and file permissions
+
+Use a certificate issued for the exact external hostname by your existing
+certificate lifecycle. ttygate has no native ACME support. The ephemeral
+self-signed certificate generated by the smoke test is test-only and is not
+production-safe.
+
+Recommended Unix ownership and modes:
+
+| Path | Owner | Mode | Notes |
+|---|---|---:|---|
+| Proxy configuration | `root:proxy-group` | `0640` | Proxy process reads; cannot write |
+| TLS certificate chain | `root:proxy-group` | `0644` or stricter | Contains public material |
+| TLS private key | `root:proxy-group` | `0640` or stricter | Proxy reads; never log or commit |
+| ttygate configuration | `root:ttygate` | `0640` | ttygate reads; cannot write |
+| Audit directory | `ttygate:ttygate` | `0700` | Persistent, backed up as sensitive |
+| Existing audit JSONL | `ttygate:ttygate` | `0600` | ttygate rejects broader modes |
+| SSH private identity | `ttygate:ttygate` | `0600` | Unencrypted Ed25519, daemon-readable |
+| SSH known-hosts file | `ttygate:ttygate` | `0600` | Provision keys out of band |
+
+Never put a private key, proxy token, cookie, ticket, or authorization value in
+the configuration, process arguments, environment variables, container
+labels, logs, or repository. Use the proxy and platform's supported secret-file
+mechanism.
+
+## Caddy
+
+Validate the exact file after installing the certificate files and making the
+upstreams resolvable:
+
+```sh
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+Caddy's `forward_auth` performs the authentication subrequest and copies the
+successful response identity into the request. The subsequent
+`reverse_proxy` explicitly deletes Authorization and the incoming identity
+field before setting the canonical value. Caddy handles the WebSocket upgrade
+and bidirectional tunnel natively. Preserve its external Host override because
+ttygate's browser authority is the external proxy, not the backend name.
+
+The example disables automatic HTTPS because certificate ownership remains
+with the operator. Do not replace it with `tls internal` for production.
+Caddy's official documentation covers
+[`forward_auth`](https://caddyserver.com/docs/caddyfile/directives/forward_auth),
+[`reverse_proxy` header and WebSocket behavior](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy),
+and the stronger
+[`caddy validate` command](https://caddyserver.com/docs/command-line#caddy-validate).
+
+## Nginx
+
+Validate the exact file after installing the certificate files and making the
+upstreams resolvable:
+
+```sh
+nginx -t -c /etc/nginx/nginx.conf
+nginx -c /etc/nginx/nginx.conf -g 'daemon off;'
+```
+
+Nginx's `auth_request` runs in the access phase.
+`auth_request_set` captures the successful auth response header, and
+`proxy_set_header` replaces any client field with that value. Unlike Caddy,
+Nginx requires explicit HTTP/1.1 `Upgrade` and conditional `Connection`
+forwarding for WebSockets. The map sends `Connection: upgrade` only when the
+client supplied an Upgrade value. The separate port 8080 server performs only
+an HTTPS redirect; do not serve ttygate content there.
+
+See Nginx's official
+[`auth_request` module](https://nginx.org/en/docs/http/ngx_http_auth_request_module.html),
+[`proxy_set_header` documentation](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header),
+[`WebSocket proxying`](https://nginx.org/en/docs/http/websocket.html), and
+[`nginx -t` behavior](https://nginx.org/en/docs/switches.html).
+
+## Cloudflare Access-style identity
+
+ttygate has no built-in Cloudflare Access authentication. A safe deployment
+must protect the origin from direct Internet access and establish identity
+before either example injects `X-Authenticated-User`.
+
+When the application is connected through Cloudflare Tunnel, configure Access
+for the exact self-hosted hostname and restrict the origin so only the tunnel
+path reaches the authenticating proxy. Otherwise, the authentication gateway
+must validate the `Cf-Access-Jwt-Assertion` signature, issuer, audience,
+expiry, and relevant claims against the expected Access application before
+returning a canonical identity. Validation of
+`CF-Access-Authenticated-User-Email` alone is insufficient and permits identity
+spoofing if an attacker can reach the origin.
+
+Cloudflare documents the
+[self-hosted application and origin flow](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)
+and explicitly states that
+[the Access JWT must be validated](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/application-token/)
+when Tunnel is not performing that validation.
+
+Keep the independent proxy-to-ttygate network boundary and exact
+`trusted_sources` entry. Cloudflare edge address ranges are not ttygate's
+trusted proxy CIDR unless a connection from such an address is literally the
+immediate, isolated backend peer—which is not the recommended topology.
+
+## Tailscale Serve-style identity
+
+ttygate has no built-in Tailscale authentication. Tailscale Serve can terminate
+HTTPS and proxy to a ttygate listener bound only to loopback. Configure:
+
+```toml
+[server]
+bind = "127.0.0.1:7681"
+mode = "production"
+public_url = "https://REPLACE_WITH_TAILSCALE_SERVE_NAME"
+
+[server.trusted_proxy]
+trusted_sources = ["127.0.0.1/32"]
+
+[auth]
+provider = "trusted-proxy"
+identity_header = "tailscale-user-login"
+```
+
+Use `Tailscale-User-Login`, not the display-name or profile-picture headers, as
+the canonical identity. Tailscale Serve removes incoming client copies of its
+identity headers before injecting them. It provides user identity only for
+tailnet Serve traffic: Funnel traffic does not include identity, and tagged
+devices do not populate user identity headers. Such requests therefore fail
+ttygate identity establishment rather than receiving a fallback identity.
+
+Tailscale's official
+[Serve identity-header documentation](https://tailscale.com/docs/features/tailscale-serve#identity-headers)
+also recommends a localhost-only backend to prevent direct header spoofing.
+Other local processes remain part of that trust boundary. Do not publish the
+loopback backend through another listener, container port, or tailnet service.
+
+If Caddy or Nginx remains between Serve and ttygate, it must itself be
+loopback-only, copy `Tailscale-User-Login` into the canonical
+`X-Authenticated-User` field, and remain ttygate's sole trusted socket peer.
+Do not use the public/tailnet client address as ttygate's trusted proxy CIDR.
+
+## Health checks and WebSockets
+
+`/healthz` traverses the proxy and, in these examples, the same authentication
+subrequest as the frontend. An external monitor must use a dedicated,
+least-privilege authentication method whose credential is not logged.
+Container or systemd liveness checks can continue using ttygate's private
+bounded `--health-check` command without publishing the backend.
+
+The frontend, identity endpoint, session API, and `/ws` WebSocket remain on one
+external HTTPS authority. Do not route `/ws` around authentication or to a
+different hostname. Caddy handles Upgrade automatically; the Nginx example
+passes the hop-by-hop fields explicitly and disables response buffering.
+
+## Audit operations
+
+Lifecycle audit JSONL contains security metadata: canonical identity,
+configured target, actual backend peer, timestamps, stable denial reasons,
+session correlation, and exit outcome. It does not contain terminal input,
+terminal output, commands, arguments, cookies, tickets, authorization values,
+private keys, or upstream credentials.
+
+The audit filesystem is sensitive. ttygate appends and flushes complete
+records but does not `fsync` every event, rotate files, select retention,
+ship records, back them up, or delete them. Operators own rotation, retention,
+shipping, backup, access review, capacity, and incident response. Coordinate
+rotation with ttygate so an active inode is not silently replaced; preserve
+owner-only permissions throughout.
+
+## Production checklist
+
+- Replace and review the complete authority/address/path tuple.
+- Validate Caddy with `caddy validate` or Nginx with `nginx -t`.
+- Use a publicly or privately trusted production certificate for the exact
+  external name; keep its private key out of logs and the repository.
+- Publish only the proxy HTTPS listener; verify ttygate has no client route.
+- Configure the exact immediate proxy CIDR ttygate observes.
+- Verify the auth gateway denies missing identity and returns one canonical
+  identity only after real authentication.
+- Send a spoofed client identity header and confirm it cannot select the
+  ttygate identity.
+- Confirm `public_url`, browser Origin, secure cookie, HTTPS, and WSS authority
+  match exactly.
+- Exercise `/healthz`, frontend load, cookie, ticket, WebSocket, PTY, close,
+  and audit through the deployed proxy.
+- Confirm wrong Origin, direct backend access, untrusted peers, development
+  auth, plaintext production, and incomplete proxy config fail closed.
+- Provision config, certificate, audit, and SSH files with reviewed ownership
+  and modes.
+- Set rate, concurrency, and session deadlines for the deployment.
+- Define audit rotation, retention, shipping, backup, capacity, and access
+  policy; scan complete logs for prohibited terminal or credential content.
+- Document proxy compromise, same-host processes, shared PTY OS user, audit
+  metadata, SSH credentials, and availability as residual risks.
+
+## Troubleshooting
+
+Use stable status and error categories rather than enabling request/header
+dumps:
+
+- Proxy 401/403: the auth subrequest denied or did not establish identity.
+- ttygate 400/401/503 on identity establishment: missing, duplicate, malformed,
+  or untrusted proxy authority; check the actual backend peer and canonical
+  header count.
+- ttygate 403 on session or WebSocket: `public_url` and browser Origin differ.
+- WebSocket 101 never appears: check the Nginx Upgrade/Connection directives or
+  the Caddy route, then the secure cookie and ticket-first message.
+- `Audit(UnsafeDestination)`: correct audit ownership/mode and destination
+  type; do not weaken permissions or print the path contents.
+- `Config(Validation ...)`: fix the named configuration field; do not switch to
+  development auth, plaintext production, or a broader trusted CIDR.
+- SSH curated failures: verify provisioned identity, known-host key, resolved
+  user policy, and OpenSSH version without exposing paths, keys, argv, or raw
+  OpenSSH diagnostics.
+
+Never troubleshoot by logging cookies, tickets, Authorization,
+`Cf-Access-Jwt-Assertion`, TLS private keys, terminal contents, or complete
+request headers.
+
+Refs #12.
