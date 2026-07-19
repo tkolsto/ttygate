@@ -100,6 +100,19 @@ for command in docker openssl sed grep mktemp; do
   command -v "$command" >/dev/null 2>&1 ||
     fail "required command is unavailable: $command"
 done
+
+validate_image() {
+  label=$1
+  reference=$2
+  printf '%s\n' "$reference" |
+    grep -Eq '^[^[:space:]]+@sha256:[0-9a-f]{64}$' ||
+    fail "$label image reference must be digest-pinned"
+}
+
+validate_image Caddy "$CADDY_IMAGE"
+validate_image Nginx "$NGINX_IMAGE"
+validate_image Node "$NODE_IMAGE"
+
 docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
 
 mkdir -p "$tls_dir"
@@ -287,6 +300,33 @@ sleep 1
 [ "$(docker inspect --format '{{.State.Running}}' "$proxy")" = true ] ||
   fail "proxy failed to start"
 
+docker run --rm \
+  --name "$attacker" \
+  --network "$frontend_network" \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --entrypoint node \
+  "$NODE_IMAGE" \
+  -e '
+    const http = require("node:http");
+    const fixed = "https://terminal.example.invalid:8443/probe?fixture=1";
+    const request = http.request({
+      hostname: "terminal.example.invalid",
+      port: 8080,
+      path: "/probe?fixture=1",
+      headers: { Host: "attacker.example.invalid" },
+      timeout: 3000
+    }, (response) => {
+      response.resume();
+      const redirect = response.statusCode >= 300 && response.statusCode < 400;
+      process.exit(!redirect || response.headers.location === fixed ? 0 : 1);
+    });
+    request.on("timeout", () => request.destroy(new Error("timeout")));
+    request.on("error", () => process.exit(2));
+    request.end();
+  ' || fail "client-controlled Host selected redirect authority"
+
 backend_bindings=$(docker inspect --format '{{json .HostConfig.PortBindings}}' "$backend")
 case "$backend_bindings" in
   '{}' | null) ;;
@@ -431,6 +471,8 @@ docker top "$backend" -eo pid,ppid,comm,args | grep -Eq '[[:space:]]sh[[:space:]
   fail "live ttygate-stop fixture had no PTY child"
 docker stop --time 10 "$backend" >/dev/null
 wait_for_client_exit || fail "ttygate stop did not end the client transport"
+[ "$(docker inspect --format '{{.State.ExitCode}}' "$backend")" -eq 0 ] ||
+  fail "ttygate did not complete graceful SIGTERM shutdown"
 scan_audit runtime-secrets-backend-stop.json
 
 docker stop --time 10 "$proxy" "$auth" >/dev/null

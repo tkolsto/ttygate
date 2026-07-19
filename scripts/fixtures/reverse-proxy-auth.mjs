@@ -4,9 +4,12 @@ import { pathToFileURL } from "node:url";
 export const FIXTURE_AUTHORIZATION = "Bearer chunk42-fixture-only";
 export const FIXTURE_IDENTITY = "synthetic-user";
 
-export function authorize(method, path, authorization) {
+export function authorize(method, path, authorization, clientIdentity) {
   if (path !== "/verify") return { status: 404, identity: undefined };
   if (method !== "GET") return { status: 405, identity: undefined };
+  if (clientIdentity !== undefined) {
+    return { status: 400, identity: undefined };
+  }
   if (
     typeof authorization !== "string" ||
     authorization.length > 256 ||
@@ -25,10 +28,13 @@ export function startAuthServer() {
         ? distinctAuthorization[0]
         : undefined
       : request.headers.authorization;
+    const clientIdentity =
+      request.headersDistinct?.["x-authenticated-user"];
     const decision = authorize(
       request.method ?? "",
       request.url ?? "",
       authorization,
+      clientIdentity,
     );
     request.resume();
     response.setHeader("Cache-Control", "no-store");

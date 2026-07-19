@@ -13,4 +13,5 @@ packaging/systemd
 **/known_hosts*
 **/*.log
 **/.tmp*
+.ttygate-chunk42-*
 frontend/dist/index.html

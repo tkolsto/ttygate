@@ -10,13 +10,17 @@ http://terminal.example.invalid:8080 {
 https://terminal.example.invalid:8443 {
 	tls /etc/ttygate-proxy/tls/certificate.pem /etc/ttygate-proxy/tls/private-key.pem
 
-	forward_auth auth-gateway:9000 {
-		uri /verify
-		copy_headers X-Authenticated-User
-	}
+	route {
+		request_header -X-Authenticated-User
 
-	reverse_proxy ttygated:7681 {
-		header_up -Authorization
-		header_up Host {http.request.host}
+		forward_auth auth-gateway:9000 {
+			uri /verify
+			copy_headers X-Authenticated-User
+		}
+
+		reverse_proxy ttygated:7681 {
+			header_up -Authorization
+			header_up Host {http.request.host}
+		}
 	}
 }

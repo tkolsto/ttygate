@@ -11,6 +11,7 @@ import {
   decodeServerFrames,
   maskedFrame,
   scanAuditText,
+  validWebSocketHandshake,
   validatedTicket,
 } from "./reverse-proxy-session.mjs";
 
@@ -26,6 +27,18 @@ test("synthetic auth denies missing invalid duplicate and oversized authorizatio
       identity: undefined,
     });
   }
+  assert.deepEqual(
+    authorize(
+      "GET",
+      "/verify",
+      FIXTURE_AUTHORIZATION,
+      ["spoofed-user"],
+    ),
+    {
+      status: 400,
+      identity: undefined,
+    },
+  );
 });
 
 test("synthetic auth returns one bounded canonical identity only for its fixed grant", () => {
@@ -110,6 +123,30 @@ test("masked client frames and bounded server frame decoding preserve payload by
   );
 });
 
+test("WebSocket handshake requires the RFC 6455 accept proof", () => {
+  const key = "dGhlIHNhbXBsZSBub25jZQ==";
+  assert.equal(
+    validWebSocketHandshake(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+      key,
+    ),
+    true,
+  );
+  assert.equal(
+    validWebSocketHandshake(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Sec-WebSocket-Accept: attacker-selected",
+      key,
+    ),
+    false,
+  );
+});
+
 test("complete audit scan requires the canonical lifecycle and rejects secret classes", () => {
   const good = [
     '{"schema_version":1,"event_type":"authentication-succeeded","identity":"synthetic-user","remote_address":"192.0.2.10:40000","authenticated_at":"2026-07-19T00:00:00Z"}',
@@ -117,6 +154,9 @@ test("complete audit scan requires the canonical lifecycle and rejects secret cl
     '{"schema_version":1,"event_type":"session-ended","session_id":"synthetic-correlation","identity":"synthetic-user","target":"maintenance-shell","remote_address":"192.0.2.10:40001","started_at":"2026-07-19T00:00:01Z","ended_at":"2026-07-19T00:00:02Z","outcome":{"kind":"client-request"}}',
   ].join("\n") + "\n";
   assert.equal(scanAuditText(good), 3);
+  const orphaned = good +
+    '{"schema_version":1,"event_type":"session-started","session_id":"orphaned-correlation","identity":"synthetic-user","target":"maintenance-shell","remote_address":"192.0.2.10:40002","started_at":"2026-07-19T00:00:03Z"}\n';
+  assert.throws(() => scanAuditText(orphaned), /audit content invalid/);
 
   for (const forbidden of [
     "Authorization",

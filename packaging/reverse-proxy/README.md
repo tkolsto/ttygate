@@ -129,12 +129,14 @@ caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
 ```
 
 Caddy's `forward_auth` performs the authentication subrequest and copies the
-successful response identity over any client-supplied request value. The
-subsequent `reverse_proxy` deletes Authorization; do not delete and reconstruct
-the copied identity with a `header_up` placeholder, because that can erase the
-canonical value. Caddy handles the WebSocket upgrade and bidirectional tunnel
-natively. Preserve its external Host override because ttygate's browser
-authority is the external proxy, not the backend name.
+successful response identity after `request_header` removes any client-supplied
+value before authentication. The `route` block preserves that written
+strip/authenticate/proxy order. The subsequent `reverse_proxy` deletes
+Authorization; do not delete and reconstruct the copied identity with a
+`header_up` placeholder, because that can erase the canonical value. Caddy
+handles the WebSocket upgrade and bidirectional tunnel natively. Preserve its
+external Host override because ttygate's browser authority is the external
+proxy, not the backend name.
 
 The example disables automatic HTTPS because certificate ownership remains
 with the operator. Do not replace it with `tls internal` for production.
@@ -155,12 +157,15 @@ nginx -c /etc/nginx/nginx.conf -g 'daemon off;'
 ```
 
 Nginx's `auth_request` runs in the access phase.
+The authentication location clears any client identity header before contacting
+the gateway.
 `auth_request_set` captures the successful auth response header, and
 `proxy_set_header` replaces any client field with that value. Unlike Caddy,
 Nginx requires explicit HTTP/1.1 `Upgrade` and conditional `Connection`
 forwarding for WebSockets. The map sends `Connection: upgrade` only when the
 client supplied an Upgrade value. The separate port 8080 server performs only
-an HTTPS redirect; do not serve ttygate content there.
+an HTTPS redirect to the literal configured authority; it never reflects a
+client-selected Host into `Location`. Do not serve ttygate content there.
 
 See Nginx's official
 [`auth_request` module](https://nginx.org/en/docs/http/ngx_http_auth_request_module.html),

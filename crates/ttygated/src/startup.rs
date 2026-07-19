@@ -3,17 +3,20 @@ use std::{
     io,
     net::{SocketAddr, TcpListener as StdTcpListener},
     path::Path,
+    sync::Arc,
 };
 
 use axum_server::tls_rustls::RustlsConfig;
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::{
     audit::{AuditError, AuditLog},
     config::{Config, ConfigError, ServerTransport, Target, TlsConfig, validate_startup_contract},
     server::{self, AppState, ServerBuildError},
     service_manager::{self, ServiceManagerError},
+    session::SessionManager,
     ssh::{self, PreparedSshTargets, SshPreparationError},
     tls::{self, TlsError},
 };
@@ -45,6 +48,8 @@ pub enum StartupError {
     Bind(#[source] io::Error),
     #[error("server stopped because of a listener error")]
     Serve(#[source] io::Error),
+    #[error("shutdown signal handling could not be installed")]
+    Signal(#[source] io::Error),
     #[error(transparent)]
     ServiceManager(#[from] ServiceManagerError),
 }
@@ -181,19 +186,52 @@ async fn bind_and_serve(prepared: PreparedServer) -> Result<(), StartupError> {
             let listener = TcpListener::bind(prepared.bind)
                 .await
                 .map_err(StartupError::Bind)?;
+            let shutdown = termination_signal().map_err(StartupError::Signal)?;
             service_manager::notify_ready()?;
             let _watchdog = service_manager::spawn_watchdog();
-            server::serve(listener, prepared.state)
-                .await
-                .map_err(StartupError::Serve)
+            let sessions = prepared.state.sessions();
+            serve_until_shutdown(server::serve(listener, prepared.state), sessions, shutdown).await
         }
         PreparedTransport::DirectTls(tls) => {
             let listener = StdTcpListener::bind(prepared.bind).map_err(StartupError::Bind)?;
+            let shutdown = termination_signal().map_err(StartupError::Signal)?;
             service_manager::notify_ready()?;
             let _watchdog = service_manager::spawn_watchdog();
-            server::serve_tls_on(listener, prepared.state, tls)
-                .await
-                .map_err(StartupError::Serve)
+            let sessions = prepared.state.sessions();
+            serve_until_shutdown(
+                server::serve_tls_on(listener, prepared.state, tls),
+                sessions,
+                shutdown,
+            )
+            .await
+        }
+    }
+}
+
+fn termination_signal() -> io::Result<impl Future<Output = ()>> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
+async fn serve_until_shutdown(
+    serve: impl Future<Output = io::Result<()>>,
+    sessions: Arc<SessionManager>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), StartupError> {
+    let mut serving = Box::pin(serve);
+    let mut shutdown = Box::pin(shutdown);
+    tokio::select! {
+        result = &mut serving => result.map_err(StartupError::Serve),
+        () = &mut shutdown => {
+            drop(serving);
+            sessions.shutdown().await;
+            Ok(())
         }
     }
 }

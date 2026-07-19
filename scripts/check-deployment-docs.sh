@@ -62,6 +62,7 @@ README=README.md
 ROADMAP=docs/roadmap.md
 REWRITE_PLAN=docs/ttygate-rewrite-plan.md
 THREAT_MODEL=docs/threat-model.md
+DOCKERIGNORE=.dockerignore
 
 for file in \
   "$CADDY" \
@@ -74,6 +75,8 @@ for file in \
   require_file "$file"
 done
 require_executable "$SMOKE"
+require_file "$DOCKERIGNORE"
+require_text "$DOCKERIGNORE" '^\.ttygate-chunk42-\*$' 'ephemeral proxy fixture exclusion'
 
 # Caddy terminates TLS, delegates authentication, copies one authenticated
 # identity over any client value, removes upstream credentials, and proxies
@@ -84,6 +87,7 @@ require_text "$CADDY" 'tls[[:space:]]+/etc/ttygate-proxy/tls/certificate\.pem[[:
 require_text "$CADDY" 'forward_auth[[:space:]]+auth-gateway:9000' 'authentication subrequest'
 require_text "$CADDY" 'uri[[:space:]]+/verify' 'fixed authentication verification endpoint'
 require_text "$CADDY" 'copy_headers[[:space:]]+X-Authenticated-User' 'canonical authenticated identity copy'
+require_text "$CADDY" 'request_header[[:space:]]+-X-Authenticated-User' 'client identity removal before authentication'
 require_text "$CADDY" 'header_up[[:space:]]+-Authorization' 'authorization removal'
 require_text "$CADDY" 'header_up[[:space:]]+Host[[:space:]]+\{http\.request\.host\}' 'external Host preservation'
 require_text "$CADDY" 'reverse_proxy[[:space:]]+ttygated:7681' 'private ttygate backend'
@@ -93,13 +97,14 @@ reject_text "$CADDY" 'header_up[[:space:]]+[+-]?X-Authenticated-User' 'post-auth
 # Nginx has an explicit redirect, TLS listener, auth_request flow, identity
 # replacement, and HTTP/1.1 hop-by-hop header forwarding for WebSockets.
 require_text "$NGINX" 'listen[[:space:]]+8080' 'plaintext redirect listener'
-require_text "$NGINX" 'return[[:space:]]+308[[:space:]]+https://\$host:8443\$request_uri' 'HTTPS redirect'
+require_text "$NGINX" 'return[[:space:]]+308[[:space:]]+https://terminal\.example\.invalid:8443\$request_uri' 'fixed-authority HTTPS redirect'
 require_text "$NGINX" 'listen[[:space:]]+8443[[:space:]]+ssl' 'TLS listener'
 require_text "$NGINX" 'server_name[[:space:]]+terminal\.example\.invalid' 'reserved external authority'
 require_text "$NGINX" 'ssl_certificate[[:space:]]+/etc/ttygate-proxy/tls/certificate\.pem' 'certificate path'
 require_text "$NGINX" 'ssl_certificate_key[[:space:]]+/etc/ttygate-proxy/tls/private-key\.pem' 'private-key path'
 require_text "$NGINX" 'auth_request[[:space:]]+/_ttygate_auth' 'authentication subrequest'
 require_text "$NGINX" 'auth_request_set[[:space:]]+\$authenticated_identity[[:space:]]+\$upstream_http_x_authenticated_user' 'canonical auth response capture'
+require_text "$NGINX" 'proxy_set_header[[:space:]]+X-Authenticated-User[[:space:]]+""' 'client identity removal before authentication'
 require_text "$NGINX" 'proxy_set_header[[:space:]]+Authorization[[:space:]]+""' 'authorization removal'
 require_text "$NGINX" 'proxy_set_header[[:space:]]+X-Authenticated-User[[:space:]]+\$authenticated_identity' 'client identity replacement'
 require_text "$NGINX" 'proxy_set_header[[:space:]]+Host[[:space:]]+\$http_host' 'external Host preservation'
@@ -114,6 +119,7 @@ require_text "$NGINX" 'proxy_temp_path[[:space:]]+/tmp/' 'read-only-root proxy t
 require_text "$NGINX" 'scgi_temp_path[[:space:]]+/tmp/' 'read-only-root SCGI temp path'
 require_text "$NGINX" 'uwsgi_temp_path[[:space:]]+/tmp/' 'read-only-root uwsgi temp path'
 reject_text "$NGINX" 'ssl_verify_client[[:space:]]+off|proxy_ssl_verify[[:space:]]+off' 'explicit TLS verification weakening'
+reject_text "$NGINX" 'return[[:space:]]+30[1278][[:space:]]+https://\$host' 'client-controlled redirect authority'
 
 # The matching application config is production-only, externally HTTPS, and
 # trusts one conspicuous documentation address rather than forwarding claims.
@@ -176,6 +182,8 @@ for pattern in \
   'audit' \
   'docker rm' \
   'docker network rm' \
+  'attacker\.example\.invalid' \
+  'image reference must be digest-pinned' \
   'trap.*EXIT'; do
   require_text "$SMOKE" "$pattern" "smoke coverage matching $pattern"
 done
@@ -183,6 +191,7 @@ require_text "$SMOKE" 'trap.*HUP.*INT.*TERM' 'signal cancellation cleanup'
 require_text "$AUTH_FIXTURE" 'X-Authenticated-User' 'synthetic canonical identity'
 require_text "$AUTH_FIXTURE" 'authorization' 'synthetic upstream authentication'
 require_text "$SESSION_FIXTURE" 'Sec-WebSocket-Key' 'WebSocket lifecycle'
+require_text "$SESSION_FIXTURE" 'Sec-WebSocket-Accept' 'WebSocket handshake proof'
 require_text "$SESSION_FIXTURE" 'node:tls|connect.*servername' 'TLS-protected WebSocket transport'
 require_text "$SESSION_FIXTURE" '/api/sessions' 'ticket issuance'
 require_text "$SESSION_FIXTURE" '/healthz' 'proxied health check'
@@ -190,6 +199,7 @@ require_text "$SESSION_FIXTURE" 'missing authentication' 'missing authenticated 
 require_text "$SESSION_FIXTURE" 'spoofed-user' 'client identity spoof rejection'
 require_text "$SESSION_FIXTURE" 'wrong-origin' 'incorrect Origin denial'
 require_text "$SESSION_FIXTURE" 'scanAuditText' 'complete audit secrecy scan'
+require_text "$SESSION_FIXTURE" 'starts\.size !== ends\.size' 'exact audit lifecycle correlation'
 require_text "$SESSION_FIXTURE" 'terminal_input' 'terminal input audit exclusion'
 require_text "$SESSION_FIXTURE" 'terminal_output' 'terminal output audit exclusion'
 

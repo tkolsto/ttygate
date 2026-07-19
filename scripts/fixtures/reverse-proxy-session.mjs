@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { request } from "node:https";
 import { connect } from "node:tls";
@@ -115,6 +115,31 @@ export function decodeServerFrames(buffer) {
   return { frames, remaining: buffer.subarray(offset) };
 }
 
+export function validWebSocketHandshake(head, key) {
+  if (typeof head !== "string" || typeof key !== "string") return false;
+  const lines = head.split("\r\n");
+  if (!/^HTTP\/1\.1 101(?: |$)/.test(lines.shift() ?? "")) return false;
+  const headers = new Map();
+  for (const line of lines) {
+    const separator = line.indexOf(":");
+    if (separator <= 0) return false;
+    const name = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+    if (headers.has(name)) return false;
+    headers.set(name, value);
+  }
+  const expected = createHash("sha1")
+    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+    .digest("base64");
+  return (
+    headers.get("upgrade")?.toLowerCase() === "websocket" &&
+    (headers.get("connection") ?? "")
+      .split(",")
+      .some((value) => value.trim().toLowerCase() === "upgrade") &&
+    headers.get("sec-websocket-accept") === expected
+  );
+}
+
 export function scanAuditText(text, runtimeSecrets = []) {
   if (
     typeof text !== "string" ||
@@ -159,21 +184,36 @@ export function scanAuditText(text, runtimeSecrets = []) {
       value.event_type,
     )
   );
+  const starts = new Map();
+  const ends = new Map();
+  for (const value of lifecycle) {
+    if (
+      value.event_type !== "session-started" &&
+      value.event_type !== "session-ended"
+    ) {
+      continue;
+    }
+    if (
+      typeof value.session_id !== "string" ||
+      value.session_id.length === 0 ||
+      value.session_id.length > 128 ||
+      value.identity !== FIXTURE_IDENTITY ||
+      value.target !== TARGET
+    ) {
+      throw new Error("audit content invalid");
+    }
+    const records = value.event_type === "session-started" ? starts : ends;
+    if (records.has(value.session_id)) throw new Error("audit content invalid");
+    records.set(value.session_id, value);
+  }
   if (
     !lifecycle.some((value) =>
       value.event_type === "authentication-succeeded" &&
       value.identity === FIXTURE_IDENTITY
     ) ||
-    !lifecycle.some((value) =>
-      value.event_type === "session-started" &&
-      value.identity === FIXTURE_IDENTITY &&
-      value.target === TARGET
-    ) ||
-    !lifecycle.some((value) =>
-      value.event_type === "session-ended" &&
-      value.identity === FIXTURE_IDENTITY &&
-      value.target === TARGET
-    ) ||
+    starts.size === 0 ||
+    starts.size !== ends.size ||
+    [...starts.keys()].some((sessionId) => !ends.has(sessionId)) ||
     lifecycle.some((value) =>
       typeof value.remote_address === "string" &&
       !value.remote_address.startsWith("192.0.2.10:")
@@ -244,6 +284,7 @@ function openWebSocket(ca, cookie, ticket, hold = false) {
     let lifecycleReady = false;
     let closeRequested = false;
     let settled = false;
+    let websocketKey;
     const timeout = setTimeout(() => {
       socket.destroy(new Error("WebSocket lifecycle timed out"));
     }, 10_000);
@@ -275,13 +316,13 @@ function openWebSocket(ca, cookie, ticket, hold = false) {
       }
     });
     socket.once("secureConnect", () => {
-      const key = randomBytes(16).toString("base64");
+      websocketKey = randomBytes(16).toString("base64");
       socket.write(
         "GET /api/ws HTTP/1.1\r\n" +
           `Host: ${HOSTNAME}:${PORT}\r\n` +
           "Upgrade: websocket\r\n" +
           "Connection: Upgrade\r\n" +
-          `Sec-WebSocket-Key: ${key}\r\n` +
+          `Sec-WebSocket-Key: ${websocketKey}\r\n` +
           "Sec-WebSocket-Version: 13\r\n" +
           `Origin: ${ORIGIN}\r\n` +
           `Authorization: ${FIXTURE_AUTHORIZATION}\r\n` +
@@ -298,7 +339,7 @@ function openWebSocket(ca, cookie, ticket, hold = false) {
         const boundary = handshake.indexOf("\r\n\r\n");
         if (boundary === -1) return;
         const head = handshake.subarray(0, boundary).toString("ascii");
-        if (!head.startsWith("HTTP/1.1 101 ")) {
+        if (!validWebSocketHandshake(head, websocketKey)) {
           socket.destroy(new Error("WebSocket upgrade was rejected"));
           return;
         }

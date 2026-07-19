@@ -154,6 +154,8 @@ docker top "$container" -eo pid,ppid,comm,args | grep -Eq '[[:space:]](sh|sleep)
 docker stop --time 10 "$container" >/dev/null
 [ "$(docker inspect --format '{{.State.Status}}' "$container")" = "exited" ] ||
   fail "container did not stop"
+[ "$(docker inspect --format '{{.State.ExitCode}}' "$container")" -eq 0 ] ||
+  fail "container did not complete graceful SIGTERM shutdown"
 docker rm "$container" >/dev/null
 if docker inspect "$container" >/dev/null 2>&1; then
   fail "stopped daemon container survived removal"
