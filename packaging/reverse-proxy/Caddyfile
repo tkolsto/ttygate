@@ -1,0 +1,24 @@
+{
+	admin off
+	auto_https off
+}
+
+http://terminal.example.invalid:8080 {
+	redir https://terminal.example.invalid:8443{uri} 308
+}
+
+https://terminal.example.invalid:8443 {
+	tls /etc/ttygate-proxy/tls/certificate.pem /etc/ttygate-proxy/tls/private-key.pem
+
+	forward_auth auth-gateway:9000 {
+		uri /verify
+		copy_headers X-Authenticated-User
+	}
+
+	reverse_proxy ttygated:7681 {
+		header_up -Authorization
+		header_up -X-Authenticated-User
+		header_up X-Authenticated-User {http.request.header.X-Authenticated-User}
+		header_up Host {http.request.host}
+	}
+}
