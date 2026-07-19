@@ -100,8 +100,24 @@ require_text "$README" 'UID.*65532|65532.*UID' 'stable container identity'
 require_text "$README" 'Type=notify|sd_notify' 'systemd readiness contract'
 require_text "$README" 'PrivateNetwork.*(absent|omitted|cannot)|cannot.*PrivateNetwork' 'systemd network namespace exception'
 require_text "$README" 'PrivateUsers.*(absent|omitted|cannot)|cannot.*PrivateUsers' 'systemd user namespace exception'
-require_text "$README" 'Chunks? 4\.2.*4\.3|4\.2.*and.*4\.3' 'remaining packaging and release scope'
+require_text "$README" 'production deployment checklist' 'Chunk 4.2 production deployment checklist'
+require_text "$README" 'authentication provider matrix' 'Chunk 4.2 authentication provider matrix'
+require_text "$README" 'verified.*Caddy.*Nginx|Caddy.*Nginx.*verified' 'verified proxy examples'
+require_text "$README" 'Cloudflare Access' 'Cloudflare Access deployment boundary'
+require_text "$README" 'Tailscale Serve' 'Tailscale Serve deployment boundary'
+require_text "$README" 'local PTY' 'local PTY deployment example'
+require_text "$README" 'strict.host.key.*SSH|SSH.*strict.host.key' 'strict-host-key SSH deployment example'
+require_text "$README" 'schema_version.*event_type|synthetic audit' 'synthetic audit JSONL'
+require_text "$README" 'Shell In A Box.*comparison|comparison.*Shell In A Box' 'Shell In A Box comparison'
+require_text "$README" 'shared.*OS user|same.*OS user' 'shared OS-user non-goal'
+require_text "$README" 'no arbitrary command|browser.*not.*command' 'no browser-supplied command non-goal'
+require_text "$README" 'no native SSH|OpenSSH subprocess' 'OpenSSH subprocess boundary'
+require_text "$README" 'no automatic host.key learning|UpdateHostKeys=no' 'no host-key learning boundary'
+require_text "$README" 'no built.in Cloudflare|Cloudflare.*not built.in' 'no built-in Cloudflare provider'
+require_text "$README" 'no native ACME|ACME.*not' 'no native ACME boundary'
+require_text "$README" 'Chunk 4\.3' 'remaining Chunk 4.3 gate'
 require_text "$THREAT_MODEL" 'Chunk 4\.1.*(implements|implemented).*Docker.*systemd|Docker.*systemd.*Refs #12' 'implemented Chunk 4.1 packaging status'
+require_text "$THREAT_MODEL" 'Chunk 4\.2.*(implements|implemented).*Caddy.*Nginx|verified.*reverse.proxy' 'implemented Chunk 4.2 deployment mitigation'
 reject_text "$THREAT_MODEL" 'packaging, deployment examples, and release work remain planned' 'stale all-packaging-is-planned status'
 require_text "$README" 'Refs #8' 'Chunk 2.1 changelog reference'
 require_text "$README" 'cargo test --workspace' 'Rust verification command'
@@ -167,6 +183,8 @@ require_text "$ROADMAP" 'M2 exit.*complete|M2.*Status.*complete' 'complete M2 st
 require_text "$ROADMAP" 'Chunk 3\.1.*OpenSSH subprocess target' 'Chunk 3.1 heading'
 require_text "$ROADMAP" 'Status.*complete.*Refs #11' 'complete Chunk 3.1 roadmap status'
 require_text "$ROADMAP" 'M3 exit.*complete|M3.*Status.*complete' 'complete M3 status'
+require_text "$ROADMAP" 'Chunk 4\.2.*Deployment docs and reverse-proxy examples' 'Chunk 4.2 heading'
+require_text "$ROADMAP" 'Status.*complete.*Refs #12' 'complete Chunk 4.2 roadmap status'
 
 require_file "$REWRITE_PLAN"
 require_text "$REWRITE_PLAN" 'Implemented in Chunk 2\.2.*Refs #9|Chunk 2\.2.*implemented.*Refs #9' 'implemented Chunk 2.2 rewrite-plan status'
@@ -179,6 +197,10 @@ require_text "$REWRITE_PLAN" 'Implemented in Chunk 3\.1.*Refs #11|Chunk 3\.1.*im
 require_text "$REWRITE_PLAN" 'ssh_executable' 'rewrite-plan ssh executable field'
 require_text "$REWRITE_PLAN" 'identity_file' 'rewrite-plan ssh identity field'
 require_text "$REWRITE_PLAN" 'Phase 3.*(complete|implemented)|M3.*complete' 'complete rewrite-plan Phase 3 status'
+require_text "$REWRITE_PLAN" 'Chunk 4\.2.*complete.*Refs #12|verified.*Caddy.*Nginx' 'verified Phase 4 deployment status'
+for file in "$README" "$THREAT_MODEL" "$ROADMAP" "$REWRITE_PLAN"; do
+  require_text "$file" 'Chunk 4\.3|release.*remain' 'remaining Chunk 4.3 release gate'
+done
 
 if grep -Eini 'contract-only|does not yet trust( or consume)? the identity header|provider unavailable|trusted-proxy enforcement remains Chunk 2\.2|Future in Chunk 2\.2|production authentication (and|is|remains)[^.]*planned' \
   "$README" "$THREAT_MODEL" "$ROADMAP" "$REWRITE_PLAN"; then

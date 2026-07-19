@@ -167,6 +167,10 @@ recording limitations.
 - **Deliverables:** example configs for Caddy and Nginx; Cloudflare Access / Tailscale-style identity-header walkthroughs; production deployment checklist in README; auth provider matrix; audit log example; Shell In A Box comparison; non-goals including the shared-OS-user model.
 - **Consumes:** 2.1, 2.2 behavior; 4.1 artifacts.
 - **Done when:** each example verified by actually running it (plan Phase 4 manual checks).
+- **Status:** complete (Refs #12). Digest-pinned Caddy and Nginx examples pass
+  native validation and disposable TLS/authentication/WSS/PTY smoke tests,
+  including spoofed-header replacement, untrusted-peer denial, audit secrecy,
+  teardown, and cleanup. M4 remains incomplete until Chunk 4.3.
 
 ### Chunk 4.3 — Release v0.1
 

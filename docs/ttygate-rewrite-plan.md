@@ -284,8 +284,9 @@ binding, and runtime sink failure permanently denies new authority.
 This is append persistence, not a transactional journal: the writer flushes but
 does not `fsync` each record. Operators own rotation, retention, shipping,
 backup, and deletion. The containing filesystem remains trusted against
-privileged or concurrent namespace mutation. Recording, reconnect,
-packaging, deployment examples, and release hardening remain future phases.
+privileged or concurrent namespace mutation. Recording and reconnect remain
+future work. Packaging and verified deployment examples are implemented;
+release hardening remains assigned to Chunk 4.3.
 
 ## Implementation Phases
 
@@ -376,8 +377,12 @@ Exit criteria (tests):
 **Status:** Chunk 4.1 is complete (Refs #12): the Docker and systemd install/run
 paths default to localhost, use dedicated non-root identities, preserve
 fail-closed ownership checks, and have scripted cleanup, health, readiness, and
-watchdog coverage. Reverse-proxy examples, release automation, and the v0.1 tag
-remain assigned to Chunks 4.2 and 4.3.
+watchdog coverage. Chunk 4.2 is complete (Refs #12): verified Caddy and Nginx
+examples exercise isolated TLS/authentication/WSS/PTY lifecycles, strict
+identity replacement, audit secrecy, teardown, and cleanup; the public
+deployment checklist also documents Cloudflare Access and Tailscale Serve
+boundaries. Release automation, the remaining manual pre-release checks, and
+the v0.1 tag remain assigned to Chunk 4.3, so Phase 4 and M4 are not complete.
 
 Exit criteria (manual pre-release checks):
 
