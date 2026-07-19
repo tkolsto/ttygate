@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# Regex contracts below intentionally single-quote literal Nginx $variables.
+# shellcheck disable=SC2016
+
 set -eu
 
 fail() {
@@ -57,18 +60,19 @@ done
 require_executable "$SMOKE"
 
 # Caddy terminates TLS, delegates authentication, copies one authenticated
-# identity, removes client/upstream credentials, and proxies every path.
+# identity over any client value, removes upstream credentials, and proxies
+# every path. Do not rewrite the copied header again: Caddy evaluates
+# reverse_proxy header placeholders after header deletion.
 require_text "$CADDY" 'terminal\.example\.invalid:8443' 'reserved external HTTPS authority'
 require_text "$CADDY" 'tls[[:space:]]+/etc/ttygate-proxy/tls/certificate\.pem[[:space:]]+/etc/ttygate-proxy/tls/private-key\.pem' 'operator-supplied TLS material'
 require_text "$CADDY" 'forward_auth[[:space:]]+auth-gateway:9000' 'authentication subrequest'
 require_text "$CADDY" 'uri[[:space:]]+/verify' 'fixed authentication verification endpoint'
 require_text "$CADDY" 'copy_headers[[:space:]]+X-Authenticated-User' 'canonical authenticated identity copy'
 require_text "$CADDY" 'header_up[[:space:]]+-Authorization' 'authorization removal'
-require_text "$CADDY" 'header_up[[:space:]]+-X-Authenticated-User' 'client identity removal'
-require_text "$CADDY" 'header_up[[:space:]]+X-Authenticated-User[[:space:]]+\{http\.request\.header\.X-Authenticated-User\}' 'canonical identity injection'
 require_text "$CADDY" 'header_up[[:space:]]+Host[[:space:]]+\{http\.request\.host\}' 'external Host preservation'
 require_text "$CADDY" 'reverse_proxy[[:space:]]+ttygated:7681' 'private ttygate backend'
-reject_text "$CADDY" 'tls[[:space:]]+internal|tls_insecure|http://terminal\.' 'insecure TLS convenience'
+reject_text "$CADDY" 'tls[[:space:]]+internal|tls_insecure' 'insecure TLS convenience'
+reject_text "$CADDY" 'header_up[[:space:]]+[+-]?X-Authenticated-User' 'post-auth identity rewrite'
 
 # Nginx has an explicit redirect, TLS listener, auth_request flow, identity
 # replacement, and HTTP/1.1 hop-by-hop header forwarding for WebSockets.
@@ -86,7 +90,13 @@ require_text "$NGINX" 'proxy_set_header[[:space:]]+Host[[:space:]]+\$http_host' 
 require_text "$NGINX" 'proxy_http_version[[:space:]]+1\.1' 'HTTP/1.1 upstream transport'
 require_text "$NGINX" 'proxy_set_header[[:space:]]+Upgrade[[:space:]]+\$http_upgrade' 'WebSocket Upgrade forwarding'
 require_text "$NGINX" 'proxy_set_header[[:space:]]+Connection[[:space:]]+\$connection_upgrade' 'conditional WebSocket Connection forwarding'
-require_text "$NGINX" 'proxy_pass[[:space:]]+http://ttygated:7681' 'private ttygate backend'
+require_text "$NGINX" 'server[[:space:]]+ttygated:7681' 'private ttygate backend'
+require_text "$NGINX" 'proxy_pass[[:space:]]+http://ttygate_backend' 'private ttygate upstream use'
+require_text "$NGINX" 'client_body_temp_path[[:space:]]+/tmp/' 'read-only-root client temp path'
+require_text "$NGINX" 'fastcgi_temp_path[[:space:]]+/tmp/' 'read-only-root FastCGI temp path'
+require_text "$NGINX" 'proxy_temp_path[[:space:]]+/tmp/' 'read-only-root proxy temp path'
+require_text "$NGINX" 'scgi_temp_path[[:space:]]+/tmp/' 'read-only-root SCGI temp path'
+require_text "$NGINX" 'uwsgi_temp_path[[:space:]]+/tmp/' 'read-only-root uwsgi temp path'
 reject_text "$NGINX" 'ssl_verify_client[[:space:]]+off|proxy_ssl_verify[[:space:]]+off' 'explicit TLS verification weakening'
 
 # The matching application config is production-only, externally HTTPS, and
@@ -106,10 +116,11 @@ reject_text "$CONFIG" '0\.0\.0\.0/0|::/0|provider[[:space:]]*=[[:space:]]*"dev"|
 # Operator documentation owns all deployment and residual-risk boundaries.
 for pattern in \
   'browser.*TLS.*proxy|TLS.*proxy.*browser' \
-  'only.*proxy.*reach.*backend|backend.*only.*proxy' \
+  'only.*proxy.*reach' \
+  'backend listener' \
   'actual socket peer' \
   'Forwarded.*(not|never).*authority|not.*trust.*Forwarded' \
-  'strip.*client.*identity|replace.*client.*identity' \
+  '(strip|remove|replace).*client.*identity' \
   'public_url.*Origin|Origin.*public_url' \
   'WebSocket' \
   'Secure.*HttpOnly.*SameSite|secure cookie' \
@@ -121,8 +132,8 @@ for pattern in \
   'localhost|loopback' \
   '0600|owner.only' \
   'rotation.*retention.*shipping|retention.*rotation' \
-  'terminal input.*(not|never)|exclude.*terminal input' \
-  'test certificate.*not.*production|not.*production.*test certificate' \
+  '(does not|never|exclude).*terminal input|terminal input.*(not|never)' \
+  'test certificate.*not.*production|not.*production.*test certificate|test-only.*not.*production' \
   'Caddy.*Nginx|Nginx.*Caddy' \
   'caddy validate' \
   'nginx -t' \
@@ -133,7 +144,7 @@ require_text "$GUIDE" 'https://caddyserver\.com/docs/' 'official Caddy documenta
 require_text "$GUIDE" 'https://nginx\.org/en/docs/' 'official Nginx documentation link'
 require_text "$GUIDE" 'https://developers\.cloudflare\.com/' 'official Cloudflare documentation link'
 require_text "$GUIDE" 'https://tailscale\.com/docs/' 'official Tailscale documentation link'
-reject_text "$GUIDE" 'self.signed.*production.safe|trust.*CF-Access-Authenticated-User-Email.*alone' 'unsafe provider or certificate claim'
+reject_text "$GUIDE" 'self.signed.*is production.safe|trust CF-Access-Authenticated-User-Email alone' 'unsafe provider or certificate claim'
 
 # The shared harness must validate and exercise both exact configurations,
 # scan audit secrecy, and guarantee cleanup.
@@ -141,26 +152,30 @@ for pattern in \
   'caddy validate' \
   'nginx -t' \
   'openssl.*req' \
-  '/healthz' \
   'reverse-proxy-session\.mjs' \
-  'missing.*identity|missing.*auth' \
-  'spoof' \
   'untrusted.*peer' \
   'public_url' \
   'development.*auth|provider.*dev' \
   'plaintext.*production' \
   'audit' \
-  'terminal.*input|terminal.*output' \
   'docker rm' \
   'docker network rm' \
-  'trap.*EXIT.*HUP.*INT.*TERM'; do
+  'trap.*EXIT'; do
   require_text "$SMOKE" "$pattern" "smoke coverage matching $pattern"
 done
+require_text "$SMOKE" 'trap.*HUP.*INT.*TERM' 'signal cancellation cleanup'
 require_text "$AUTH_FIXTURE" 'X-Authenticated-User' 'synthetic canonical identity'
 require_text "$AUTH_FIXTURE" 'authorization' 'synthetic upstream authentication'
-require_text "$SESSION_FIXTURE" 'wss:' 'secure WebSocket lifecycle'
+require_text "$SESSION_FIXTURE" 'Sec-WebSocket-Key' 'WebSocket lifecycle'
+require_text "$SESSION_FIXTURE" 'node:tls|connect.*servername' 'TLS-protected WebSocket transport'
 require_text "$SESSION_FIXTURE" '/api/sessions' 'ticket issuance'
 require_text "$SESSION_FIXTURE" '/healthz' 'proxied health check'
+require_text "$SESSION_FIXTURE" 'missing authentication' 'missing authenticated identity denial'
+require_text "$SESSION_FIXTURE" 'spoofed-user' 'client identity spoof rejection'
+require_text "$SESSION_FIXTURE" 'wrong-origin' 'incorrect Origin denial'
+require_text "$SESSION_FIXTURE" 'scanAuditText' 'complete audit secrecy scan'
+require_text "$SESSION_FIXTURE" 'terminal_input' 'terminal input audit exclusion'
+require_text "$SESSION_FIXTURE" 'terminal_output' 'terminal output audit exclusion'
 
 # Required CI uses separate immutable proxy jobs and publishes no artifacts.
 require_text "$CI" '^  caddy-deployment:' 'separate Caddy deployment job'

@@ -10,6 +10,7 @@ import {
   canonicalCookie,
   decodeServerFrames,
   maskedFrame,
+  scanAuditText,
   validatedTicket,
 } from "./reverse-proxy-session.mjs";
 
@@ -106,5 +107,35 @@ test("masked client frames and bounded server frame decoding preserve payload by
   assert.throws(
     () => decodeServerFrames(Buffer.from([0x82, 0x7f])),
     /server frame invalid/,
+  );
+});
+
+test("complete audit scan requires the canonical lifecycle and rejects secret classes", () => {
+  const good = [
+    '{"schema_version":1,"event_type":"authentication-succeeded","identity":"synthetic-user","remote_address":"192.0.2.10:40000","authenticated_at":"2026-07-19T00:00:00Z"}',
+    '{"schema_version":1,"event_type":"session-started","session_id":"synthetic-correlation","identity":"synthetic-user","target":"maintenance-shell","remote_address":"192.0.2.10:40001","started_at":"2026-07-19T00:00:01Z"}',
+    '{"schema_version":1,"event_type":"session-ended","session_id":"synthetic-correlation","identity":"synthetic-user","target":"maintenance-shell","remote_address":"192.0.2.10:40001","started_at":"2026-07-19T00:00:01Z","ended_at":"2026-07-19T00:00:02Z","outcome":{"kind":"client-request"}}',
+  ].join("\n") + "\n";
+  assert.equal(scanAuditText(good), 3);
+
+  for (const forbidden of [
+    "Authorization",
+    "chunk42-fixture-only",
+    "ttgate_session=",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "TTYGATE_PROXY_FLOW_OK",
+    "printf",
+    "BEGIN PRIVATE KEY",
+  ]) {
+    assert.throws(
+      () => scanAuditText(`${good}${forbidden}\n`),
+      /audit content invalid/,
+    );
+  }
+  const withRuntimeSecret =
+    `${good}{"schema_version":1,"event_type":"access-denied","reason":"runtime-only-secret"}\n`;
+  assert.throws(
+    () => scanAuditText(withRuntimeSecret, ["runtime-only-secret"]),
+    /audit content invalid/,
   );
 });

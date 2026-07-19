@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { request } from "node:https";
 import { connect } from "node:tls";
 import { pathToFileURL } from "node:url";
@@ -115,6 +115,75 @@ export function decodeServerFrames(buffer) {
   return { frames, remaining: buffer.subarray(offset) };
 }
 
+export function scanAuditText(text, runtimeSecrets = []) {
+  if (
+    typeof text !== "string" ||
+    text.length === 0 ||
+    Buffer.byteLength(text) > 1_048_576 ||
+    !text.endsWith("\n")
+  ) {
+    throw new Error("audit content invalid");
+  }
+  const lower = text.toLowerCase();
+  for (const forbidden of [
+    "authorization",
+    "chunk42-fixture-only",
+    "ttgate_session=",
+    "ttgate_proxy_flow_ok",
+    "printf",
+    "begin private key",
+    '"ticket"',
+    '"cookie"',
+    '"headers"',
+    '"terminal_input"',
+    '"terminal_output"',
+    '"command"',
+    '"arguments"',
+    '"environment"',
+    '"private_key"',
+    ...runtimeSecrets.map((value) => value.toLowerCase()),
+  ]) {
+    if (forbidden !== "" && lower.includes(forbidden)) {
+      throw new Error("audit content invalid");
+    }
+  }
+  const values = text.trimEnd().split("\n").map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      throw new Error("audit content invalid");
+    }
+  });
+  const lifecycle = values.filter((value) =>
+    ["authentication-succeeded", "session-started", "session-ended"].includes(
+      value.event_type,
+    )
+  );
+  if (
+    !lifecycle.some((value) =>
+      value.event_type === "authentication-succeeded" &&
+      value.identity === FIXTURE_IDENTITY
+    ) ||
+    !lifecycle.some((value) =>
+      value.event_type === "session-started" &&
+      value.identity === FIXTURE_IDENTITY &&
+      value.target === TARGET
+    ) ||
+    !lifecycle.some((value) =>
+      value.event_type === "session-ended" &&
+      value.identity === FIXTURE_IDENTITY &&
+      value.target === TARGET
+    ) ||
+    lifecycle.some((value) =>
+      typeof value.remote_address === "string" &&
+      !value.remote_address.startsWith("192.0.2.10:")
+    )
+  ) {
+    throw new Error("audit content invalid");
+  }
+  return values.length;
+}
+
 function httpsRequest(ca, method, path, headers = {}, body = "") {
   return new Promise((resolve, reject) => {
     const outgoing = request(
@@ -159,7 +228,7 @@ function httpsRequest(ca, method, path, headers = {}, body = "") {
   });
 }
 
-function openWebSocket(ca, cookie, ticket) {
+function openWebSocket(ca, cookie, ticket, hold = false) {
   return new Promise((resolve, reject) => {
     const socket = connect({
       ca,
@@ -172,15 +241,39 @@ function openWebSocket(ca, cookie, ticket) {
     let frames = Buffer.alloc(0);
     let output = Buffer.alloc(0);
     let upgraded = false;
+    let lifecycleReady = false;
+    let closeRequested = false;
+    let settled = false;
     const timeout = setTimeout(() => {
       socket.destroy(new Error("WebSocket lifecycle timed out"));
     }, 10_000);
 
     const fail = (error) => {
+      if (settled) return;
       clearTimeout(timeout);
+      settled = true;
       reject(error instanceof Error ? error : new Error("WebSocket failed"));
     };
-    socket.once("error", fail);
+    const finish = () => {
+      if (settled) return;
+      clearTimeout(timeout);
+      settled = true;
+      resolve();
+    };
+    socket.once("error", (error) => {
+      if (hold && lifecycleReady) {
+        finish();
+      } else {
+        fail(error);
+      }
+    });
+    socket.once("close", () => {
+      if (hold && lifecycleReady) {
+        finish();
+      } else if (!settled) {
+        fail(new Error("WebSocket closed before lifecycle completion"));
+      }
+    });
     socket.once("secureConnect", () => {
       const key = randomBytes(16).toString("base64");
       socket.write(
@@ -232,7 +325,19 @@ function openWebSocket(ca, cookie, ticket) {
             socket.destroy(new Error("terminal output exceeded fixture bound"));
             return;
           }
-          if (output.includes(Buffer.from(TERMINAL_SENTINEL))) {
+          if (
+            output.includes(Buffer.from(TERMINAL_SENTINEL)) &&
+            !lifecycleReady
+          ) {
+            lifecycleReady = true;
+            if (hold) {
+              clearTimeout(timeout);
+              process.stdout.write("REVERSE_PROXY_SESSION_HOLD_READY\n");
+              continue;
+            }
+          }
+          if (!hold && lifecycleReady && !closeRequested) {
+            closeRequested = true;
             socket.write(
               maskedFrame(
                 0x1,
@@ -249,9 +354,8 @@ function openWebSocket(ca, cookie, ticket) {
             return;
           }
           if (control.type === "close" && output.includes(TERMINAL_SENTINEL)) {
-            clearTimeout(timeout);
             socket.end(maskedFrame(0x8, Buffer.alloc(0)));
-            resolve();
+            finish();
           }
         } else if (frame.opcode === 0x8) {
           if (!output.includes(TERMINAL_SENTINEL)) {
@@ -263,7 +367,7 @@ function openWebSocket(ca, cookie, ticket) {
   });
 }
 
-export async function runLifecycle(certificatePath) {
+export async function runLifecycle(certificatePath, secretPath) {
   const ca = readFileSync(certificatePath);
   const missing = await httpsRequest(ca, "GET", "/");
   if (![401, 403].includes(missing.status)) {
@@ -276,7 +380,9 @@ export async function runLifecycle(certificatePath) {
   };
   const health = await httpsRequest(ca, "GET", "/healthz", common);
   if (health.status !== 200 || health.body !== "ok\n") {
-    throw new Error("proxied health check failed");
+    throw new Error(
+      `proxied health check failed: status=${health.status} body=${JSON.stringify(health.body.slice(0, 128))}`,
+    );
   }
   const frontend = await httpsRequest(ca, "GET", "/", common);
   if (
@@ -296,7 +402,9 @@ export async function runLifecycle(certificatePath) {
     },
   );
   if (identity.status !== 204) {
-    throw new Error("identity establishment failed");
+    throw new Error(
+      `identity establishment failed: status=${identity.status} body=${JSON.stringify(identity.body.slice(0, 128))}`,
+    );
   }
   const cookie = canonicalCookie(identity.headers["set-cookie"]);
   const payload = JSON.stringify({ target: TARGET });
@@ -312,7 +420,39 @@ export async function runLifecycle(certificatePath) {
     payload,
   );
   const ticket = validatedTicket(grant.status, grant.body);
-  await openWebSocket(ca, cookie, ticket);
+  const wrongOrigin = await httpsRequest(
+    ca,
+    "POST",
+    "/api/sessions",
+    {
+      ...common,
+      Origin: "https://wrong-origin.example.invalid:8443",
+      Cookie: cookie,
+      "Content-Type": "application/json",
+    },
+    payload,
+  );
+  if (wrongOrigin.status !== 403) {
+    throw new Error("incorrect public URL or Origin was not denied");
+  }
+  if (secretPath !== undefined) {
+    writeFileSync(
+      secretPath,
+      JSON.stringify({
+        authorization: FIXTURE_AUTHORIZATION,
+        cookie,
+        ticket,
+        terminal: TERMINAL_SENTINEL,
+      }),
+      { encoding: "utf8", flag: "wx", mode: 0o600 },
+    );
+  }
+  await openWebSocket(
+    ca,
+    cookie,
+    ticket,
+    process.env.TTYGATE_FIXTURE_HOLD === "1",
+  );
 
   process.stdout.write(`REVERSE_PROXY_SESSION_OK identity=${FIXTURE_IDENTITY}\n`);
 }
@@ -321,9 +461,20 @@ if (
   process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
-  const certificatePath = process.argv[2];
-  if (certificatePath === undefined) {
-    throw new Error("certificate path is required");
+  if (process.argv[2] === "--scan-audit") {
+    const auditPath = process.argv[3];
+    const secretPath = process.argv[4];
+    if (auditPath === undefined || secretPath === undefined) {
+      throw new Error("audit and secret paths are required");
+    }
+    const secrets = Object.values(JSON.parse(readFileSync(secretPath, "utf8")));
+    const count = scanAuditText(readFileSync(auditPath, "utf8"), secrets);
+    process.stdout.write(`AUDIT_SCAN_OK records=${count}\n`);
+  } else {
+    const certificatePath = process.argv[2];
+    if (certificatePath === undefined) {
+      throw new Error("certificate path is required");
+    }
+    await runLifecycle(certificatePath, process.argv[3]);
   }
-  await runLifecycle(certificatePath);
 }

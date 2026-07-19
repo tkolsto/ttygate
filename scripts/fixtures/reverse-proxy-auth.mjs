@@ -19,8 +19,12 @@ export function authorize(method, path, authorization) {
 
 export function startAuthServer() {
   const server = createServer((request, response) => {
-    const authorization = request.headersDistinct?.authorization ??
-      request.headers.authorization;
+    const distinctAuthorization = request.headersDistinct?.authorization;
+    const authorization = Array.isArray(distinctAuthorization)
+      ? distinctAuthorization.length === 1
+        ? distinctAuthorization[0]
+        : undefined
+      : request.headers.authorization;
     const decision = authorize(
       request.method ?? "",
       request.url ?? "",

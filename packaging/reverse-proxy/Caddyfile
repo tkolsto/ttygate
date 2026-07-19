@@ -17,8 +17,6 @@ https://terminal.example.invalid:8443 {
 
 	reverse_proxy ttygated:7681 {
 		header_up -Authorization
-		header_up -X-Authenticated-User
-		header_up X-Authenticated-User {http.request.header.X-Authenticated-User}
 		header_up Host {http.request.host}
 	}
 }
