@@ -32,7 +32,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // This is the ordered source of truth for the strict option vocabulary. Runtime
 // argv construction must use the same keys while replacing material placeholders.
-pub(crate) const STRICT_SSH_PROBE_OPTIONS: [&str; 28] = [
+pub(crate) const STRICT_SSH_PROBE_OPTIONS: [&str; 29] = [
     "StrictHostKeyChecking=yes",
     "UserKnownHostsFile=/dev/null",
     "GlobalKnownHostsFile=/dev/null",
@@ -41,6 +41,7 @@ pub(crate) const STRICT_SSH_PROBE_OPTIONS: [&str; 28] = [
     "BatchMode=yes",
     "IdentitiesOnly=yes",
     "IdentityFile=/dev/null",
+    "CertificateFile=/dev/null",
     "IdentityAgent=none",
     "AddKeysToAgent=no",
     "PreferredAuthentications=publickey",
@@ -841,6 +842,7 @@ pub async fn probe_capabilities(executable: &Path) -> Result<(), SshPreparationE
         ("updatehostkeys", &["no", "false"][..]),
         ("checkhostip", &["yes", "true"][..]),
         ("identityfile", &["/dev/null"][..]),
+        ("certificatefile", &["/dev/null"][..]),
         ("addkeystoagent", &["no", "false"][..]),
         ("preferredauthentications", &["publickey"][..]),
         ("pubkeyauthentication", &["yes", "true"][..]),
@@ -1267,6 +1269,7 @@ checkhostip yes\n\
 batchmode yes\n\
 identitiesonly yes\n\
 identityfile /dev/null\n\
+certificatefile /dev/null\n\
 identityagent none\n\
 addkeystoagent false\n\
 preferredauthentications publickey\n\
@@ -1635,6 +1638,7 @@ requesttty force\n"
             "BatchMode=yes",
             "IdentitiesOnly=yes",
             "IdentityFile=/dev/null",
+            "CertificateFile=/dev/null",
             "IdentityAgent=none",
             "AddKeysToAgent=no",
             "PreferredAuthentications=publickey",
@@ -1814,6 +1818,55 @@ requesttty force\n"
     }
 
     #[tokio::test]
+    async fn installed_openssh_renders_safe_material_option_paths_exactly() {
+        let _probe_guard = REAL_PROBE_TEST_LOCK.lock().await;
+        let executable = Path::new("/usr/bin/ssh");
+        let Ok(metadata) = fs::metadata(executable) else {
+            eprintln!("supported OpenSSH executable is unavailable; explicit skip");
+            return;
+        };
+        assert!(metadata.is_file());
+        let material = Material::new();
+        let identity = material.identity.to_str().unwrap();
+        let known_hosts = material.known_hosts.to_str().unwrap();
+        let output = std::process::Command::new(executable)
+            .args(["-G", "-E", "/dev/null", "-F", "/dev/null"])
+            .arg("-o")
+            .arg(format!("IdentityFile={identity}"))
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={known_hosts}"))
+            .args(["-o", "CertificateFile=/dev/null", "--", "host.example"])
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "installed OpenSSH rejected closed material options"
+        );
+        let rendered = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == format!("identityfile {identity}")),
+            "installed OpenSSH changed the identity path"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == format!("userknownhostsfile {known_hosts}")),
+            "installed OpenSSH changed the known-host path"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "certificatefile /dev/null"),
+            "installed OpenSSH changed the certificate pin"
+        );
+    }
+
+    #[tokio::test]
     async fn production_configured_ssh_target_has_no_insecure_runtime_fallback() {
         let material = Material::new();
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1870,6 +1923,12 @@ requesttty force\n"
                 1,
                 "{key} was not serialized exactly once"
             );
+            if key != "UserKnownHostsFile" && key != "IdentityFile" {
+                assert!(
+                    options.contains(&probe_option),
+                    "{probe_option} was not serialized with its literal pinned value"
+                );
+            }
         }
         assert_eq!(argv[0], "-vv");
         assert_eq!(argv[1], "-tt");

@@ -647,8 +647,8 @@ fn convert_target(index: usize, raw: RawTarget) -> Result<Target, ConfigError> {
                 ));
             }
             validate_literal_path(&ssh_executable, &format!("targets[{index}].ssh_executable"))?;
-            validate_literal_path(&identity_file, &format!("targets[{index}].identity_file"))?;
-            validate_literal_path(&known_hosts, &format!("targets[{index}].known_hosts"))?;
+            validate_ssh_option_path(&identity_file, &format!("targets[{index}].identity_file"))?;
+            validate_ssh_option_path(&known_hosts, &format!("targets[{index}].known_hosts"))?;
             let policy = match user_policy {
                 RawUserPolicy::SameAsAuthUser => {
                     reject_stray_policy_fields(index, &user, &user_mapping)?;
@@ -749,6 +749,26 @@ fn validate_literal_path(path: &Path, field: &str) -> Result<(), ConfigError> {
         return Err(validation(
             field.to_owned(),
             "must be a non-empty literal path without expansion syntax",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_option_path(path: &Path, field: &str) -> Result<(), ConfigError> {
+    validate_literal_path(path, field)?;
+    let Some(value) = path.to_str() else {
+        return Err(validation(field.to_owned(), "must be valid UTF-8"));
+    };
+    let has_option_lexer_syntax = value.starts_with('~')
+        || value.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '%' | '\'' | '"' | '\\' | '$')
+        });
+    if value.is_empty() || has_option_lexer_syntax {
+        return Err(validation(
+            field.to_owned(),
+            "must be a non-empty literal path without OpenSSH option lexer or expansion syntax",
         ));
     }
     Ok(())
@@ -953,11 +973,11 @@ fn validate_typed_target(index: usize, target: &Target) -> Result<(), ConfigErro
                 &target.ssh_executable,
                 &format!("targets[{index}].ssh_executable"),
             )?;
-            validate_literal_path(
+            validate_ssh_option_path(
                 &target.identity_file,
                 &format!("targets[{index}].identity_file"),
             )?;
-            validate_literal_path(
+            validate_ssh_option_path(
                 &target.known_hosts,
                 &format!("targets[{index}].known_hosts"),
             )?;
@@ -1481,7 +1501,7 @@ command = ["/bin/bash"]"#,
 
     #[test]
     fn preserves_literal_paths_and_rejects_expansion_syntax() {
-        for path in ["./known_hosts", "/etc/ttygate/known hosts"] {
+        for path in ["./known_hosts", "/etc/ttygate/known-hosts"] {
             let source = config_with_target(&format!(
                 r#"[[targets]]
 name = "host"
@@ -1504,6 +1524,7 @@ user_policy = "same-as-auth-user""#
             "",
             "~/known_hosts",
             "$HOME/known_hosts",
+            "/etc/ttygate/known hosts",
             "./known_*",
             "./known?hosts",
             "./known[12]",
@@ -2449,6 +2470,53 @@ user_mapping = { alice = "remote-alice" }"#,
             let error = parse(&source).unwrap_err().to_string();
             assert!(error.contains(field), "{error:?} did not contain {field:?}");
         }
+    }
+
+    #[test]
+    fn ssh_option_paths_reject_every_lexer_or_expansion_construct() {
+        let cases = [
+            ("space", "/etc/ttygate/id key"),
+            ("tab", "/etc/ttygate/id\tkey"),
+            ("newline", "/etc/ttygate/id\nkey"),
+            ("carriage-return", "/etc/ttygate/id\rkey"),
+            ("control", "/etc/ttygate/id\u{001b}key"),
+            ("delete", "/etc/ttygate/id\u{007f}key"),
+            ("percent-token", "/etc/ttygate/id_%h"),
+            ("single-quote", "/etc/ttygate/id'key"),
+            ("double-quote", "/etc/ttygate/id\"key"),
+            ("backslash", "/etc/ttygate/id\\ key"),
+            ("dollar", "/etc/ttygate/id$key"),
+            ("leading-tilde", "~/id_key"),
+        ];
+
+        for field in ["identity_file", "known_hosts"] {
+            for (label, path) in cases {
+                let mut target = parsed_ssh(r#"user_policy = "same-as-auth-user""#);
+                if field == "identity_file" {
+                    target.identity_file = path.into();
+                } else {
+                    target.known_hosts = path.into();
+                }
+                let error = TargetAllowlist::new(vec![Target::Ssh(target)])
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(&format!("targets[0].{field}")),
+                    "{field} accepted SSH option lexer construct {label}: {path:?}"
+                );
+            }
+        }
+
+        let executable_with_space = ssh_target(r#"user_policy = "same-as-auth-user""#)
+            .replace("/usr/bin/ssh", "/opt/ttygate/bin/ssh executable");
+        let config = parse(&executable_with_space).unwrap();
+        let Target::Ssh(target) = &config.targets[0] else {
+            panic!("expected SSH target");
+        };
+        assert_eq!(
+            target.ssh_executable,
+            PathBuf::from("/opt/ttygate/bin/ssh executable")
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ exec /usr/sbin/sshd -D -e \
   -o PasswordAuthentication=no \
   -o KbdInteractiveAuthentication=no \
   -o PubkeyAuthentication=yes \
+  -o TrustedUserCAKeys=/fixture/user_ca.pub \
   -o PermitRootLogin=no \
   -o AllowUsers=ttygate \
   -o PrintMotd=no \

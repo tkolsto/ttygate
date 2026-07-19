@@ -134,6 +134,12 @@ impl RealSshdFixture {
         }
         generate_key(client_directory.join("client_key"));
         generate_key(client_directory.join("wrong_client_key"));
+        generate_key(client_directory.join("user_ca"));
+        fs::copy(
+            client_directory.join("user_ca.pub"),
+            server_directory.join("user_ca.pub"),
+        )
+        .unwrap();
         generate_key_with_comment(
             client_directory.join(SENTINEL_IDENTITY),
             SENTINEL_PRIVATE_KEY_COMMENT,
@@ -323,6 +329,16 @@ impl RealSshdFixture {
     }
 
     async fn manager(&self, target: SshTarget, limits: Limits) -> (Arc<SessionManager>, AppState) {
+        self.try_manager(target, limits)
+            .await
+            .expect("prepare real SSH target")
+    }
+
+    async fn try_manager(
+        &self,
+        target: SshTarget,
+        limits: Limits,
+    ) -> Result<(Arc<SessionManager>, AppState), startup::StartupError> {
         let config = test_config(target.clone(), limits.clone(), self.audit_path.clone());
         let target_for_builder = target.clone();
         let limits_for_builder = limits.clone();
@@ -343,10 +359,9 @@ impl RealSshdFixture {
                 ))
             },
         )
-        .await
-        .expect("prepare real SSH target");
+        .await?;
         let state = prepared.state;
-        (state.sessions(), state)
+        Ok((state.sessions(), state))
     }
 
     async fn session(&self) -> (Session, Arc<SessionManager>) {
@@ -494,6 +509,53 @@ impl RealSshdFixture {
         assert!(!audit.contains("session-started"), "{audit}");
         assert_eq!(audit.matches("\"event_type\":\"access-denied\"").count(), 1);
         self.assert_no_session_children().await;
+    }
+
+    async fn assert_ca_only_sibling_certificate_is_disabled(&self) {
+        command_ok(
+            Command::new("ssh-keygen")
+                .args(["-q", "-s"])
+                .arg(self.client_directory.join("user_ca"))
+                .args(["-I", "ttygate-review", "-n", "ttygate"])
+                .arg(self.client_directory.join("wrong_client_key.pub")),
+            "sign CA-only sibling client certificate",
+        );
+        assert!(
+            self.client_directory
+                .join("wrong_client_key-cert.pub")
+                .is_file()
+        );
+        let (manager, _) = self
+            .manager(
+                self.target("known_hosts", "wrong_client_key"),
+                default_limits(),
+            )
+            .await;
+        match manager
+            .start(
+                Identity::new(USER).unwrap(),
+                TARGET,
+                Resize::new(80, 24).unwrap(),
+            )
+            .await
+        {
+            Err(error) => {
+                assert_eq!(error, SessionError::SshAuthenticationFailed);
+                let audit = self.audit_text();
+                assert!(
+                    audit.contains("\"reason\":\"ssh-authentication-failed\""),
+                    "{audit}"
+                );
+                assert!(!audit.contains("session-started"), "{audit}");
+                assert!(!audit.contains("session-ended"), "{audit}");
+                assert_eq!(audit.matches("\"event_type\":\"access-denied\"").count(), 1);
+                self.assert_no_session_children().await;
+            }
+            Ok(mut session) => {
+                session.close().await.unwrap();
+                panic!("OpenSSH automatically loaded an unpinned sibling certificate");
+            }
+        }
     }
 
     async fn assert_remote_exit(&self) {
@@ -969,7 +1031,7 @@ impl RealSshdFixture {
         );
         assert_eq!(
             String::from_utf8(mounted.stdout).unwrap(),
-            "accepted_client_key.pub\nbanner\nssh_host_ed25519_key\n"
+            "accepted_client_key.pub\nbanner\nssh_host_ed25519_key\nuser_ca.pub\n"
         );
         let route = command_ok(
             Command::new("docker").args(["exec", &self.container.name, "cat", "/proc/net/route"]),
@@ -1211,7 +1273,12 @@ fn assert_server_fixture_allowlist(server_directory: &Path) {
     entries.sort();
     assert_eq!(
         entries,
-        ["accepted_client_key.pub", "banner", "ssh_host_ed25519_key"]
+        [
+            "accepted_client_key.pub",
+            "banner",
+            "ssh_host_ed25519_key",
+            "user_ca.pub"
+        ]
     );
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
@@ -1460,6 +1527,14 @@ async fn refused_port_is_distinct_connection_failure() {
 #[tokio::test]
 async fn wrong_identity_key_is_distinct_authentication_failure() {
     RealSshdFixture::start().await.assert_wrong_identity().await;
+}
+
+#[tokio::test]
+async fn ca_only_sibling_identity_certificate_is_rejected_without_session_lifecycle() {
+    RealSshdFixture::start()
+        .await
+        .assert_ca_only_sibling_certificate_is_disabled()
+        .await;
 }
 
 #[tokio::test]
