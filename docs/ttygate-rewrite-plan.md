@@ -363,7 +363,7 @@ Exit criteria (tests):
 - SSH works against a real server without disabling host-key verification.
 - Integration tests: host-key mismatch is rejected and audit-logged; unknown SSH target rejected; user policy mapping applied correctly; no client input can alter the ssh argument vector.
 
-**Status:** Phase 3 / M3 complete. Implemented in Chunk 3.1 (Refs #11): `type = "ssh"` targets require literal `ssh_executable`, `identity_file`, and `known_hosts` paths whose option values additionally reject the OpenSSH option lexer and expansion syntax; startup validates material ownership, permissions, and structure and probes the client for the complete pinned option vocabulary (including `CertificateFile=/dev/null`) before bind; sessions run with a fully server-constructed argv, cleared environment, and curated non-reflecting failure states; real containerized-sshd tests cover the exit criteria above. The remaining roadmap begins with packaging; completion so far does not make this pre-release build production-safe.
+**Status:** Phase 3 / M3 complete. Implemented in Chunk 3.1 (Refs #11): `type = "ssh"` targets require literal `ssh_executable`, `identity_file`, and `known_hosts` paths whose option values additionally reject the OpenSSH option lexer and expansion syntax; startup validates material ownership, permissions, and structure and probes the client for the complete pinned option vocabulary (including `CertificateFile=/dev/null`) before bind; sessions run with a fully server-constructed argv, cleared environment, and curated non-reflecting failure states; real containerized-sshd tests cover the exit criteria above. Chunk 4.1 packaging is also implemented (Refs #12); completion so far does not make this pre-release build production-safe.
 
 ### Phase 4: Packaging and Release
 
@@ -372,6 +372,12 @@ Exit criteria (tests):
 - Example reverse-proxy configs for Caddy/Nginx and Cloudflare Access/Tailscale style headers.
 - Release workflow with checksums and SBOM if practical.
 - Complete the README checklist below.
+
+**Status:** Chunk 4.1 is complete (Refs #12): the Docker and systemd install/run
+paths default to localhost, use dedicated non-root identities, preserve
+fail-closed ownership checks, and have scripted cleanup, health, readiness, and
+watchdog coverage. Reverse-proxy examples, release automation, and the v0.1 tag
+remain assigned to Chunks 4.2 and 4.3.
 
 Exit criteria (manual pre-release checks):
 

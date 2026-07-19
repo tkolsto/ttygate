@@ -1,0 +1,16 @@
+.git
+.worktrees
+target
+frontend/node_modules
+frontend/playwright-report
+frontend/test-results
+crates/ttygated/tests
+spikes
+docs
+.github
+packaging/systemd
+**/*.key
+**/known_hosts*
+**/*.log
+**/.tmp*
+frontend/dist/index.html

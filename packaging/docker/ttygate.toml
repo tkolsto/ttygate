@@ -1,0 +1,25 @@
+[server]
+bind = "127.0.0.1:7681"
+mode = "dev"
+public_url = "http://127.0.0.1:7681"
+
+[auth]
+provider = "dev"
+user = "local"
+
+[audit]
+format = "json"
+path = "/var/log/ttygate/audit.jsonl"
+recording = false
+
+[limits]
+max_sessions = 4
+max_sessions_per_user = 2
+idle_timeout_seconds = 900
+absolute_timeout_seconds = 14400
+
+[[targets]]
+name = "local-shell"
+type = "pty"
+command = ["/bin/sh"]
+read_only = false

@@ -13,6 +13,7 @@ use crate::{
     audit::{AuditError, AuditLog},
     config::{Config, ConfigError, ServerTransport, Target, TlsConfig, validate_startup_contract},
     server::{self, AppState, ServerBuildError},
+    service_manager::{self, ServiceManagerError},
     ssh::{self, PreparedSshTargets, SshPreparationError},
     tls::{self, TlsError},
 };
@@ -44,6 +45,8 @@ pub enum StartupError {
     Bind(#[source] io::Error),
     #[error("server stopped because of a listener error")]
     Serve(#[source] io::Error),
+    #[error(transparent)]
+    ServiceManager(#[from] ServiceManagerError),
 }
 
 pub async fn start(config: &Config) -> Result<(), StartupError> {
@@ -178,12 +181,16 @@ async fn bind_and_serve(prepared: PreparedServer) -> Result<(), StartupError> {
             let listener = TcpListener::bind(prepared.bind)
                 .await
                 .map_err(StartupError::Bind)?;
+            service_manager::notify_ready()?;
+            let _watchdog = service_manager::spawn_watchdog();
             server::serve(listener, prepared.state)
                 .await
                 .map_err(StartupError::Serve)
         }
         PreparedTransport::DirectTls(tls) => {
             let listener = StdTcpListener::bind(prepared.bind).map_err(StartupError::Bind)?;
+            service_manager::notify_ready()?;
+            let _watchdog = service_manager::spawn_watchdog();
             server::serve_tls_on(listener, prepared.state, tls)
                 .await
                 .map_err(StartupError::Serve)

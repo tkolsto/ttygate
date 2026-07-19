@@ -156,6 +156,11 @@ recording limitations.
 - **Deliverables:** Dockerfile (multi-stage, non-root runtime user, `/healthz` healthcheck); systemd unit with hardening (`DynamicUser` or dedicated user, `NoNewPrivileges`, `ProtectSystem`, watchdog wired to `/healthz` or sd_notify).
 - **Consumes:** working binary (M1–M3).
 - **Done when:** both start localhost-only by default and pass a scripted smoke test.
+- **Status:** complete (Refs #12). The Docker package uses digest-pinned build
+  stages, a fixed non-root identity, a minimal runtime, and daemon-driven
+  health; the dedicated-user systemd package uses `Type=notify`, watchdog
+  heartbeats, explicit ownership, sandboxing, and cgroup teardown. Separate
+  Docker and Linux systemd smoke jobs exercise both paths.
 
 ### Chunk 4.2 — Deployment docs and reverse-proxy examples
 
