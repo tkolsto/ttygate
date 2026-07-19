@@ -1,0 +1,3 @@
+d /var/lib/ttygate 0700 ttygate ttygate - -
+d /var/log/ttygate 0700 ttygate ttygate - -
+d /etc/ttygate/ssh 0750 root ttygate - -
