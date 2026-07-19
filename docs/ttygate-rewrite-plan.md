@@ -242,7 +242,9 @@ name = "lab-host"
 type = "ssh"
 host = "lab.example.internal"
 port = 22
-known_hosts = "./known_hosts"
+ssh_executable = "/usr/bin/ssh"
+identity_file = "/etc/ttygate/lab_host_ed25519"
+known_hosts = "/etc/ttygate/lab_host_known_hosts"
 user_policy = "same-as-auth-user"
 ```
 
@@ -282,7 +284,7 @@ binding, and runtime sink failure permanently denies new authority.
 This is append persistence, not a transactional journal: the writer flushes but
 does not `fsync` each record. Operators own rotation, retention, shipping,
 backup, and deletion. The containing filesystem remains trusted against
-privileged or concurrent namespace mutation. SSH, recording, reconnect,
+privileged or concurrent namespace mutation. Recording, reconnect,
 packaging, deployment examples, and release hardening remain future phases.
 
 ## Implementation Phases
@@ -347,8 +349,7 @@ Exit criteria (tests):
 - Integration tests: requests from outside trusted CIDRs cannot inject identity headers; audit log reconstructs who opened which target and when.
 - Security docs describe remaining limitations (shared-OS-user model, recording sensitivity).
 
-**Status:** Phase 2 / M2 complete. The remaining roadmap begins with the SSH
-backend; completion does not make this pre-release build production-safe.
+**Status:** Phase 2 / M2 complete.
 
 ### Phase 3: SSH Backend
 
@@ -361,6 +362,8 @@ Exit criteria (tests):
 
 - SSH works against a real server without disabling host-key verification.
 - Integration tests: host-key mismatch is rejected and audit-logged; unknown SSH target rejected; user policy mapping applied correctly; no client input can alter the ssh argument vector.
+
+**Status:** Phase 3 / M3 complete. Implemented in Chunk 3.1 (Refs #11): `type = "ssh"` targets require literal `ssh_executable`, `identity_file`, and `known_hosts` paths whose option values additionally reject the OpenSSH option lexer and expansion syntax; startup validates material ownership, permissions, and structure and probes the client for the complete pinned option vocabulary (including `CertificateFile=/dev/null`) before bind; sessions run with a fully server-constructed argv, cleared environment, and curated non-reflecting failure states; real containerized-sshd tests cover the exit criteria above. The remaining roadmap begins with packaging; completion so far does not make this pre-release build production-safe.
 
 ### Phase 4: Packaging and Release
 

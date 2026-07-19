@@ -63,7 +63,26 @@ require_text "$README" 'semantic HTTP.*field value|HTTP parser.*optional whitesp
 require_text "$README" 'strip every|inject exactly one canonical identity header' 'trusted-proxy strip-and-inject responsibility'
 require_text "$README" 'IPv4.mapped|mapped IPv4' 'IPv4-mapped address policy'
 require_text "$README" 'session and WSS requests|cookie.*session ticket' 'proxy identity authority propagation'
-require_text "$README" 'SSH.*record.*packag|record.*packag.*release' 'future production controls'
+require_text "$README" 'record.*packag.*release|recording.*packaging' 'future production controls'
+require_text "$README" 'Chunk 3\.1 \(Refs #11\) implements|Chunk 3\.1.*(complete|implemented).*Refs #11' 'implemented Chunk 3.1 status'
+require_text "$README" 'StrictHostKeyChecking=yes' 'strict host-key policy'
+require_text "$README" 'CertificateFile=/dev/null' 'pinned certificate policy'
+require_text "$README" 'ssh_executable' 'ssh executable configuration field'
+require_text "$README" 'identity_file' 'ssh identity configuration field'
+require_text "$README" 'known_hosts' 'ssh known-hosts configuration field'
+require_text "$README" 'user_policy' 'ssh user policy configuration field'
+require_text "$README" 'fixed.*same-as-auth-user.*mapping' 'complete user-policy vocabulary'
+require_text "$README" 'unencrypted.*Ed25519|Ed25519.*unencrypted' 'unencrypted Ed25519 identity provisioning'
+require_text "$README" 'newline-terminated' 'newline-terminated material contract'
+require_text "$README" 'capability probe|probes.*ssh -G|ssh -G' 'startup capability probe'
+require_text "$README" 'OpenSSH 9\.2' 'OpenSSH compatibility floor'
+require_text "$README" 'fails closed before bind|before bind.*fails closed|no weaker runtime fallback' 'fail-closed SSH startup'
+require_text "$README" 'ssh-host-key-failed' 'curated SSH host-key error code'
+require_text "$README" 'UpdateHostKeys=no|never modifies.*known.hosts' 'no host-key learning'
+require_text "$README" 'remote (command|process)(s|es)? (may|can) (outlive|persist|continue)' 'remote-side cleanup limit'
+require_text "$README" 'agent forwarding' 'deferred agent scope'
+require_text "$README" 'certificate authentication' 'deferred certificate scope'
+require_text "$README" 'ProxyJump|bastion' 'deferred proxy scope'
 require_text "$README" 'Refs #8' 'Chunk 2.1 changelog reference'
 require_text "$README" 'cargo test --workspace' 'Rust verification command'
 require_text "$README" 'npm.*(test:e2e|run test:e2e)' 'frontend browser-test command'
@@ -108,7 +127,14 @@ require_text "$THREAT_MODEL" 'distributed.*(remain|residual|not prevent)|does no
 require_text "$THREAT_MODEL" 'actual socket peer|socket peer.*authoritative' 'authoritative proxy peer boundary'
 require_text "$THREAT_MODEL" 'semantic HTTP field' 'semantic HTTP field-value boundary'
 require_text "$THREAT_MODEL" 'optional whitespace.*(parser|removed)|parser.*optional whitespace' 'HTTP optional-whitespace boundary'
-require_text "$THREAT_MODEL" 'SSH.*record.*packag|record.*packag.*release' 'future control boundaries'
+require_text "$THREAT_MODEL" 'record.*packag.*release|recording.*packaging' 'future control boundaries'
+require_text "$THREAT_MODEL" 'Chunk 3\.1 \(Refs #11\) implements|implemented.*Chunk 3\.1' 'implemented Chunk 3.1 controls'
+require_text "$THREAT_MODEL" 'StrictHostKeyChecking=yes' 'implemented strict host-key mitigation'
+require_text "$THREAT_MODEL" 'CertificateFile=/dev/null' 'pinned implicit-certificate mitigation'
+require_text "$THREAT_MODEL" 'option lexer|re-lex|expansion syntax' 'SSH option-value grammar boundary'
+require_text "$THREAT_MODEL" 'unencrypted.*(identity|private key)|daemon-readable.*(identity|private key)' 'daemon-readable identity residual risk'
+require_text "$THREAT_MODEL" 'remote (command|process)(s|es)? (may|can) (outlive|persist|continue)' 'remote-process residual risk'
+require_text "$THREAT_MODEL" 'known.hosts.*(operator|accuracy|provision)|operator.*known.hosts' 'operator known-hosts responsibility'
 
 require_file "$ROADMAP"
 require_text "$ROADMAP" 'Chunk 2\.2.*Trusted reverse-proxy auth provider' 'Chunk 2.2 heading'
@@ -118,6 +144,9 @@ require_text "$ROADMAP" 'Status.*complete.*Refs #24' 'complete Chunk 2.3 roadmap
 require_text "$ROADMAP" 'Chunk 2\.4.*Audit subsystem' 'Chunk 2.4 heading'
 require_text "$ROADMAP" 'Status.*complete.*Refs #10' 'complete Chunk 2.4 roadmap status'
 require_text "$ROADMAP" 'M2 exit.*complete|M2.*Status.*complete' 'complete M2 status'
+require_text "$ROADMAP" 'Chunk 3\.1.*OpenSSH subprocess target' 'Chunk 3.1 heading'
+require_text "$ROADMAP" 'Status.*complete.*Refs #11' 'complete Chunk 3.1 roadmap status'
+require_text "$ROADMAP" 'M3 exit.*complete|M3.*Status.*complete' 'complete M3 status'
 
 require_file "$REWRITE_PLAN"
 require_text "$REWRITE_PLAN" 'Implemented in Chunk 2\.2.*Refs #9|Chunk 2\.2.*implemented.*Refs #9' 'implemented Chunk 2.2 rewrite-plan status'
@@ -126,16 +155,27 @@ require_text "$REWRITE_PLAN" 'Implemented in Chunk 2\.4.*Refs #10|Chunk 2\.4.*im
 require_text "$REWRITE_PLAN" 'global-session-limit.*identity-session-limit' 'stable concurrency error codes'
 require_text "$REWRITE_PLAN" 'semantic HTTP field' 'rewrite-plan semantic HTTP field-value contract'
 require_text "$REWRITE_PLAN" 'optional whitespace.*(parser|framing)|parser.*optional whitespace' 'rewrite-plan HTTP optional-whitespace contract'
+require_text "$REWRITE_PLAN" 'Implemented in Chunk 3\.1.*Refs #11|Chunk 3\.1.*implement.*Refs #11' 'implemented Chunk 3.1 rewrite-plan status'
+require_text "$REWRITE_PLAN" 'ssh_executable' 'rewrite-plan ssh executable field'
+require_text "$REWRITE_PLAN" 'identity_file' 'rewrite-plan ssh identity field'
+require_text "$REWRITE_PLAN" 'Phase 3.*(complete|implemented)|M3.*complete' 'complete rewrite-plan Phase 3 status'
 
 if grep -Eini 'contract-only|does not yet trust( or consume)? the identity header|provider unavailable|trusted-proxy enforcement remains Chunk 2\.2|Future in Chunk 2\.2|production authentication (and|is|remains)[^.]*planned' \
   "$README" "$THREAT_MODEL" "$ROADMAP" "$REWRITE_PLAN"; then
   fail 'public docs still describe trusted-proxy authentication as unavailable'
 fi
 
+if grep -Eini 'SSH( execution)?(, [^.]*)? remains? (planned|future|incomplete)|SSH backend is not (yet )?implemented|SSH, recording|later audit, SSH|but SSH[^.]*planned' \
+  "$README" "$THREAT_MODEL" "$ROADMAP" "$REWRITE_PLAN"; then
+  fail 'public docs still describe the SSH backend as unimplemented'
+fi
+
 require_file "$PROTOCOL"
 for heading in 'Scope' 'Versioning and compatibility' 'WebSocket framing' 'Control messages' 'Validation and limits' 'Protocol errors and close semantics' 'Backpressure'; do
   require_text "$PROTOCOL" "^#+[[:space:]]+$heading" "$heading section"
 done
+require_text "$PROTOCOL" 'ssh-host-key-failed' 'protocol SSH host-key error code'
+require_text "$PROTOCOL" 'Unknown and mismatched host keys' 'shared host-key failure statement'
 
 require_file "$ISSUE_CONFIG"
 require_text "$ISSUE_CONFIG" 'blank_issues_enabled:[[:space:]]*false' 'disabled blank issues'

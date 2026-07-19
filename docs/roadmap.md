@@ -140,11 +140,12 @@ recording limitations.
 
 ### Chunk 3.1 — OpenSSH subprocess target
 
+- **Status:** complete (Refs #11). Strict-host-key SSH targets spawn the configured system OpenSSH client through the existing PTY, concurrency, audit, and WebSocket machinery with a pinned 29-option policy (including `CertificateFile=/dev/null` against implicit sibling certificates), startup capability probing and credential-material validation before bind, option-path grammar rejection of OpenSSH lexer/expansion syntax, fixed/same-as-auth-user/mapping user policies, and curated non-reflecting failure states.
 - **Deliverables:** `type = "ssh"` targets spawn the system `ssh` client inside the existing PTY machinery with the pinned option set from the 0.3 spike; user policy (fixed / same-as-auth-user / mapping table); argument vector fully server-constructed — no client input reaches it; host-key failures and connection errors surfaced distinctly in the frontend and recorded as audit events.
 - **Consumes:** PTY/session machinery (1.4), config (1.1), audit API (2.4), spike record (0.3c).
 - **Done when:** integration tests (against a containerized sshd): successful session with strict host keys; host-key mismatch rejected and audit-logged; user policy mapping applied; property-style test that no protocol input can alter the argv.
 
-**M3 exit:** plan Phase 3 exit criteria green.
+**M3 exit — Status: complete.** Plan Phase 3 exit criteria are green: real containerized-sshd integration tests prove strict-host-key success, one audited curated denial for unknown and mismatched host keys, wrong-identity and sibling-certificate rejection, applied user policy, hostile-input argv immutability, and local process-group cleanup.
 
 ---
 
