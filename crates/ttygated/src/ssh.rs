@@ -1934,6 +1934,23 @@ requesttty force\n"
         assert_eq!(argv[1], "-tt");
     }
 
+    // Reads a PTY-backed stream to completion with the production
+    // end-of-stream contract from the session reader: `Ok(0)` and read errors
+    // both end the stream, because a Linux PTY master reports EIO instead of
+    // EOF once the child side has closed.
+    async fn read_pty_stream_to_end(
+        reader: &mut (impl tokio::io::AsyncRead + Unpin),
+        bytes: &mut Vec<u8>,
+    ) {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match tokio::io::AsyncReadExt::read(reader, &mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn ssh_spawn_contract_uses_no_shell_and_only_the_literal_executable() {
         let material = Material::new();
@@ -1967,12 +1984,8 @@ requesttty force\n"
         let (mut terminal, _writer, mut child, mut diagnostics, _client_log) = running.into_parts();
         let mut terminal_bytes = Vec::new();
         let mut diagnostic_bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut terminal, &mut terminal_bytes)
-            .await
-            .unwrap();
-        tokio::io::AsyncReadExt::read_to_end(&mut diagnostics, &mut diagnostic_bytes)
-            .await
-            .unwrap();
+        read_pty_stream_to_end(&mut terminal, &mut terminal_bytes).await;
+        read_pty_stream_to_end(&mut diagnostics, &mut diagnostic_bytes).await;
         assert!(child.wait().await.unwrap().success());
         assert!(
             terminal_bytes
@@ -2579,13 +2592,9 @@ requesttty force\n"
             Some(super::SshDiagnosticClass::AuthenticationFailed)
         );
         let mut completion = Vec::new();
-        tokio::time::timeout(
-            wait,
-            tokio::io::AsyncReadExt::read_to_end(&mut terminal, &mut completion),
-        )
-        .await
-        .expect("fixture terminal completion timed out")
-        .unwrap();
+        tokio::time::timeout(wait, read_pty_stream_to_end(&mut terminal, &mut completion))
+            .await
+            .expect("fixture terminal completion timed out");
         assert!(
             completion.windows(4).any(|window| window == b"DONE"),
             "fixture exited without its completion marker"
