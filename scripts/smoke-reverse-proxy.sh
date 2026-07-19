@@ -379,10 +379,11 @@ run_client() {
   docker create \
     --name "$client" \
     --network "$frontend_network" \
+    --user "$host_uid:$host_gid" \
     --read-only \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=0700 \
+    --tmpfs "/tmp:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
     --mount "type=bind,src=$repo_root/scripts/fixtures,dst=/fixtures,readonly" \
     --mount "type=bind,src=$runtime,dst=/runtime" \
     --env "TTYGATE_FIXTURE_HOLD=$hold" \
@@ -420,6 +421,7 @@ wait_for_client_exit() {
 
 scan_audit() {
   secret_name=$1
+  audit_copy="$runtime/audit-scan.jsonl"
   docker run --rm \
     --network none \
     --user 65532:65532 \
@@ -427,12 +429,25 @@ scan_audit() {
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --mount "type=volume,src=$audit_volume,dst=/audit,readonly" \
+    --entrypoint cat \
+    "$NODE_IMAGE" \
+    /audit/audit.jsonl >"$audit_copy" ||
+    fail "audit volume could not be copied for isolated scanning"
+  scan_result=$(docker run --rm \
+    --network none \
+    --user "$host_uid:$host_gid" \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
     --mount "type=bind,src=$repo_root/scripts/fixtures,dst=/fixtures,readonly" \
     --mount "type=bind,src=$runtime,dst=/runtime,readonly" \
     --entrypoint node \
     "$NODE_IMAGE" \
     /fixtures/reverse-proxy-session.mjs \
-    --scan-audit /audit/audit.jsonl "/runtime/$secret_name" |
+    --scan-audit /runtime/audit-scan.jsonl "/runtime/$secret_name") ||
+    fail "complete audit scan rejected lifecycle or found secret content"
+  rm -f "$audit_copy"
+  printf '%s\n' "$scan_result" |
     grep -Eq '^AUDIT_SCAN_OK records=[1-9][0-9]*$' ||
     fail "complete audit scan rejected lifecycle or found secret content"
 }
