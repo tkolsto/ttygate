@@ -190,6 +190,11 @@ impl RealSshdFixture {
                     "ALL",
                     "--cap-add",
                     "CHOWN",
+                    // Linux bind mounts preserve host ownership, so container
+                    // root needs the read-only DAC bypass to read the
+                    // host-owned 0700 fixture mount; write bypass stays denied.
+                    "--cap-add",
+                    "DAC_READ_SEARCH",
                     "--cap-add",
                     "SETGID",
                     "--cap-add",
@@ -999,7 +1004,13 @@ impl RealSshdFixture {
         cap_add.sort_unstable();
         assert_eq!(
             cap_add,
-            ["CAP_CHOWN", "CAP_SETGID", "CAP_SETUID", "CAP_SYS_CHROOT"]
+            [
+                "CAP_CHOWN",
+                "CAP_DAC_READ_SEARCH",
+                "CAP_SETGID",
+                "CAP_SETUID",
+                "CAP_SYS_CHROOT"
+            ]
         );
         assert_eq!(
             server["HostConfig"]["SecurityOpt"],
