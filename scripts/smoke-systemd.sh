@@ -25,6 +25,18 @@ fail() {
   exit 1
 }
 
+wait_for_health() {
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    if "$binary_target" --health-check 127.0.0.1:7681 >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  return 1
+}
+
 cleanup() {
   if [ -n "$fixture_pid" ]; then
     kill "$fixture_pid" >/dev/null 2>&1 || true
@@ -100,7 +112,7 @@ done
   fail "installed service does not restrict notifications to the main process"
 [ "$(sudo systemctl show "$unit_name" --property WatchdogUSec --value)" = 6s ] ||
   fail "installed watchdog interval differs from the unit"
-"$binary_target" --health-check 127.0.0.1:7681 ||
+wait_for_health ||
   fail "daemon health check failed"
 
 fixture_log=$(mktemp)
@@ -152,7 +164,7 @@ while [ "$attempt" -lt 20 ]; do
 done
 [ "$new_pid" -gt 0 ] && [ "$new_pid" != "$old_pid" ] ||
   fail "systemd did not restart a watchdog-stalled daemon"
-"$binary_target" --health-check 127.0.0.1:7681 ||
+wait_for_health ||
   fail "restarted daemon did not become healthy"
 
 sudo systemctl stop "$unit_name"

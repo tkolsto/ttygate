@@ -159,5 +159,6 @@ require_text "$SYSTEMD_README" 'systemd-analyze' 'unit verification command'
 # shellcheck disable=SC2016 # The dollar sign is literal script text in this regex.
 require_text scripts/smoke-systemd.sh '/sys/fs/cgroup\$control_group/cgroup\.procs' 'runtime service-cgroup PID capture'
 require_text scripts/smoke-systemd.sh 'service control-group process survived stop' 'runtime service-cgroup teardown assertion'
+require_text scripts/smoke-systemd.sh 'wait_for_health' 'bounded restarted-daemon readiness verification'
 
 printf 'All packaging contract checks passed.\n'
