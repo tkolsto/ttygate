@@ -67,6 +67,8 @@ require_text "$DOCKERFILE" '^ARG SOURCE_DATE_EPOCH=1769990400$' 'the pinned Debi
 require_text "$DOCKERFILE" 'touch --no-dereference --date="@\$\{SOURCE_DATE_EPOCH\}"' 'generated-file timestamp normalization'
 require_text scripts/smoke-docker.sh 'rewrite-timestamp=true' 'layer timestamp normalization during OCI export'
 require_text scripts/smoke-docker.sh 'docker buildx build' 'portable BuildKit exporter invocation'
+require_text scripts/smoke-docker.sh '[[:space:]]--load' 'portable runtime image load through Buildx'
+reject_text scripts/smoke-docker.sh 'docker load[[:space:]]+--input' 'direct OCI archive loading into the classic Docker image store'
 require_text "$CI_WORKFLOW" 'docker/setup-buildx-action@[0-9a-f]{40}' 'a digest-pinned portable BuildKit builder'
 require_text "$DOCKERFILE" 'rm -f /etc/apt/sources\.list\.d/debian\.sources' 'removal of mutable Debian package sources'
 require_text "$DOCKERFILE" 'groupadd .*ttygate|addgroup .*ttygate' 'a dedicated runtime group'

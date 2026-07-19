@@ -55,7 +55,13 @@ docker buildx build \
 second_index=$(tar -xOf "$archive_two" index.json)
 [ "$first_index" = "$second_index" ] ||
   fail "clean repeated builds produced different image identities"
-docker load --input "$archive_one" >/dev/null
+docker buildx build \
+  --build-arg "CACHE_SCOPE=$run_id" \
+  --build-arg SOURCE_DATE_EPOCH=1769990400 \
+  --provenance=false \
+  --load \
+  --tag "$image_one" \
+  . >/dev/null
 
 [ "$(docker image inspect --format '{{.Config.User}}' "$image_one")" = "ttygate:ttygate" ] ||
   fail "runtime image user is not ttygate:ttygate"
