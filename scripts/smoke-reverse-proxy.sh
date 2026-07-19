@@ -96,10 +96,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
-for command in docker openssl sed grep mktemp; do
+for command in docker openssl sed grep mktemp id; do
   command -v "$command" >/dev/null 2>&1 ||
     fail "required command is unavailable: $command"
 done
+
+host_uid=$(id -u)
+host_gid=$(id -g)
 
 validate_image() {
   label=$1
@@ -228,11 +231,11 @@ create_proxy_container() {
       docker create \
         --name "$name" --network "$frontend_network" --read-only \
         --ip 198.51.100.10 --network-alias terminal.example.invalid \
-        --cap-drop ALL --cap-add NET_BIND_SERVICE \
+        --user "$host_uid:$host_gid" --cap-drop ALL --cap-add NET_BIND_SERVICE \
         --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=0700 \
-        --tmpfs /data:rw,noexec,nosuid,nodev,mode=0700 \
-        --tmpfs /config:rw,noexec,nosuid,nodev,mode=0700 \
+        --tmpfs "/tmp:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
+        --tmpfs "/data:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
+        --tmpfs "/config:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
         --mount "type=bind,src=$repo_root/packaging/reverse-proxy/Caddyfile,dst=/etc/caddy/Caddyfile,readonly" \
         --mount "type=bind,src=$tls_dir,dst=/etc/ttygate-proxy/tls,readonly" \
         --entrypoint caddy "$CADDY_IMAGE" \
@@ -242,11 +245,11 @@ create_proxy_container() {
       docker create \
         --name "$name" --network "$frontend_network" --read-only \
         --ip 198.51.100.10 --network-alias terminal.example.invalid \
-        --cap-drop ALL --cap-add NET_BIND_SERVICE \
+        --user "$host_uid:$host_gid" --cap-drop ALL --cap-add NET_BIND_SERVICE \
         --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=0700 \
-        --tmpfs /data:rw,noexec,nosuid,nodev,mode=0700 \
-        --tmpfs /config:rw,noexec,nosuid,nodev,mode=0700 \
+        --tmpfs "/tmp:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
+        --tmpfs "/data:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
+        --tmpfs "/config:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
         --mount "type=bind,src=$repo_root/packaging/reverse-proxy/Caddyfile,dst=/etc/caddy/Caddyfile,readonly" \
         --mount "type=bind,src=$tls_dir,dst=/etc/ttygate-proxy/tls,readonly" \
         --entrypoint caddy "$CADDY_IMAGE" \
@@ -256,9 +259,9 @@ create_proxy_container() {
       docker create \
         --name "$name" --network "$frontend_network" --read-only \
         --ip 198.51.100.10 --network-alias terminal.example.invalid \
-        --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+        --user "$host_uid:$host_gid" --cap-drop ALL \
         --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=0700 \
+        --tmpfs "/tmp:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
         --mount "type=bind,src=$repo_root/packaging/reverse-proxy/nginx.conf,dst=/etc/nginx/nginx.conf,readonly" \
         --mount "type=bind,src=$tls_dir,dst=/etc/ttygate-proxy/tls,readonly" \
         --entrypoint nginx "$NGINX_IMAGE" \
@@ -268,9 +271,9 @@ create_proxy_container() {
       docker create \
         --name "$name" --network "$frontend_network" --read-only \
         --ip 198.51.100.10 --network-alias terminal.example.invalid \
-        --cap-drop ALL --cap-add CHOWN --cap-add SETUID --cap-add SETGID \
+        --user "$host_uid:$host_gid" --cap-drop ALL \
         --security-opt no-new-privileges \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=0700 \
+        --tmpfs "/tmp:rw,noexec,nosuid,nodev,mode=0700,uid=$host_uid,gid=$host_gid" \
         --mount "type=bind,src=$repo_root/packaging/reverse-proxy/nginx.conf,dst=/etc/nginx/nginx.conf,readonly" \
         --mount "type=bind,src=$tls_dir,dst=/etc/ttygate-proxy/tls,readonly" \
         --entrypoint nginx "$NGINX_IMAGE" \

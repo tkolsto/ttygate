@@ -184,6 +184,7 @@ for pattern in \
   'docker network rm' \
   'attacker\.example\.invalid' \
   'image reference must be digest-pinned' \
+  '\-\-user "\$host_uid:\$host_gid"' \
   'trap.*EXIT'; do
   require_text "$SMOKE" "$pattern" "smoke coverage matching $pattern"
 done
