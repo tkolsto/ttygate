@@ -1,5 +1,6 @@
 use std::{
     pin::Pin,
+    process::Stdio,
     task::{Context, Poll},
 };
 
@@ -10,10 +11,14 @@ use nix::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    process::Child,
+    process::{Child, ChildStderr},
 };
 
-use crate::{config::PtyTarget, protocol::Resize};
+use crate::{
+    config::PtyTarget,
+    protocol::Resize,
+    ssh::{SshClientLog, SshSpawnSpec},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum BackendError {
@@ -44,8 +49,93 @@ impl PtyProcessBackend {
             child: PtyChild {
                 inner: child,
                 process_group: pid,
+                exit_status: None,
+                cleanup_state: CleanupState::Running,
+                #[cfg(test)]
+                reaped: None,
+                #[cfg(test)]
+                cleanup_failures: None,
+                #[cfg(test)]
+                post_kill_wait_stalls: None,
+                #[cfg(test)]
+                group_ops: None,
             },
         })
+    }
+
+    #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+    pub(crate) fn spawn_ssh(spec: SshSpawnSpec, size: Resize) -> Result<RunningSsh, BackendError> {
+        let (pty, pts) = pty_process::open().map_err(|_| BackendError::Unavailable)?;
+        pty.resize(pty_process::Size::new(size.rows, size.cols))
+            .map_err(|_| BackendError::Unavailable)?;
+        let command = pty_process::Command::new(spec.executable())
+            .args(spec.argv())
+            .env_clear()
+            .envs(spec.environment())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn(pts).map_err(|_| BackendError::Unavailable)?;
+        let raw_stderr = child
+            .stderr
+            .take()
+            .expect("piped stderr is a Tokio child invariant");
+        let pid = Pid::from_raw(
+            i32::try_from(child.id().expect("spawned child has a process id"))
+                .expect("Unix process ids fit in i32"),
+        );
+        let client_log = spec.into_client_log();
+        let (reader, writer) = pty.into_split();
+        Ok(RunningSsh {
+            reader: PtyReader(reader),
+            writer: PtyWriter(writer),
+            child: PtyChild {
+                inner: child,
+                process_group: pid,
+                exit_status: None,
+                cleanup_state: CleanupState::Running,
+                #[cfg(test)]
+                reaped: None,
+                #[cfg(test)]
+                cleanup_failures: None,
+                #[cfg(test)]
+                post_kill_wait_stalls: None,
+                #[cfg(test)]
+                group_ops: None,
+            },
+            raw_stderr,
+            client_log,
+        })
+    }
+}
+
+#[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+pub(crate) struct RunningSsh {
+    reader: PtyReader,
+    writer: PtyWriter,
+    child: PtyChild,
+    raw_stderr: ChildStderr,
+    client_log: SshClientLog,
+}
+
+impl std::fmt::Debug for RunningSsh {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunningSsh")
+            .field("process_group", &self.child.process_group)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunningSsh {
+    #[allow(dead_code, reason = "the SSH lifecycle supervisor is added in Task 4")]
+    pub(crate) fn into_parts(self) -> (PtyReader, PtyWriter, PtyChild, ChildStderr, SshClientLog) {
+        (
+            self.reader,
+            self.writer,
+            self.child,
+            self.raw_stderr,
+            self.client_log,
+        )
     }
 }
 
@@ -67,6 +157,19 @@ impl std::fmt::Debug for RunningPty {
 impl RunningPty {
     pub(crate) fn into_parts(self) -> (PtyReader, PtyWriter, PtyChild) {
         (self.reader, self.writer, self.child)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_reap(&mut self, reaped: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.child.reaped = Some(reaped);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_cleanup_failures(
+        &mut self,
+        failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.child.cleanup_failures = Some(failures);
     }
 }
 
@@ -119,14 +222,92 @@ impl AsyncWrite for PtyWriter {
 pub(crate) struct PtyChild {
     inner: Child,
     process_group: Pid,
+    exit_status: Option<std::process::ExitStatus>,
+    cleanup_state: CleanupState,
+    #[cfg(test)]
+    reaped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    cleanup_failures: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    post_kill_wait_stalls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    group_ops: Option<std::sync::Arc<TestGroupOps>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupState {
+    Running,
+    ExitObservedUnreaped,
+    FinalSignalAttempted,
+    Reaped,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestGroupOps {
+    final_signals: std::sync::atomic::AtomicUsize,
+    probes: std::sync::atomic::AtomicUsize,
+    present_probes: std::sync::atomic::AtomicUsize,
+    nonzero_after_reap: std::sync::atomic::AtomicBool,
+    operations: std::sync::Mutex<Vec<TestGroupOperation>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestGroupOperation {
+    Observe,
+    Hup,
+    Kill,
+    Reap,
+    Probe,
 }
 
 impl PtyChild {
     pub(crate) async fn wait(&mut self) -> Result<std::process::ExitStatus, BackendError> {
-        self.inner
+        if let Some(status) = self.exit_status {
+            return Ok(status);
+        }
+        let status = self
+            .inner
             .wait()
             .await
-            .map_err(|_| BackendError::Unavailable)
+            .map_err(|_| BackendError::Unavailable)?;
+        self.exit_status = Some(status);
+        self.cleanup_state = CleanupState::Reaped;
+        #[cfg(test)]
+        self.record_group_operation(TestGroupOperation::Reap);
+        Ok(status)
+    }
+
+    pub(crate) async fn wait_for_exit_observed(&mut self) -> Result<(), BackendError> {
+        loop {
+            if self.poll_exit_observed()? {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn poll_exit_observed(&mut self) -> Result<bool, BackendError> {
+        if self.cleanup_state != CleanupState::Running {
+            return Ok(true);
+        }
+        let pid = rustix::process::Pid::from_raw(self.process_group.as_raw())
+            .ok_or(BackendError::Unavailable)?;
+        let observed = rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )
+        .map_err(|_| BackendError::Unavailable)?
+        .is_some();
+        if observed {
+            self.cleanup_state = CleanupState::ExitObservedUnreaped;
+            #[cfg(test)]
+            self.record_group_operation(TestGroupOperation::Observe);
+        }
+        Ok(observed)
     }
 
     pub(crate) async fn terminate(
@@ -141,37 +322,133 @@ impl PtyChild {
         grace: std::time::Duration,
         mut signal: impl FnMut(Pid, Signal) -> Result<(), BackendError>,
     ) -> Result<std::process::ExitStatus, BackendError> {
-        // A failed graceful signal is recoverable only if the mandatory final
-        // group cleanup succeeds. The final signal therefore owns the result.
-        let _ = signal(self.process_group, Signal::SIGHUP);
-        let grace_deadline = tokio::time::Instant::now() + grace;
-        match tokio::time::timeout_at(grace_deadline, self.inner.wait()).await {
-            Ok(result) => {
-                let status = result.map_err(|_| BackendError::Unavailable);
-                tokio::time::sleep_until(grace_deadline).await;
-                signal(self.process_group, Signal::SIGKILL)?;
-                status
+        // The unreaped leader pins the numeric process-group identifier.
+        // Signal exactly once while that pin is held; after reap, retries may
+        // only probe for ESRCH so they cannot signal a reused PGID.
+        if matches!(
+            self.cleanup_state,
+            CleanupState::Running | CleanupState::ExitObservedUnreaped
+        ) {
+            #[cfg(test)]
+            self.record_group_operation(TestGroupOperation::Hup);
+            let _ = signal(self.process_group, Signal::SIGHUP);
+            let grace_deadline = tokio::time::Instant::now() + grace;
+            while self.cleanup_state == CleanupState::Running
+                && tokio::time::Instant::now() < grace_deadline
+            {
+                let _ = self.poll_exit_observed()?;
+                if self.cleanup_state == CleanupState::Running {
+                    tokio::time::sleep_until(std::cmp::min(
+                        grace_deadline,
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+                    ))
+                    .await;
+                }
             }
-            Err(_) => {
-                let cleanup = signal(self.process_group, Signal::SIGKILL);
-                let status = self
-                    .inner
-                    .wait()
-                    .await
-                    .map_err(|_| BackendError::Unavailable);
-                cleanup?;
-                status
+            tokio::time::sleep_until(grace_deadline).await;
+            self.cleanup_state = CleanupState::FinalSignalAttempted;
+            #[cfg(test)]
+            if let Some(ops) = &self.group_ops {
+                ops.final_signals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.exit_status.is_some() {
+                    ops.nonzero_after_reap
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
+            #[cfg(test)]
+            self.record_group_operation(TestGroupOperation::Kill);
+            let _ = signal(self.process_group, Signal::SIGKILL);
+        }
+
+        let status = tokio::time::timeout(grace, self.wait_after_final_signal())
+            .await
+            .map_err(|_| BackendError::Unavailable)
+            .and_then(std::convert::identity)?;
+        self.wait_for_group_absence(grace).await?;
+        #[cfg(test)]
+        self.confirm_cleanup_for_test();
+        Ok(status)
+    }
+
+    async fn wait_for_group_absence(&self, grace: std::time::Duration) -> Result<(), BackendError> {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if self.process_group_absent()? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BackendError::Unavailable);
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+            ))
+            .await;
         }
     }
 
-    pub(crate) async fn cleanup_group_after_exit(
-        &self,
-        grace: std::time::Duration,
-    ) -> Result<(), BackendError> {
-        let _ = signal_group(self.process_group, Signal::SIGHUP);
-        tokio::time::sleep(grace).await;
-        kill_group_if_present(self.process_group)
+    async fn wait_after_final_signal(&mut self) -> Result<std::process::ExitStatus, BackendError> {
+        #[cfg(test)]
+        if let Some(stalls) = &self.post_kill_wait_stalls
+            && stalls
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+        {
+            std::future::pending::<()>().await;
+        }
+        self.wait().await
+    }
+
+    fn process_group_absent(&self) -> Result<bool, BackendError> {
+        #[cfg(test)]
+        if let Some(ops) = &self.group_ops {
+            self.record_group_operation(TestGroupOperation::Probe);
+            ops.probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let remaining = ops.present_probes.load(std::sync::atomic::Ordering::SeqCst);
+            if remaining != 0 {
+                ops.present_probes
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        #[cfg(test)]
+        if let Some(failures) = &self.cleanup_failures {
+            let remaining = failures.load(std::sync::atomic::Ordering::SeqCst);
+            if remaining != 0 {
+                if remaining != usize::MAX {
+                    failures.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                return Ok(false);
+            }
+        }
+        match killpg(self.process_group, None) {
+            Err(nix::errno::Errno::ESRCH) => Ok(true),
+            Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(false),
+            Err(_) => Err(BackendError::Unavailable),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_group_operation(&self, operation: TestGroupOperation) {
+        if let Some(ops) = &self.group_ops {
+            ops.operations
+                .lock()
+                .expect("test group operation recorder")
+                .push(operation);
+        }
+    }
+
+    #[cfg(test)]
+    fn confirm_cleanup_for_test(&self) {
+        if let Some(reaped) = &self.reaped {
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[cfg(test)]
@@ -187,10 +464,6 @@ fn signal_group(process_group: Pid, signal: Signal) -> Result<(), BackendError> 
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(_) => Err(BackendError::Unavailable),
     }
-}
-
-fn kill_group_if_present(process_group: Pid) -> Result<(), BackendError> {
-    signal_group(process_group, Signal::SIGKILL)
 }
 
 #[cfg(test)]
@@ -327,18 +600,156 @@ mod tests {
         let pid = child.process_group;
         let result = child
             .terminate_with(Duration::from_millis(100), |group, signal| {
-                signal_group(group, signal)?;
                 if signal == Signal::SIGKILL {
                     Err(BackendError::Unavailable)
                 } else {
-                    Ok(())
+                    signal_group(group, signal)
                 }
             })
             .await;
         assert_eq!(result, Err(BackendError::Unavailable));
+        signal_group(child.process_group, Signal::SIGKILL).unwrap();
+        child.wait().await.unwrap();
         assert_eq!(
             kill(Pid::from_raw(pid.as_raw()), None),
             Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sigkill_child_wait_is_bounded_and_retryable() {
+        let running =
+            PtyProcessBackend::spawn(&target(&["ignore-hup"]), Resize::new(80, 24).unwrap())
+                .expect("spawn fixture");
+        let (mut reader, _writer, mut child) = running.into_parts();
+        let mut output = Vec::new();
+        read_until(&mut reader, &mut output, b"READY").await;
+        child.post_kill_wait_stalls =
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)));
+
+        let result = timeout(
+            Duration::from_millis(300),
+            child.terminate_with(Duration::from_millis(50), signal_group),
+        )
+        .await;
+        let retry = timeout(
+            Duration::from_millis(300),
+            child.terminate_with(Duration::from_millis(50), signal_group),
+        )
+        .await;
+        let cached_retry = timeout(
+            Duration::from_millis(300),
+            child.terminate_with(Duration::from_millis(50), signal_group),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(Err(BackendError::Unavailable))),
+            "post-SIGKILL child wait must return a bounded retryable error"
+        );
+        assert!(
+            matches!(retry, Ok(Ok(_))),
+            "retry must reap the child after the bounded failure"
+        );
+        assert!(
+            matches!(cached_retry, Ok(Ok(_))),
+            "later retries must reuse the cached child status"
+        );
+    }
+
+    #[tokio::test]
+    async fn natural_exit_is_observed_then_group_signaled_before_leader_reap() {
+        let target = PtyTarget {
+            name: "natural-exit".to_owned(),
+            executable: "/bin/sh".into(),
+            argv: vec!["-c".to_owned(), "exit 23".to_owned()],
+            read_only: false,
+        };
+        let running = PtyProcessBackend::spawn(&target, Resize::new(80, 24).unwrap())
+            .expect("spawn natural-exit fixture");
+        let (_reader, _writer, mut child) = running.into_parts();
+        let ops = std::sync::Arc::new(super::TestGroupOps::default());
+        child.group_ops = Some(std::sync::Arc::clone(&ops));
+
+        timeout(Duration::from_secs(3), child.wait_for_exit_observed())
+            .await
+            .expect("natural exit observation timed out")
+            .unwrap();
+        let status = child
+            .terminate_with(Duration::from_millis(1), |_group, _signal| Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(
+            *ops.operations.lock().unwrap(),
+            [
+                super::TestGroupOperation::Observe,
+                super::TestGroupOperation::Hup,
+                super::TestGroupOperation::Kill,
+                super::TestGroupOperation::Reap,
+                super::TestGroupOperation::Probe,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn requested_teardown_observes_graceful_exit_before_final_signal_and_reap() {
+        let target = PtyTarget {
+            name: "requested-exit".to_owned(),
+            executable: "/bin/sleep".into(),
+            argv: vec!["300".to_owned()],
+            read_only: false,
+        };
+        let running = PtyProcessBackend::spawn(&target, Resize::new(80, 24).unwrap())
+            .expect("spawn requested-exit fixture");
+        let (_reader, _writer, mut child) = running.into_parts();
+        let ops = std::sync::Arc::new(super::TestGroupOps::default());
+        child.group_ops = Some(std::sync::Arc::clone(&ops));
+
+        child
+            .terminate_with(Duration::from_millis(100), signal_group)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *ops.operations.lock().unwrap(),
+            [
+                super::TestGroupOperation::Hup,
+                super::TestGroupOperation::Observe,
+                super::TestGroupOperation::Kill,
+                super::TestGroupOperation::Reap,
+                super::TestGroupOperation::Probe,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reaped_group_cleanup_only_probes_and_never_resignals_reused_pgid() {
+        let running =
+            PtyProcessBackend::spawn(&target(&["ignore-hup"]), Resize::new(80, 24).unwrap())
+                .expect("spawn fixture");
+        let (mut reader, _writer, mut child) = running.into_parts();
+        let mut output = Vec::new();
+        read_until(&mut reader, &mut output, b"READY").await;
+        let ops = std::sync::Arc::new(super::TestGroupOps::default());
+        ops.present_probes
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        child.group_ops = Some(std::sync::Arc::clone(&ops));
+
+        child
+            .terminate_with(Duration::from_millis(50), signal_group)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ops.final_signals.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(ops.probes.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(
+            !ops.nonzero_after_reap
+                .load(std::sync::atomic::Ordering::SeqCst)
         );
     }
 }

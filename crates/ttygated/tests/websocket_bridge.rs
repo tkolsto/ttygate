@@ -114,7 +114,7 @@ fn state_with_all_and_audit(
     limits: Limits,
     audit: AuditLog,
 ) -> AppState {
-    AppState::new(
+    AppState::new_for_test(
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
@@ -652,6 +652,8 @@ async fn post_redemption_session_denials_are_audited() {
         name: "future-ssh".into(),
         host: "ssh.example.test".into(),
         port: 22,
+        ssh_executable: "/usr/bin/ssh".into(),
+        identity_file: "/non-secret/id_ed25519".into(),
         known_hosts: "/non-secret/known-hosts".into(),
         user_policy: SshUserPolicy::Fixed("remote-user".into()),
         read_only: false,
@@ -1047,6 +1049,8 @@ async fn expired_ssh_and_spawn_failure_tickets_are_safe_and_consumed() {
         name: "ssh".into(),
         host: "example.test".into(),
         port: 22,
+        ssh_executable: "/usr/bin/ssh".into(),
+        identity_file: "/configured/id_ed25519".into(),
         known_hosts: "/configured/known_hosts".into(),
         user_policy: SshUserPolicy::Fixed("configured".into()),
         read_only: false,

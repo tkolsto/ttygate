@@ -104,6 +104,16 @@ function statusCopy(snapshot: ConnectionSnapshot): string {
         : "Terminal connected.";
     case "denied":
       return "Terminal access was denied by policy.";
+    case "ssh-host-key-failed":
+      return "SSH host identity verification failed.";
+    case "ssh-connection-failed":
+      return "The SSH connection could not be established.";
+    case "ssh-authentication-failed":
+      return "SSH authentication was rejected.";
+    case "ssh-policy-denied":
+      return "SSH access was denied by policy.";
+    case "ssh-failed":
+      return "The SSH session could not be established safely.";
     case "protocol-error":
       return "The terminal protocol failed safely.";
     case "internal-error":
@@ -143,6 +153,11 @@ function statusTone(phase: ConnectionPhase): StatusTone {
     case "active":
       return "active";
     case "denied":
+    case "ssh-host-key-failed":
+    case "ssh-connection-failed":
+    case "ssh-authentication-failed":
+    case "ssh-policy-denied":
+    case "ssh-failed":
     case "protocol-error":
     case "internal-error":
     case "timed-out":

@@ -32,6 +32,11 @@ export type ConnectionPhase =
   | "connecting"
   | "active"
   | "denied"
+  | "ssh-host-key-failed"
+  | "ssh-connection-failed"
+  | "ssh-authentication-failed"
+  | "ssh-policy-denied"
+  | "ssh-failed"
   | "protocol-error"
   | "internal-error"
   | "timed-out"
@@ -347,6 +352,16 @@ export class TerminalConnectionController {
       case "error":
         if (control.code === "authorization-denied" || control.code === "session-denied") {
           this.#finish("denied", target);
+        } else if (control.code === "ssh-host-key-failed") {
+          this.#finish("ssh-host-key-failed", target);
+        } else if (control.code === "ssh-connection-failed") {
+          this.#finish("ssh-connection-failed", target);
+        } else if (control.code === "ssh-authentication-failed") {
+          this.#finish("ssh-authentication-failed", target);
+        } else if (control.code === "ssh-policy-denied") {
+          this.#finish("ssh-policy-denied", target);
+        } else if (control.code === "ssh-failed") {
+          this.#finish("ssh-failed", target);
         } else if (control.code === "protocol-error") {
           this.#finish("protocol-error", target);
         } else {

@@ -11,8 +11,9 @@ use tokio::net::TcpListener;
 
 use crate::{
     audit::{AuditError, AuditLog},
-    config::{Config, ConfigError, ServerTransport, TlsConfig, validate_startup_contract},
+    config::{Config, ConfigError, ServerTransport, Target, TlsConfig, validate_startup_contract},
     server::{self, AppState, ServerBuildError},
+    ssh::{self, PreparedSshTargets, SshPreparationError},
     tls::{self, TlsError},
 };
 
@@ -34,6 +35,8 @@ pub enum StartupError {
     #[error(transparent)]
     Tls(#[from] TlsError),
     #[error(transparent)]
+    Ssh(#[from] SshPreparationError),
+    #[error(transparent)]
     Audit(#[from] AuditError),
     #[error(transparent)]
     Application(#[from] ServerBuildError),
@@ -48,7 +51,7 @@ pub async fn start(config: &Config) -> Result<(), StartupError> {
         config,
         tls::load,
         AuditLog::open,
-        AppState::from_config_with_audit,
+        AppState::from_config_with_audit_pending_ssh,
         bind_and_serve,
     )
     .await
@@ -69,7 +72,47 @@ where
     Binder: FnOnce(PreparedServer) -> BindFuture,
     BindFuture: Future<Output = Result<(), StartupError>>,
 {
-    let prepared = prepare_with(config, tls_loader, audit_loader, app_builder).await?;
+    start_with_ssh(
+        config,
+        tls_loader,
+        ssh::prepare,
+        audit_loader,
+        app_builder,
+        binder,
+    )
+    .await
+}
+
+pub async fn start_with_ssh<
+    'a,
+    TlsLoader,
+    TlsFuture,
+    SshLoader,
+    SshFuture,
+    AuditLoader,
+    AppBuilder,
+    Binder,
+    BindFuture,
+>(
+    config: &'a Config,
+    tls_loader: TlsLoader,
+    ssh_loader: SshLoader,
+    audit_loader: AuditLoader,
+    app_builder: AppBuilder,
+    binder: Binder,
+) -> Result<(), StartupError>
+where
+    TlsLoader: FnOnce(&'a TlsConfig) -> TlsFuture,
+    TlsFuture: Future<Output = Result<RustlsConfig, TlsError>>,
+    SshLoader: FnOnce(&'a [Target]) -> SshFuture,
+    SshFuture: Future<Output = Result<PreparedSshTargets, SshPreparationError>>,
+    AuditLoader: FnOnce(&Path) -> Result<AuditLog, AuditError>,
+    AppBuilder: FnOnce(&Config, AuditLog) -> Result<AppState, ServerBuildError>,
+    Binder: FnOnce(PreparedServer) -> BindFuture,
+    BindFuture: Future<Output = Result<(), StartupError>>,
+{
+    let prepared =
+        prepare_with_ssh(config, tls_loader, ssh_loader, audit_loader, app_builder).await?;
     binder(prepared).await
 }
 
@@ -85,6 +128,32 @@ where
     AuditLoader: FnOnce(&Path) -> Result<AuditLog, AuditError>,
     AppBuilder: FnOnce(&Config, AuditLog) -> Result<AppState, ServerBuildError>,
 {
+    prepare_with_ssh(config, tls_loader, ssh::prepare, audit_loader, app_builder).await
+}
+
+pub async fn prepare_with_ssh<
+    'a,
+    TlsLoader,
+    TlsFuture,
+    SshLoader,
+    SshFuture,
+    AuditLoader,
+    AppBuilder,
+>(
+    config: &'a Config,
+    tls_loader: TlsLoader,
+    ssh_loader: SshLoader,
+    audit_loader: AuditLoader,
+    app_builder: AppBuilder,
+) -> Result<PreparedServer, StartupError>
+where
+    TlsLoader: FnOnce(&'a TlsConfig) -> TlsFuture,
+    TlsFuture: Future<Output = Result<RustlsConfig, TlsError>>,
+    SshLoader: FnOnce(&'a [Target]) -> SshFuture,
+    SshFuture: Future<Output = Result<PreparedSshTargets, SshPreparationError>>,
+    AuditLoader: FnOnce(&Path) -> Result<AuditLog, AuditError>,
+    AppBuilder: FnOnce(&Config, AuditLog) -> Result<AppState, ServerBuildError>,
+{
     validate_startup_contract(config)?;
     let transport = match &config.server.transport {
         ServerTransport::Plaintext => Some(PreparedTransport::Plaintext),
@@ -93,8 +162,9 @@ where
         }
         ServerTransport::TrustedProxy(_) => Some(PreparedTransport::Plaintext),
     };
+    let prepared_ssh = ssh_loader(&config.targets).await?;
     let audit = audit_loader(&config.audit.path)?;
-    let state = app_builder(config, audit)?;
+    let state = app_builder(config, audit)?.with_prepared_ssh(&config.targets, prepared_ssh)?;
     Ok(PreparedServer {
         bind: config.server.bind,
         state,
@@ -140,6 +210,157 @@ mod tests {
     };
 
     use super::{PreparedServer, PreparedTransport, StartupError, start, start_with};
+
+    fn ssh_config() -> crate::config::Config {
+        let mut config = parse(source()).unwrap();
+        config.targets = vec![crate::config::Target::Ssh(crate::config::SshTarget {
+            name: "remote".into(),
+            host: "host.example".into(),
+            port: 22,
+            ssh_executable: "/test/ssh".into(),
+            identity_file: "/test/identity".into(),
+            known_hosts: "/test/known-hosts".into(),
+            user_policy: crate::config::SshUserPolicy::Fixed("operator".into()),
+            read_only: false,
+        })];
+        config
+    }
+
+    #[tokio::test]
+    async fn ssh_prepared_map_mismatch_reaches_no_bind() {
+        let config = ssh_config();
+        let (record, observed) = phases();
+        let ssh_record = Arc::clone(&record);
+        let audit_record = Arc::clone(&record);
+        let app_record = Arc::clone(&record);
+        let bind_record = Arc::clone(&record);
+        let error = super::start_with_ssh(
+            &config,
+            |_| async { unreachable!("plaintext config must not load TLS") },
+            move |_| {
+                ssh_record.lock().unwrap().push("ssh");
+                std::future::ready(Ok(crate::ssh::PreparedSshTargets::from_test_names([
+                    "unexpected",
+                ])))
+            },
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                Ok(test_audit())
+            },
+            move |config, audit| {
+                app_record.lock().unwrap().push("app");
+                AppState::from_config_with_audit_pending_ssh(config, audit)
+            },
+            move |_| {
+                bind_record.lock().unwrap().push("bind");
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, StartupError::Ssh(_)));
+        assert_eq!(*observed.lock().unwrap(), ["ssh", "audit", "app"]);
+    }
+
+    #[test]
+    fn production_app_construction_rejects_unprepared_ssh_allowlist() {
+        assert!(AppState::from_config_with_audit(&ssh_config(), test_audit()).is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_orders_ssh_preparation_and_transfers_exact_map_before_bind() {
+        let mut config = ssh_config();
+        config.server.public_url = "https://127.0.0.1:7681".into();
+        config.server.transport = ServerTransport::DirectTls(TlsConfig {
+            certificate: "/test/certificate".into(),
+            private_key: "/test/private-key".into(),
+        });
+        let (record, observed) = phases();
+        let tls_record = Arc::clone(&record);
+        let ssh_record = Arc::clone(&record);
+        let audit_record = Arc::clone(&record);
+        let app_record = Arc::clone(&record);
+        let bind_record = Arc::clone(&record);
+
+        super::start_with_ssh(
+            &config,
+            move |_| {
+                tls_record.lock().unwrap().push("tls");
+                async { Ok(rustls_config().await) }
+            },
+            move |_| {
+                ssh_record.lock().unwrap().push("ssh");
+                std::future::ready(Ok(crate::ssh::PreparedSshTargets::from_test_names([
+                    "remote",
+                ])))
+            },
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                Ok(test_audit())
+            },
+            move |config, audit| {
+                app_record.lock().unwrap().push("app");
+                AppState::from_config_with_audit_pending_ssh(config, audit)
+            },
+            move |prepared| {
+                bind_record.lock().unwrap().push("bind");
+                async move {
+                    assert!(prepared.state.prepared_ssh().get("remote").is_some());
+                    assert_eq!(prepared.state.prepared_ssh().iter().count(), 1);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            ["tls", "ssh", "audit", "app", "bind"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_preparation_failure_reaches_neither_application_nor_bind() {
+        let mut config = parse(source()).unwrap();
+        config.targets = vec![crate::config::Target::Ssh(crate::config::SshTarget {
+            name: "remote".into(),
+            host: "host.example".into(),
+            port: 22,
+            ssh_executable: "/missing/ssh".into(),
+            identity_file: "/missing/identity".into(),
+            known_hosts: "/missing/known-hosts".into(),
+            user_policy: crate::config::SshUserPolicy::Fixed("operator".into()),
+            read_only: false,
+        })];
+        let (record, observed) = phases();
+        let audit_record = Arc::clone(&record);
+        let app_record = Arc::clone(&record);
+        let bind_record = Arc::clone(&record);
+
+        let error = start_with(
+            &config,
+            |_| async { unreachable!("plaintext config must not load TLS") },
+            move |_| {
+                audit_record.lock().unwrap().push("audit");
+                unreachable!("failed SSH preparation must not open audit")
+            },
+            move |_, _| {
+                app_record.lock().unwrap().push("app");
+                unreachable!("failed SSH preparation must not build app")
+            },
+            move |_: PreparedServer| {
+                bind_record.lock().unwrap().push("bind");
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, StartupError::Ssh(_)));
+        assert!(observed.lock().unwrap().is_empty());
+    }
 
     type PhaseLog = Arc<Mutex<Vec<&'static str>>>;
 

@@ -28,6 +28,7 @@ use crate::{
     protocol::MAX_BINARY_BYTES,
     rate_limit::{Attempt, FixedWindowLimiter, LimitError},
     session::{SessionError, SessionManager},
+    ssh::PreparedSshTargets,
     ticket::{TicketError, TicketStore},
     websocket,
 };
@@ -59,10 +60,22 @@ pub struct AppState {
     sessions: Arc<SessionManager>,
     authentication_failures: Arc<FixedWindowLimiter<PeerKey>>,
     session_requests: Arc<FixedWindowLimiter<crate::ticket::Identity>>,
+    prepared_ssh: Arc<PreparedSshTargets>,
 }
 
 impl AppState {
-    pub fn new(
+    pub fn new_for_test(
+        origin: OriginPolicy,
+        auth: Arc<dyn AuthProvider>,
+        targets: TargetAllowlist,
+        tickets: TicketStore,
+        limits: Limits,
+        audit: AuditLog,
+    ) -> Self {
+        Self::new_unprepared(origin, auth, targets, tickets, limits, audit)
+    }
+
+    fn new_unprepared(
         origin: OriginPolicy,
         auth: Arc<dyn AuthProvider>,
         targets: TargetAllowlist,
@@ -91,6 +104,7 @@ impl AppState {
             sessions: Arc::new(sessions),
             authentication_failures,
             session_requests,
+            prepared_ssh: Arc::new(PreparedSshTargets::default()),
         }
     }
 
@@ -101,6 +115,20 @@ impl AppState {
     }
 
     pub fn from_config_with_audit(
+        config: &Config,
+        audit: AuditLog,
+    ) -> Result<Self, ServerBuildError> {
+        if config
+            .targets
+            .iter()
+            .any(|target| matches!(target, Target::Ssh(_)))
+        {
+            return Err(ServerBuildError::SshPreparationRequired);
+        }
+        Self::from_config_with_audit_pending_ssh(config, audit)
+    }
+
+    pub(crate) fn from_config_with_audit_pending_ssh(
         config: &Config,
         audit: AuditLog,
     ) -> Result<Self, ServerBuildError> {
@@ -125,7 +153,7 @@ impl AppState {
         };
         let targets =
             TargetAllowlist::new(config.targets.clone()).map_err(|_| ServerBuildError::Targets)?;
-        Ok(Self::new(
+        Ok(Self::new_unprepared(
             origin,
             auth,
             targets,
@@ -146,6 +174,26 @@ impl AppState {
     pub fn audit(&self) -> Arc<AuditLog> {
         Arc::clone(&self.audit)
     }
+
+    pub fn prepared_ssh(&self) -> Arc<PreparedSshTargets> {
+        Arc::clone(&self.prepared_ssh)
+    }
+
+    pub(crate) fn with_prepared_ssh(
+        mut self,
+        targets: &[Target],
+        prepared_ssh: PreparedSshTargets,
+    ) -> Result<Self, crate::ssh::SshPreparationError> {
+        prepared_ssh.validate_for_targets(targets)?;
+        self.prepared_ssh = Arc::new(prepared_ssh);
+        self.sessions = Arc::new(
+            self.sessions
+                .as_ref()
+                .clone()
+                .with_prepared_ssh(Arc::clone(&self.prepared_ssh)),
+        );
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -160,6 +208,8 @@ pub enum ServerBuildError {
     Authentication,
     #[error("configured audit control could not be constructed")]
     AuditUnavailable,
+    #[error("configured SSH targets require prepared startup material")]
+    SshPreparationRequired,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -859,7 +909,7 @@ mod audit_failure_tests {
     async fn runtime_audit_failure_denies_new_http_authority() {
         let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let audit = AuditLog::open(&directory.path().join("audit.jsonl")).unwrap();
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             OriginPolicy::new("https://ttygate.local:7681").unwrap(),
             Arc::new(DevAuthProvider::new("developer").unwrap()),
             TargetAllowlist::new(vec![Target::Pty(PtyTarget {

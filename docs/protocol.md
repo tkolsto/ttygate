@@ -77,6 +77,22 @@ An error reports a safe user-facing failure with a stable machine-readable code:
 {"version":1,"type":"error","code":"session-unavailable","message":"The terminal session is unavailable."}
 ```
 
+SSH setup failures use this fixed, closed mapping:
+
+| Code | Curated message |
+|---|---|
+| `ssh-host-key-failed` | `The SSH host identity could not be verified.` |
+| `ssh-connection-failed` | `The SSH connection could not be established.` |
+| `ssh-authentication-failed` | `SSH authentication was rejected.` |
+| `ssh-policy-denied` | `SSH access was denied by policy.` |
+| `ssh-failed` | `The SSH session could not be established safely.` |
+
+Unknown and mismatched host keys intentionally share `ssh-host-key-failed`.
+These codes contain no target name, host, username, configured path, argv,
+OpenSSH diagnostic, terminal data, or secret. SSH targets add no client
+authority fields: after ticket redemption, the server resolves all SSH
+authority from the ticket-bound configured target and authenticated identity.
+
 `code` is 1–64 ASCII characters, begins with a lowercase letter, and otherwise contains lowercase letters, digits, or single hyphens (no leading, trailing, or adjacent hyphens). `message` is 1–256 Unicode scalar values, contains no ASCII control characters, and is plain text only. Producers MUST use curated text and MUST NOT include hostile payloads, secrets, terminal data, raw parser errors, or HTML. Consumers MUST render it as text, never HTML.
 
 A server close is the final typed lifecycle notification:

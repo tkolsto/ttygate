@@ -23,6 +23,11 @@ test("view model provides stable accessible copy for every connection phase", ()
     "connecting": "Connecting to the terminal…",
     "active": "Terminal connected.",
     "denied": "Terminal access was denied by policy.",
+    "ssh-host-key-failed": "SSH host identity verification failed.",
+    "ssh-connection-failed": "The SSH connection could not be established.",
+    "ssh-authentication-failed": "SSH authentication was rejected.",
+    "ssh-policy-denied": "SSH access was denied by policy.",
+    "ssh-failed": "The SSH session could not be established safely.",
     "protocol-error": "The terminal protocol failed safely.",
     "internal-error": "The terminal is unavailable because of an internal error.",
     "timed-out": "The terminal session timed out.",
@@ -103,4 +108,53 @@ test("view copy never includes target names or other server-controlled text", ()
 
   assert.ok(!JSON.stringify(model).includes(hostile));
   assert.ok(!JSON.stringify(model).includes("credential"));
+});
+
+test("ssh_frontend_errors_never_reflect_target_host_user_path_argv_or_diagnostics", () => {
+  const sentinels = [
+    "target-secret",
+    "ssh.example.test",
+    "remote-user",
+    "/run/ttygate/id-secret",
+    "-oProxyCommand=credential",
+    "REMOTE HOST IDENTIFICATION HAS CHANGED",
+  ];
+  const expected: Record<ConnectionPhase, string> = {
+    "establishing-identity": "Establishing browser identity…",
+    "ready": "Ready. Choose a configured target.",
+    "requesting-authorization": "Requesting terminal authorization…",
+    "connecting": "Connecting to the terminal…",
+    "active": "Terminal connected.",
+    "denied": "Terminal access was denied by policy.",
+    "protocol-error": "The terminal protocol failed safely.",
+    "internal-error": "The terminal is unavailable because of an internal error.",
+    "timed-out": "The terminal session timed out.",
+    "exited": "The terminal process exited.",
+    "transport-disconnected": "The terminal transport disconnected.",
+    "user-closed": "You closed the terminal session.",
+    "ssh-host-key-failed": "SSH host identity verification failed.",
+    "ssh-connection-failed": "The SSH connection could not be established.",
+    "ssh-authentication-failed": "SSH authentication was rejected.",
+    "ssh-policy-denied": "SSH access was denied by policy.",
+    "ssh-failed": "The SSH session could not be established safely.",
+  };
+
+  for (const phase of [
+    "ssh-host-key-failed",
+    "ssh-connection-failed",
+    "ssh-authentication-failed",
+    "ssh-policy-denied",
+    "ssh-failed",
+  ] as const) {
+    const model = viewModel({
+      phase,
+      targets: [{ name: sentinels.join(" "), readOnly: false }],
+      activeTarget: sentinels.join(" "),
+      readOnly: false,
+    });
+    assert.equal(model.status, expected[phase]);
+    for (const sentinel of sentinels) {
+      assert.ok(!JSON.stringify(model).includes(sentinel));
+    }
+  }
 });

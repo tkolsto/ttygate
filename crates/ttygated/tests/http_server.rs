@@ -67,7 +67,7 @@ fn audited_app(mut configured: Limits) -> AuditedApp {
         read_only: false,
     });
     AuditedApp {
-        app: build_router(AppState::new(
+        app: build_router(AppState::new_for_test(
             OriginPolicy::new(ORIGIN).unwrap(),
             Arc::new(DevAuthProvider::new("developer").unwrap()),
             TargetAllowlist::new(vec![target]).unwrap(),
@@ -155,7 +155,7 @@ fn app_with_auth_limits_and_ticket_ttl(
         argv: Vec::new(),
         read_only: false,
     });
-    build_router(AppState::new(
+    build_router(AppState::new_for_test(
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
@@ -183,7 +183,7 @@ fn trusted_proxy_app_with_limits(limits: Limits) -> axum::Router {
         )
         .unwrap(),
     );
-    build_router(AppState::new(
+    build_router(AppState::new_for_test(
         OriginPolicy::new(ORIGIN).unwrap(),
         auth,
         TargetAllowlist::new(vec![target]).unwrap(),
@@ -1485,7 +1485,7 @@ async fn listener_injects_the_actual_peer_into_authentication_context() {
     let server_addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve(
         listener,
-        AppState::new(
+        AppState::new_for_test(
             OriginPolicy::new(ORIGIN).unwrap(),
             auth.clone(),
             TargetAllowlist::new(vec![target]).unwrap(),

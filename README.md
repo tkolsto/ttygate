@@ -21,8 +21,13 @@ and configured global/per-identity capacity is reserved when a ticket is issued
 and transferred exactly once to the live session. Roadmap Chunk 2.4 is complete (Refs #10):
 both modes require a restrictive structured lifecycle audit sink
 before application construction or listener binding, and new authority fails
-closed if that sink becomes unavailable. Milestone M2 is complete. SSH,
-recording, reconnect, packaging, deployment examples, and release hardening
+closed if that sink becomes unavailable. Milestone M2 is complete.
+Roadmap Chunk 3.1 (Refs #11) implements strict-host-key SSH targets: the
+daemon spawns the configured system OpenSSH client inside the existing PTY
+machinery with a pinned, non-negotiable option policy, validates SSH
+credential material and client capability before binding, and surfaces only
+curated failure states. Milestone M3 is complete. Recording, reconnect,
+packaging, deployment examples, and release hardening
 remain future work, so the current build is still not production-safe.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
@@ -219,11 +224,78 @@ administrators able to write or truncate the opened inode or underlying storage
 remain trusted even though pathname redirects are resisted. Audit metadata is
 sensitive even though terminal contents and credentials are excluded.
 
+## Strict OpenSSH targets
+
+Chunk 3.1 (Refs #11) implements `type = "ssh"` targets. The daemon spawns the
+configured system OpenSSH client inside the existing PTY, session,
+concurrency, audit, and WebSocket machinery:
+
+```toml
+[[targets]]
+name = "lab-host"
+type = "ssh"
+host = "lab.example.internal"
+port = 22
+ssh_executable = "/usr/bin/ssh"
+identity_file = "/etc/ttygate/lab_host_ed25519"
+known_hosts = "/etc/ttygate/lab_host_known_hosts"
+user_policy = "same-as-auth-user"
+read_only = false
+```
+
+`user_policy` accepts `fixed` (with `user`), `same-as-auth-user`, and `mapping` (with `user_mapping`);
+every resolved username must satisfy the same
+strict grammar as configured usernames, and an unmapped or invalid resolution
+is denied before any process is spawned. `host` uses a closed host-only
+grammar: ASCII DNS names or plain IPv4/IPv6 literals; user-qualified
+destinations, SSH URIs, brackets, and option-like values are rejected.
+
+All paths are literal: no environment variables, no `~`, no globs. Because
+OpenSSH re-parses `-o` option values with its own option lexer,
+`identity_file` and `known_hosts` additionally reject whitespace, control
+characters, `%`, quotes, backslashes, and `$`, so an accepted path always
+reaches OpenSSH byte-identically.
+
+Provisioning: `identity_file` must be one unencrypted OpenSSH-format Ed25519
+private key, newline-terminated, owned by the daemon user with owner-only
+permissions. `known_hosts` must be a newline-terminated file owned by the
+daemon user; its entries are the only host-key trust source. Startup validates
+executable safety, material ownership, permissions, size bounds, and identity
+structure, and probes the client (`ssh -G`) for the complete pinned option
+vocabulary; any gap fails closed before bind, with no weaker runtime fallback.
+Material is snapshotted at startup and rechecked before every spawn; a changed
+file denies the session instead of trusting new content.
+
+Every session runs with a pinned argv: `StrictHostKeyChecking=yes`, the
+configured `UserKnownHostsFile`, `IdentitiesOnly=yes` with the configured
+`IdentityFile`, `CertificateFile=/dev/null` (so OpenSSH never implicitly
+loads a sibling `<identity>-cert.pub`), `BatchMode=yes`,
+`UpdateHostKeys=no` (ttygate never modifies the known-hosts file), disabled
+password/keyboard-interactive/hostbased/GSSAPI authentication, no agent, no
+X11/port forwarding, no ProxyCommand/ProxyJump, no local command, no escape
+character, and a cleared environment with a fixed locale. No browser or
+protocol input reaches the argument vector.
+
+Failures surface only as curated states: `ssh-host-key-failed` (unknown and
+mismatched host keys intentionally share it), `ssh-connection-failed`,
+`ssh-authentication-failed`, `ssh-policy-denied`, and `ssh-failed`. Errors and
+audit records never contain hosts, usernames, paths, argv, or OpenSSH
+diagnostics.
+
+Compatibility: the pinned vocabulary requires an OpenSSH 9.2 or newer client
+(`EnableEscapeCommandline` sets the floor); the suite is exercised against
+OpenSSH 10.x. Cleanup guarantees cover the local client only: the daemon
+tears down the local SSH process group, but remote commands may outlive the
+session if the remote side detaches them from the connection. Deferred scope
+includes SSH agent forwarding, certificate authentication, ProxyJump/bastion
+chains, password authentication, host-key learning, per-target extra options,
+session re-attach, and a native SSH library backend.
+
 ## Planned v0.1 posture
 
 The daemon defaults to `127.0.0.1`, but localhost-only binding is only one layer. Local development requires Origin validation, a real browser session cookie, and a short-lived single-use ticket presented as the first WebSocket message. The frontend lists only safe presentation metadata for server-configured targets; executable paths, arguments, SSH options, credentials, and tickets never become target-selection authority. Terminal output uses bounded server and browser queues, and a dropped WebSocket ends the session without automatic reconnect.
 
-The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits and structured session-lifecycle audit persistence are implemented. SSH execution, recording, packaging, deployment examples, and release work remain planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits, structured session-lifecycle audit persistence, and strict-host-key OpenSSH targets are implemented. Recording, packaging, deployment examples, and release work remain planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
 
 ## Security model and non-goals
 
