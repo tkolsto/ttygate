@@ -1,0 +1,52 @@
+# Docker/service-network example. 192.0.2.0/24 and example.invalid are
+# reserved for documentation. Replace the complete deployment tuple described
+# in README.md; do not broaden the trusted source.
+[server]
+bind = "0.0.0.0:7681"
+mode = "production"
+public_url = "https://terminal.example.invalid:8443"
+
+[server.trusted_proxy]
+trusted_sources = ["192.0.2.10/32"]
+
+[auth]
+provider = "trusted-proxy"
+identity_header = "x-authenticated-user"
+
+[audit]
+format = "json"
+path = "/var/log/ttygate/audit.jsonl"
+recording = false
+
+[limits]
+max_sessions = 8
+max_sessions_per_user = 2
+idle_timeout_seconds = 900
+absolute_timeout_seconds = 14400
+session_requests_per_window = 10
+session_request_window_seconds = 60
+authentication_failures_per_window = 20
+authentication_failure_window_seconds = 60
+
+[[targets]]
+name = "maintenance-shell"
+type = "pty"
+command = ["/bin/sh", "-l"]
+read_only = false
+
+# Strict-host-key SSH target example. Uncomment only after replacing every
+# REPLACE_ path/host and provisioning the files for ttygate's service user.
+#
+# [[targets]]
+# name = "managed-host"
+# type = "ssh"
+# host = "REPLACE_WITH_MANAGED_HOST.example.invalid"
+# port = 22
+# ssh_executable = "/usr/bin/ssh"
+# identity_file = "/REPLACE_WITH_TTYGATE_SSH_DIRECTORY/managed_host_ed25519"
+# known_hosts = "/REPLACE_WITH_TTYGATE_SSH_DIRECTORY/managed_host_known_hosts"
+# user_policy = "mapping"
+# user_mapping = {
+#   "REPLACE_WITH_CANONICAL_IDENTITY" = "REPLACE_WITH_REMOTE_USER"
+# }
+# read_only = false

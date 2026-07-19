@@ -28,9 +28,11 @@ machinery with a pinned, non-negotiable option policy, validates SSH
 credential material and client capability before binding, and surfaces only
 curated failure states. Milestone M3 is complete. Roadmap Chunk 4.1 is
 implemented (Refs #12) with non-root Docker and hardened systemd packages,
-locked build inputs, and scripted lifecycle smoke tests. Recording, reconnect,
-deployment examples, and release hardening
-remain future work, so the current build is still not production-safe.
+locked build inputs, and scripted lifecycle smoke tests. Roadmap Chunk 4.2 is
+complete (Refs #12): the Caddy and Nginx reverse-proxy examples are verified
+through disposable TLS/authentication/WSS/PTY lifecycles. Recording, reconnect,
+and the Chunk 4.3 release gate remain future work, so the current build is still
+not production-safe.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
 
@@ -130,9 +132,10 @@ client-supplied instance of the configured identity header, and inject exactly
 one canonical identity header. It must also be the only component able to reach
 the backend from a trusted CIDR; direct public access to the backend must be
 blocked. A compromised trusted proxy can impersonate any user, and CIDR checks
-do not reduce that residual risk. This is the application contract, not a
-ready-to-copy deployment example; concrete hardened proxy examples remain
-future work.
+do not reduce that residual risk. For ready-to-adapt Caddy and Nginx
+configurations, matching ttygate configuration, Cloudflare Access and Tailscale
+Serve boundaries, and the executable verification procedure, see the
+[verified reverse-proxy deployment guide](packaging/reverse-proxy/README.md).
 
 On `POST /api/identity`, the verified header identity is stored behind the same
 opaque secure, HTTP-only, SameSite browser cookie used in development. Later
@@ -319,14 +322,86 @@ documented in
 
 Both package defaults are deliberately local development configurations; they
 do not remove the browser threat of hostile access to localhost and do not make
-the service production-safe. Chunks 4.2 and 4.3 still own reviewed deployment
-and reverse-proxy examples, release automation, and the v0.1 release.
+the service production-safe. Chunk 4.2's reviewed deployment and reverse-proxy
+examples are complete (Refs #12); Chunk 4.3 still owns release automation,
+manual pre-release checks, and the v0.1 tag.
+
+## Production deployment checklist
+
+These checks describe the implemented Chunk 4.2 boundary; they are not a
+production-readiness declaration. Start with the
+[verified reverse-proxy deployment guide](packaging/reverse-proxy/README.md)
+and replace its conspicuous documentation-only names, addresses, certificate
+paths, and synthetic authentication service:
+
+- Terminate browser TLS at a maintained proxy and redirect plaintext requests;
+  set `public_url` to that exact external HTTPS authority so Host, Origin,
+  secure-cookie, and WSS checks agree.
+- Put ttygate on an unpublished private backend network. Only the proxy may
+  reach it, and `trusted_sources` must name the proxy's actual immediate socket
+  address—not a forwarded client address, public edge range, or broad network.
+- Authenticate before proxying. Remove every client copy of the identity
+  header, inject exactly one bounded canonical identity, and remove upstream
+  credentials before ttygate.
+- Provision certificate keys, audit storage, SSH identities, and known-hosts
+  data with the owners and restrictive modes in the deployment guide. Keep
+  audit rotation, retention, shipping, backups, and access control explicit.
+- Select targets intentionally. A local PTY runs with the daemon's shared OS
+  user; use a strict-host-key SSH target when the remote account is the desired
+  isolation boundary.
+- Retain ttygate's default rate, concurrency, deadline, and output bounds unless
+  a reviewed capacity plan justifies stricter values.
+- Run native `caddy validate` or `nginx -t`, then execute
+  `./scripts/smoke-reverse-proxy.sh caddy` or
+  `./scripts/smoke-reverse-proxy.sh nginx`. The verified Caddy and Nginx tests
+  cover TLS, missing authentication, spoofed duplicate identity headers,
+  HTTPS/WSS terminal flow, audit secrecy, untrusted peers, teardown, and
+  disposable-resource cleanup.
+- Treat a compromised proxy as able to impersonate every user. Complete Chunk
+  4.3 and its manual release checklist before any v0.1 production claim.
+
+### Authentication provider matrix
+
+| Upstream mode | ttygate configuration | Required identity proof | Boundary |
+| --- | --- | --- | --- |
+| Local development | `provider = "dev"` | Fixed configured development identity | Loopback development only; production startup rejects it |
+| Caddy or Nginx with an identity-aware gateway | `provider = "trusted-proxy"` | One gateway-authenticated canonical header | Verified examples; exclusive backend reachability and exact proxy CIDR remain mandatory |
+| Cloudflare Access | `provider = "trusted-proxy"` | Gateway validates the Access JWT signature, issuer, audience, expiry, and claims | No built-in Cloudflare provider; an email header alone is not proof |
+| Tailscale Serve | `provider = "trusted-proxy"` | Serve-injected `Tailscale-User-Login` | No built-in Tailscale provider; Funnel carries no user identity |
+
+The matching local PTY shape is:
+
+```toml
+[[targets]]
+name = "maintenance-shell"
+type = "pty"
+executable = "/bin/sh"
+arguments = ["-l"]
+read_only = false
+```
+
+For strict-host-key SSH, use the full configuration and provisioning contract
+in [Strict OpenSSH targets](#strict-openssh-targets). ttygate has no native SSH
+implementation: it launches a pinned OpenSSH subprocess, requires
+`StrictHostKeyChecking=yes`, and performs no automatic host-key learning
+(`UpdateHostKeys=no`).
+
+A synthetic audit JSONL lifecycle has this shape (values are illustrative, not
+live credentials or terminal content):
+
+```jsonl
+{"schema_version":1,"event_type":"authentication-succeeded","identity":"synthetic-user","remote_address":"192.0.2.10:41000","timestamp":"2030-01-01T00:00:00Z"}
+{"schema_version":1,"event_type":"session-started","session_id":"00000000-0000-4000-8000-000000000001","identity":"synthetic-user","target":"maintenance-shell","remote_address":"192.0.2.10:41001","timestamp":"2030-01-01T00:00:01Z"}
+{"schema_version":1,"event_type":"session-ended","session_id":"00000000-0000-4000-8000-000000000001","identity":"synthetic-user","target":"maintenance-shell","remote_address":"192.0.2.10:41001","timestamp":"2030-01-01T00:00:02Z","reason":"client-close","outcome":"completed"}
+```
 
 ## Planned v0.1 posture
 
 The daemon defaults to `127.0.0.1`, but localhost-only binding is only one layer. Local development requires Origin validation, a real browser session cookie, and a short-lived single-use ticket presented as the first WebSocket message. The frontend lists only safe presentation metadata for server-configured targets; executable paths, arguments, SSH options, credentials, and tickets never become target-selection authority. Terminal output uses bounded server and browser queues, and a dropped WebSocket ends the session without automatic reconnect.
 
-The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits, structured session-lifecycle audit persistence, strict-host-key OpenSSH targets, and the Docker/systemd package paths are implemented. Recording, deployment examples, and release work remain planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits, structured session-lifecycle audit persistence, strict-host-key OpenSSH targets, Docker/systemd packages, and verified reverse-proxy examples are implemented. Recording, reconnect, and Chunk 4.3 release work remain planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+
+Recording remains a separate future production control; verified deployment examples do not enable it or relax the Chunk 4.3 release gate.
 
 ## Security model and non-goals
 
@@ -335,13 +410,18 @@ The [threat model](docs/threat-model.md) documents the trust boundaries, attacke
 - no `/bin/login`-style host authentication or default browser-exposed host login;
 - no arbitrary commands supplied by browser requests;
 - no session sharing, collaboration, or reconnect after a dropped WebSocket;
-- no built-in enterprise identity platform;
+- no built-in Cloudflare, Tailscale, OIDC, or other enterprise identity
+  provider;
+- no native ACME certificate management; TLS certificate lifecycle belongs to
+  the operator or reverse proxy;
+- no native SSH stack or automatic host-key learning; SSH targets use the
+  pinned OpenSSH subprocess contract above;
 - no drop-in compatibility with `shellinaboxd`;
-- no OS-level separation between authenticated users of local PTY targets.
+- no OS-level separation between authenticated users; local PTY targets share the same OS user.
 
 For local PTY targets, every child process will run as the daemon's dedicated non-root Unix user. Application policy and audit attribution do not create an OS security boundary between authenticated users. SSH or a future container backend is the intended route to stronger per-user isolation.
 
-## Relationship to Shell In A Box
+## Shell In A Box comparison
 
 ttygate is inspired by Shell In A Box, not a fork and not a drop-in replacement. It retains the useful product idea while pursuing a new Rust backend, a current xterm.js frontend, standard WebSockets, and an explicit security model.
 
