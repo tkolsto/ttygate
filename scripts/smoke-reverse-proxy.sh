@@ -29,9 +29,9 @@ client="$run_id-client"
 attacker="$run_id-untrusted"
 invalid="$run_id-invalid"
 
-CADDY_IMAGE="caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d"
-NGINX_IMAGE="nginx:1.29.8-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de"
-NODE_IMAGE="node:22.21.1-bookworm-slim@sha256:25b3eb23a00590b7499f2a2ce939322727fcce1b15fdd69754fcd09536a3ae2c"
+CADDY_IMAGE=${CADDY_IMAGE:-"caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d"}
+NGINX_IMAGE=${NGINX_IMAGE:-"nginx:1.29.8-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de"}
+NODE_IMAGE=${NODE_IMAGE:-"node:22.21.1-bookworm-slim@sha256:25b3eb23a00590b7499f2a2ce939322727fcce1b15fdd69754fcd09536a3ae2c"}
 
 redact() {
   sed -E \

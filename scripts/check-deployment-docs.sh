@@ -34,6 +34,22 @@ reject_text() {
   fi
 }
 
+require_job_text() {
+  job=$1
+  pattern=$2
+  description=$3
+  job_text=$(
+    awk -v heading="  $job:" '
+      $0 == heading { inside = 1; next }
+      inside && $0 ~ /^  [A-Za-z0-9_-]+:/ { exit }
+      inside { print }
+    ' "$CI"
+  )
+  [ -n "$job_text" ] || fail "$CI lacks $job job"
+  printf '%s\n' "$job_text" | grep -Eq "$pattern" ||
+    fail "$CI $job job lacks $description"
+}
+
 CADDY=packaging/reverse-proxy/Caddyfile
 NGINX=packaging/reverse-proxy/nginx.conf
 CONFIG=packaging/reverse-proxy/ttygate.toml
@@ -180,9 +196,16 @@ require_text "$SESSION_FIXTURE" 'terminal_output' 'terminal output audit exclusi
 # Required CI uses separate immutable proxy jobs and publishes no artifacts.
 require_text "$CI" '^  caddy-deployment:' 'separate Caddy deployment job'
 require_text "$CI" '^  nginx-deployment:' 'separate Nginx deployment job'
-require_text "$CI" 'caddy:[^[:space:]]+@sha256:[0-9a-f]{64}' 'digest-pinned Caddy image'
-require_text "$CI" 'nginx:[^[:space:]]+@sha256:[0-9a-f]{64}' 'digest-pinned Nginx image'
-reject_text "$CI" 'upload-artifact|release|attest|sbom|cosign' 'Chunk 4.3 publication behavior'
+for job in caddy-deployment nginx-deployment; do
+  require_job_text "$job" '^    runs-on: ubuntu-latest$' 'Linux runner'
+  require_job_text "$job" '^    timeout-minutes: [1-9][0-9]*$' 'bounded timeout'
+  require_job_text "$job" 'actions/checkout@[0-9a-f]{40}' 'immutable checkout action'
+done
+require_job_text caddy-deployment 'caddy:[^[:space:]]+@sha256:[0-9a-f]{64}' 'digest-pinned Caddy image'
+require_job_text caddy-deployment '\./scripts/smoke-reverse-proxy\.sh caddy' 'Caddy smoke lifecycle'
+require_job_text nginx-deployment 'nginx:[^[:space:]]+@sha256:[0-9a-f]{64}' 'digest-pinned Nginx image'
+require_job_text nginx-deployment '\./scripts/smoke-reverse-proxy\.sh nginx' 'Nginx smoke lifecycle'
+reject_text "$CI" 'actions/upload-artifact|gh[[:space:]]+release|action-gh-release|attest-build-provenance|sbom|cosign' 'Chunk 4.3 publication behavior'
 
 # Public documents must complete Chunk 4.2 while retaining the release gate.
 for pattern in \
