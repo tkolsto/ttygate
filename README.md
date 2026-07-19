@@ -26,8 +26,10 @@ Roadmap Chunk 3.1 (Refs #11) implements strict-host-key SSH targets: the
 daemon spawns the configured system OpenSSH client inside the existing PTY
 machinery with a pinned, non-negotiable option policy, validates SSH
 credential material and client capability before binding, and surfaces only
-curated failure states. Milestone M3 is complete. Recording, reconnect,
-packaging, deployment examples, and release hardening
+curated failure states. Milestone M3 is complete. Roadmap Chunk 4.1 is
+implemented (Refs #12) with non-root Docker and hardened systemd packages,
+locked build inputs, and scripted lifecycle smoke tests. Recording, reconnect,
+deployment examples, and release hardening
 remain future work, so the current build is still not production-safe.
 
 Follow the [roadmap](docs/roadmap.md) for implementation status. Until the roadmap says otherwise, do not deploy ttygate or rely on it to protect terminal access.
@@ -291,11 +293,40 @@ includes SSH agent forwarding, certificate authentication, ProxyJump/bastion
 chains, password authentication, host-key learning, per-target extra options,
 session re-attach, and a native SSH library backend.
 
+## Docker and systemd packages
+
+Chunk 4.1 is implemented (Refs #12). The root
+[`Dockerfile`](Dockerfile) builds locked frontend and Rust inputs in
+digest-pinned stages, then copies only the stripped daemon and required runtime
+packages into Debian slim. The process has a fixed non-root identity (UID 65532
+and GID 65532), the default config binds only `127.0.0.1:7681`, and Docker health
+uses the daemon's bounded `/healthz` checker. The supported hardened invocation
+uses a read-only root filesystem, no capabilities, `no-new-privileges`, and an
+explicit persistent audit volume. See
+[`packaging/docker/README.md`](packaging/docker/README.md) for the ownership and
+mount contract.
+
+The [`packaging/systemd/ttygated.service`](packaging/systemd/ttygated.service)
+unit uses a dedicated `ttygate` account, `Type=notify` readiness, `sd_notify`
+watchdog heartbeats, cgroup-wide teardown, an empty capability set, a strict
+filesystem view, and device, kernel, namespace, address-family, and syscall
+restrictions. `PrivateNetwork` is omitted because accepting a listener and
+reaching SSH targets are service functions. `PrivateUsers` is omitted because
+UID remapping conflicts with fail-closed ownership checks for audit and SSH
+material. Those exceptions, installation paths, and verification commands are
+documented in
+[`packaging/systemd/README.md`](packaging/systemd/README.md).
+
+Both package defaults are deliberately local development configurations; they
+do not remove the browser threat of hostile access to localhost and do not make
+the service production-safe. Chunks 4.2 and 4.3 still own reviewed deployment
+and reverse-proxy examples, release automation, and the v0.1 release.
+
 ## Planned v0.1 posture
 
 The daemon defaults to `127.0.0.1`, but localhost-only binding is only one layer. Local development requires Origin validation, a real browser session cookie, and a short-lived single-use ticket presented as the first WebSocket message. The frontend lists only safe presentation metadata for server-configured targets; executable paths, arguments, SSH options, credentials, and tickets never become target-selection authority. Terminal output uses bounded server and browser queues, and a dropped WebSocket ends the session without automatic reconnect.
 
-The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits, structured session-lifecycle audit persistence, and strict-host-key OpenSSH targets are implemented. Recording, packaging, deployment examples, and release work remain planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
+The PTY session manager already enforces configured ticket-time global/per-identity concurrency, idle/absolute deadlines, server-side read-only behavior, and bounded output backpressure. Production mode fails closed unless its typed authentication and transport contracts are structurally complete, rejects development authentication and public plaintext binds, and enforces the configured trusted-proxy socket-peer and identity-header boundary. Request rate limits, structured session-lifecycle audit persistence, strict-host-key OpenSSH targets, and the Docker/systemd package paths are implemented. Recording, deployment examples, and release work remain planned. See the [rewrite plan](docs/ttygate-rewrite-plan.md) for the intended architecture and release checklist.
 
 ## Security model and non-goals
 

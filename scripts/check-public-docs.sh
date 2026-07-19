@@ -18,6 +18,15 @@ require_text() {
   grep -Eiq "$pattern" "$file" || fail "$file lacks $description"
 }
 
+reject_text() {
+  file=$1
+  pattern=$2
+  description=$3
+  if grep -Eiq "$pattern" "$file"; then
+    fail "$file still contains $description"
+  fi
+}
+
 README=README.md
 SECURITY=SECURITY.md
 THREAT_MODEL=docs/threat-model.md
@@ -63,7 +72,7 @@ require_text "$README" 'semantic HTTP.*field value|HTTP parser.*optional whitesp
 require_text "$README" 'strip every|inject exactly one canonical identity header' 'trusted-proxy strip-and-inject responsibility'
 require_text "$README" 'IPv4.mapped|mapped IPv4' 'IPv4-mapped address policy'
 require_text "$README" 'session and WSS requests|cookie.*session ticket' 'proxy identity authority propagation'
-require_text "$README" 'record.*packag.*release|recording.*packaging' 'future production controls'
+require_text "$README" 'record.*deploy.*release|recording.*deployment' 'future production controls'
 require_text "$README" 'Chunk 3\.1 \(Refs #11\) implements|Chunk 3\.1.*(complete|implemented).*Refs #11' 'implemented Chunk 3.1 status'
 require_text "$README" 'StrictHostKeyChecking=yes' 'strict host-key policy'
 require_text "$README" 'CertificateFile=/dev/null' 'pinned certificate policy'
@@ -83,6 +92,17 @@ require_text "$README" 'remote (command|process)(s|es)? (may|can) (outlive|persi
 require_text "$README" 'agent forwarding' 'deferred agent scope'
 require_text "$README" 'certificate authentication' 'deferred certificate scope'
 require_text "$README" 'ProxyJump|bastion' 'deferred proxy scope'
+require_text "$README" 'Chunk 4\.1.*(complete|implemented).*Refs #12|Refs #12.*Chunk 4\.1' 'implemented Chunk 4.1 status'
+# shellcheck disable=SC2016 # Backticks are literal Markdown delimiters in this regex.
+require_text "$README" '\[`?Dockerfile`?\]\(Dockerfile\)' 'Docker package entry point'
+require_text "$README" 'packaging/systemd/ttygated\.service' 'systemd package entry point'
+require_text "$README" 'UID.*65532|65532.*UID' 'stable container identity'
+require_text "$README" 'Type=notify|sd_notify' 'systemd readiness contract'
+require_text "$README" 'PrivateNetwork.*(absent|omitted|cannot)|cannot.*PrivateNetwork' 'systemd network namespace exception'
+require_text "$README" 'PrivateUsers.*(absent|omitted|cannot)|cannot.*PrivateUsers' 'systemd user namespace exception'
+require_text "$README" 'Chunks? 4\.2.*4\.3|4\.2.*and.*4\.3' 'remaining packaging and release scope'
+require_text "$THREAT_MODEL" 'Chunk 4\.1.*(implements|implemented).*Docker.*systemd|Docker.*systemd.*Refs #12' 'implemented Chunk 4.1 packaging status'
+reject_text "$THREAT_MODEL" 'packaging, deployment examples, and release work remain planned' 'stale all-packaging-is-planned status'
 require_text "$README" 'Refs #8' 'Chunk 2.1 changelog reference'
 require_text "$README" 'cargo test --workspace' 'Rust verification command'
 require_text "$README" 'npm.*(test:e2e|run test:e2e)' 'frontend browser-test command'
