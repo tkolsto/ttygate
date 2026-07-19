@@ -1,11 +1,13 @@
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod healthcheck;
 pub mod origin;
 pub mod protocol;
 mod pty_backend;
 pub mod rate_limit;
 pub mod server;
+pub mod service_manager;
 pub mod session;
 pub mod ssh;
 pub mod startup;
